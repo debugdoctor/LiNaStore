@@ -19,7 +19,7 @@ target/
 # Added by cargo
 
 /target
-/data
+/test
 
 *.sql
 *.db
