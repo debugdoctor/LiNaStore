@@ -1,5 +1,6 @@
 use super::service::Manager;
 use super::command;
+use std::fs;
 use std::path::Path;
 
 pub fn handle_list(root: &str, args: &command::ListArgs){
@@ -21,6 +22,7 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
             },
         };
     }
+
     let manager = match Manager::new(root) {
         Ok(manager) => manager,
         Err(e) => {
@@ -28,7 +30,8 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
             return;
         }
     };
-    let file_names = match manager.list(&pattern, isext){
+
+    let file_names = match manager.list(&pattern, args.n, isext){
         Ok(file_names) => file_names,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
@@ -41,8 +44,12 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
         return;
     }
 
-    for file_name in file_names {
+    for file_name in &file_names {
         println!("{}", file_name.name);
+    }
+
+    if args.n != 0 && file_names.len() > args.n as usize {
+        println!("...");
     }
 }
 
@@ -55,7 +62,7 @@ pub fn handle_put(root: &str, args: &command::PutArgs){
         }
     };
     
-    match manager.put(&args.input_files){
+    match manager.put(&args.input_files, args.cover, args.compressed){
         Ok(_) => {},
         Err(e) => {
             eprintln!("Failed to store files: {}", e);
@@ -63,7 +70,19 @@ pub fn handle_put(root: &str, args: &command::PutArgs){
         }
     };
 
-    println!("Files stored successfully");
+    if args.list {
+        println!("Files stored successfully:");
+        for file in &args.input_files {
+            println!("{}", 
+                Path::new(file)
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .unwrap_or("<unknown>")
+            );
+        }
+    } else {
+        println!("Files stored successfully");
+    }
 }
 
 pub fn handle_get(root: &str, args: &command::GetArgs){
@@ -75,8 +94,17 @@ pub fn handle_get(root: &str, args: &command::GetArgs){
         }
     };
 
-    let dest_path = match &args.dest {
-        Some(path) => Path::new(path),
+    let dest_path= match &args.dest {
+        Some(path) => {
+            // Convert to absolute path
+            match fs::canonicalize(path) {
+                Ok(absolute_path) => absolute_path,
+                Err(e) => {
+                    eprintln!("Invalid destination path: {}", e);
+                    return;
+                }
+            }
+        },
         None => {
             eprintln!("Destination path is required");
             return;

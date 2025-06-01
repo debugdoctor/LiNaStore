@@ -1,5 +1,5 @@
 [package]
-name = "Lihastore"
+name = "lihastore-server"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,13 +8,17 @@ blake3 = "1.8.2"
 chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["derive"] }
 nanoid = "0.4.0"
+rayon = "1.10.0"
 rusqlite = {version = "0.35.0", features = ["bundled"]}
 uuid = { version = "1.16.0", features = ["v4"] }
+
+[features]
+simd = []
 
 [[bin]]
 name = "lihastore"
 
 [profile.release]
-opt-level = "z"
+opt-level = 's'
 lto = true
 strip = true

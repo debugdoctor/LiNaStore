@@ -1,8 +1,8 @@
-mod lib;
+mod libs;
 
 use std::env;
 use clap::Parser;
-use lib::{handler, command::{Cli, Commands}};
+use libs::{handler, command::{Cli, Commands}};
 fn main() {
   let cli = Cli::parse();
   let binding = env::current_dir()
