@@ -31,7 +31,7 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
         }
     };
 
-    let file_names = match manager.list(&pattern, args.n, isext){
+    let file_names = match manager.list(&pattern, args.n, isext, true){
         Ok(file_names) => file_names,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
@@ -110,13 +110,42 @@ pub fn handle_get(root: &str, args: &command::GetArgs){
             return;
         }
     };
-    
-    if let Err(e) = manager.get_and_save(&args.input_files, dest_path) {
-        eprintln!("Failed to retrieve and download files: {}", e);
+
+    if args.input_files.len() == 0 {
+        eprintln!("No files requested for get");
         return;
+    } else if args.input_files.len() == 1 {
+        let links = match manager.list(&format!("{}*", args.input_files[0]), 0,false, true){
+            Ok(links) => links,
+            Err(e) => {
+                eprintln!("Failed to search files: {}", e);
+                return;
+            }
+        };
+
+        if links.len() == 0 {
+            eprintln!("No files found");
+            return;
+        } else if links.len() == 1 {
+            if links[0].name  == args.input_files[0] {
+                if let Err(e) = manager.get_and_save(&args.input_files, dest_path) {
+                    eprintln!("Failed to get files: {}", e);
+                    return;
+                }
+            } else {
+                eprintln!("No files found");
+                return;
+            }
+        } else {
+            eprintln!("Multiple files found");
+            for link in &links {
+                println!(" {}", link.name);
+            }
+            return;
+        }
     }
 
-    println!("Files retrieve and download successfully");
+    println!("Files get successfully");
 }
 
 pub fn handle_delete(root: &str, args: &command::DeleteArgs){

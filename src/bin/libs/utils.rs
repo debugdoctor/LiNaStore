@@ -1,11 +1,11 @@
 use blake3::Hasher;
 use rayon::{iter::{IntoParallelRefIterator, ParallelIterator}, ThreadPool, ThreadPoolBuilder};
 use core::panic;
-use std::{error::Error, fs, io::{self, Read}, path::Path};
+use std::{borrow::Cow, error::Error, fs, io::{self, Read, Write}, path::Path};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 
 const BLOCK_SIZE: usize = 8;
 const GROUP_SIZE: usize = BLOCK_SIZE * 8;
-const BIT_MASKS: [u8; 8] = [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01];
 
 pub fn get_hash256<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error>> {
     let mut hasher = Hasher::new();
@@ -79,23 +79,11 @@ impl BlockManager {
     }
 
     pub fn compress_all(&self, input: &Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> { 
-        let input_size = input.len();
-    
-        // Calculate padding size
-        let pad_size = if input_size % GROUP_SIZE != 0 {
-            GROUP_SIZE - (input_size % GROUP_SIZE)
-        } else {
-            0
-        };
-
         let chunks: Vec<&[u8]> = input.chunks(self.chunk_size).collect();
 
         let compressed_chunks = self.thread_pool.install(|| {
             chunks.par_iter().map(|&chunk| {
-                let mut chunk_vec = chunk.to_vec();
-                if chunk.len() % GROUP_SIZE != 0 {
-                    chunk_vec.extend_from_slice(&vec![0u8; pad_size]);
-                }
+                let chunk_vec = chunk.to_vec();
 
                 let compressed_chunk = self.__encode(&chunk_vec);
                 let raw_len = chunk_vec.len();
@@ -129,7 +117,7 @@ impl BlockManager {
 
     pub fn decompress_all(&self, input: &Vec<u8>, original_size: usize) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut i = 0;
-        let mut chunks_with_flag = Vec::with_capacity(input.len());
+        let mut chunks_with_flag = Vec::with_capacity(0x400000);
 
         while i < input.len() {
             // Ensure at least 2 bytes available for length
@@ -154,19 +142,18 @@ impl BlockManager {
                 )));
             }
 
-            let chunk_data = &input[i..i + chunk_len];
-            chunks_with_flag.push((flag, chunk_data));
+            chunks_with_flag.push((flag, i, i + chunk_len));
             i += chunk_len;
         }
 
         let decompressed_chunks = self.thread_pool.install(|| {
-            chunks_with_flag.par_iter().map(|(flag, chunk)| {
+            chunks_with_flag.par_iter().map(|(flag, start, end)| {
                 match flag {
-                    0 => chunk.to_vec(), // Uncompressed chunk
-                    1 => self.__decode(chunk), // Compressed chunk
+                    0 => Cow::Borrowed(&input[*start..*end]), // Uncompressed chunk
+                    1 => Cow::Owned(self.__decode(&input[*start..*end])), // Compressed chunk
                     _ => panic!("Unknown chunk flag"),
                 }
-            }).collect::<Vec<Vec<u8>>>()
+            }).collect::<Vec<_>>()
         });
 
         let mut result = Vec::with_capacity(original_size + GROUP_SIZE);
@@ -175,162 +162,34 @@ impl BlockManager {
             result.extend_from_slice(&chunk_result);
         }
 
-        result.truncate(original_size);
-
         Ok(result)
     }
     // Input bytes less than 0x10000 (64KiB) - 0xa
     fn __encode(&self, chunk: &[u8]) -> Vec<u8> {
-        let chunk_len = chunk.len();
-
-        if chunk_len > self.chunk_size  || chunk_len % GROUP_SIZE != 0{
-            panic!("Input bytes length is invalid: {:x}", chunk.len());
-        }
         // Mutable size array
-        let mut result = Vec::with_capacity(u16::MAX as usize);
-        let mut payload = Vec::with_capacity(GROUP_SIZE / BLOCK_SIZE + GROUP_SIZE + 2);
-        // Fixed size array
-        let mut count_map = [0u8; 256];
-        let mut payload_buf = [0u8; BLOCK_SIZE + 1];
-
-        let chunk_ptr = chunk.as_ptr();
-
-        for group_start in (0..chunk_len).step_by(GROUP_SIZE) {
-            // Get group pointer
-            let group_ptr = unsafe { chunk_ptr.add(group_start) };
-
-            // Frequency count for the group
-            unsafe { core::ptr::write_bytes(count_map.as_mut_ptr(), 0, 256) };
-
-            let first_byte = unsafe { *group_ptr };
-            count_map[first_byte as usize] = 1;
-            let (mut record_byte, mut max_freq) = (first_byte, 1);
-
-            for i in 1..GROUP_SIZE {
-                let byte = unsafe { *group_ptr.add(i) };
-                let count = unsafe { count_map.get_unchecked_mut(byte as usize) };
-                *count += 1;
-                
-                if *count > max_freq {
-                    record_byte = byte;
-                    max_freq = *count;
-                }
-            }
-            
-            // Subblock compression
-            let mut subblock_compressed = 0u8;
-            unsafe { core::ptr::write_bytes(payload_buf.as_mut_ptr(), 0, BLOCK_SIZE + 1); }
+        let result = Vec::with_capacity(u16::MAX as usize);
         
-            // Subblock compression
-            payload.clear();
-            for block in (0..GROUP_SIZE).step_by(BLOCK_SIZE) {
-                let mut bitmask = 0u8;
-                let block_ptr = unsafe { group_ptr.add(block) };
-
-                let mut payload_buf_pos = 0;
-                
-                for i in 0..BLOCK_SIZE {
-                    let byte = unsafe { *block_ptr.add(i) };
-                    if byte == record_byte {
-                        bitmask |= BIT_MASKS[i];
-                    } else {
-                        payload_buf[payload_buf_pos] = byte;
-                        payload_buf_pos += 1;
-                    }
-                }
-                
-                if payload_buf_pos + 1 < BLOCK_SIZE && max_freq as usize > 2 {
-                    subblock_compressed |= BIT_MASKS[block / BLOCK_SIZE];
-                    unsafe {
-                        payload.push(bitmask);
-                        payload.extend_from_slice(core::slice::from_raw_parts(payload_buf.as_ptr(), payload_buf_pos));
-                    }
-                } else {
-                    payload.extend_from_slice(&chunk[group_start +  block.. group_start + block + BLOCK_SIZE]);
-                }
-            }
-            
-            // Write result, the order is important
-            result.push(subblock_compressed);
-            if subblock_compressed != 0 {
-                result.push(record_byte);
-            }
-            result.extend_from_slice(&payload);
+        let mut encoder = GzEncoder::new(result, Compression::fast());
+        match encoder.write_all(chunk) {
+            Ok(_)  => {},
+            Err(e) => panic!("Failed to encode chunk: {}", e),
         }
-        
-        result
+
+        match encoder.finish() {
+            Ok(compressed_data) => compressed_data,
+            Err(e) => panic!("Failed to finalize compression: {}", e),
+        }
     }
 
     fn __decode(&self, chunk: &[u8]) -> Vec<u8> {
-        let chunk_len = chunk.len();
-        let mut result = Vec::with_capacity(self.chunk_size);
-        let num_blocks_per_group = GROUP_SIZE / BLOCK_SIZE;
-        let mut i = 0;
+        let mut result = Vec::with_capacity(u16::MAX as usize);
+        let mut decoder = GzDecoder::new(chunk);
 
-        let mut block = [0u8; BLOCK_SIZE];
-
-        while i < chunk_len {
-            let subblock_compressed = unsafe { *chunk.get_unchecked(i) };
-            i += 1;
-
-            if subblock_compressed == 0 {
-                // Uncompressed group: directly copy GROUP_SIZE bytes
-                if i + GROUP_SIZE > chunk_len {
-                    panic!("Invalid chunk length");
-                }
-
-                result.extend_from_slice(&chunk[i..i + GROUP_SIZE]);
-                i += GROUP_SIZE;
-                continue;
-            }
-
-            // Compressed group
-            let record_byte = chunk[i];
-            i += 1;
-
-            for block_idx in 0..num_blocks_per_group {
-                let bit_mask = BIT_MASKS[block_idx];
-                if (subblock_compressed & bit_mask) == 0 {
-                    // Block not compressed
-                    let end = i + BLOCK_SIZE;
-                    if end > chunk_len {
-                        panic!("Invalid chunk length");
-                    }
-                    result.extend_from_slice(&chunk[i..end]);
-                    i = end;
-                    continue;
-                }
-
-                // Block is compressed
-                let bitmask = chunk[i];
-                i += 1;
-
-                let num_payload_bytes = BLOCK_SIZE - bitmask.count_ones() as usize;
-
-                if i + num_payload_bytes > chunk_len {
-                    panic!("Invalid chunk length");
-                }
-
-                let payload = &chunk[i..i + num_payload_bytes];
-                i += num_payload_bytes;
-
-                let mut payload_idx = 0;
-
-                for j in 0..BLOCK_SIZE {
-                    if (bitmask & BIT_MASKS[j]) != 0 {
-                        block[j] = record_byte;
-                    } else {
-                        if payload_idx >= payload.len() {
-                            panic!("Payload index out of bounds");
-                        }
-                        block[j] = payload[payload_idx];
-                        payload_idx += 1;
-                    }
-                }
-
-                result.extend_from_slice(&block);
-            }
+        match decoder.read_to_end(&mut result) {
+            Ok(_) => {},
+            Err(e) => panic!("Failed to write chunk for decompression: {}", e),
         }
+        
         result
     }
 }
@@ -346,7 +205,7 @@ mod tests {
         // Convert hex dump to byte array
         // Create a compressor with matching chunk size
         let manager = BlockManager::new();
-        let data = fs::read("../causestracing.sql").expect("Failed to read file");
+        let data = fs::read("../../Hadoop.jar").expect("Failed to read file");
 
         
         // Encode the data
