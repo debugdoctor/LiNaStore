@@ -20,22 +20,22 @@ pub struct Manager {
 impl Manager {
     pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, Box<dyn Error>> {
         let root_path = root.as_ref().to_path_buf(); // Convert to owning type
-        fs::create_dir_all(root_path.join("lihadata"))?;
+        fs::create_dir_all(root_path.join("linadata"))?;
       
         Ok(Manager {
             root: root_path.clone(), // Store owned path
             dao: Dao::new(
-                root_path.join("lihadata").join("meta.db")
+                root_path.join("linadata").join("meta.db")
             )?
         })
     }
 
-    pub fn list(&self, pattern: &str, n: u32, isext: bool) -> Result<Vec<Link>, Box<dyn Error>> {
+    pub fn list(&self, pattern: &str, n: u32, isext: bool, use_regex: bool) -> Result<Vec<Link>, Box<dyn Error>> {
         let links = if isext {
                 self.dao.get_links_by_ext(pattern)?
-            } else if pattern == "" || pattern == "*" {
+            } else if (pattern == "" || pattern == "*") && use_regex {
                 self.dao.get_n_links(n)?
-            } else if pattern.contains('*') {
+            } else if pattern.contains('*') && use_regex {
                 let sql_pattern = pattern.replace('*', "%");
                 self.dao.get_links_by_name(&sql_pattern, true)?
             } else {
@@ -63,7 +63,7 @@ impl Manager {
             let source = self.dao.get_source_by_id(&link.source_id)?
                 .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;
 
-            let source_path = self.root.join("lihadata")
+            let source_path = self.root.join("linadata")
                 .join(&source.id[0..4])
                 .join(&source.id[4..6])
                 .join(&source.id);
@@ -108,7 +108,7 @@ impl Manager {
                 )))?;
 
             let links = self.dao.get_links_by_name(file_name, false)?;
-            let data_path = self.root.join("lihadata");
+            let data_path = self.root.join("linadata");
 
             if links.len() > 0 {
                 let link = links.get(0).ok_or_else(|| 
@@ -209,7 +209,7 @@ impl Manager {
             return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No files requested")));
         }
 
-        let links = Self::list(&self, file, 0,false)?;
+        let links = Self::list(&self, file, 0,false, true)?;
         for link in links {
             let source = self.dao.get_source_by_id(&link.source_id)?
                 .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;
@@ -238,7 +238,7 @@ impl Manager {
                 source_count as u64
             )?;
         } else {
-            let source_path = self.root.join("lihadata")
+            let source_path = self.root.join("linadata")
                 .join(&link.source_id[..4])
                 .join(&link.source_id[4..6])
                 .join(&link.source_id);

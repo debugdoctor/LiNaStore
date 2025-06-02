@@ -1,5 +1,5 @@
 [package]
-name = "lihastore-server"
+name = "linastore-server"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,6 +7,7 @@ edition = "2024"
 blake3 = "1.8.2"
 chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["derive"] }
+flate2 = { version = "1.1.1", features = ["zlib"] }
 nanoid = "0.4.0"
 rayon = "1.10.0"
 rusqlite = {version = "0.35.0", features = ["bundled"]}
@@ -16,7 +17,8 @@ uuid = { version = "1.16.0", features = ["v4"] }
 simd = []
 
 [[bin]]
-name = "lihastore"
+name = "linastore"
+path = "src/bin/linastore.rs"
 
 [profile.release]
 opt-level = 's'

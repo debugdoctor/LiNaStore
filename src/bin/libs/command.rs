@@ -46,16 +46,16 @@ pub struct DeleteArgs {
 // Update Commands enum
 #[derive(Subcommand, Clone)]
 pub enum Commands {
-    #[command(about = "List files in lihastore")]
+    #[command(about = "List files in linastore")]
     List(ListArgs),
 
-    #[command(about = "Store files into lihastore")]
+    #[command(about = "Store files into linastore")]
     Put(PutArgs),
     
-    #[command(about = "Retrieve files from lihastore")]
+    #[command(about = "Retrieve files from linastore")]
     Get(GetArgs),
 
-    #[command(about = "Delete files from lihastore")]
+    #[command(about = "Delete files from linastore")]
     Delete(DeleteArgs),
 }
 
