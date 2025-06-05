@@ -1,4 +1,4 @@
-use super::service::Manager;
+use super::service::{ StoreManager, TidyManager };
 use super::command;
 use std::fs;
 use std::path::Path;
@@ -23,15 +23,15 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
         };
     }
 
-    let manager = match Manager::new(root) {
-        Ok(manager) => manager,
+    let store_manager = match StoreManager::new(root) {
+        Ok(store_manager) => store_manager,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
             return;
         }
     };
 
-    let file_names = match manager.list(&pattern, args.n, isext, true){
+    let file_names = match store_manager.list(&pattern, args.n, isext, true){
         Ok(file_names) => file_names,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
@@ -54,15 +54,15 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
 }
 
 pub fn handle_put(root: &str, args: &command::PutArgs){
-    let manager = match Manager::new(root) {
-        Ok(manager) => manager,
+    let store_manager = match StoreManager::new(root) {
+        Ok(store_manager) => store_manager,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
             return;
         }
     };
     
-    match manager.put(&args.input_files, args.cover, args.compressed){
+    match store_manager.put(&args.input_files, args.cover, args.compressed){
         Ok(_) => {},
         Err(e) => {
             eprintln!("Failed to store files: {}", e);
@@ -86,27 +86,18 @@ pub fn handle_put(root: &str, args: &command::PutArgs){
 }
 
 pub fn handle_get(root: &str, args: &command::GetArgs){
-    let manager = match Manager::new(root) {
-        Ok(manager) => manager,
+    let store_manager = match StoreManager::new(root) {
+        Ok(store_manager) => store_manager,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
             return;
         }
     };
 
-    let dest_path= match &args.dest {
-        Some(path) => {
-            // Convert to absolute path
-            match fs::canonicalize(path) {
-                Ok(absolute_path) => absolute_path,
-                Err(e) => {
-                    eprintln!("Invalid destination path: {}", e);
-                    return;
-                }
-            }
-        },
-        None => {
-            eprintln!("Destination path is required");
+    let dest_path=  match fs::canonicalize(&args.dest) {
+        Ok(absolute_path) => absolute_path,
+        Err(e) => {
+            eprintln!("Invalid destination path: {}", e);
             return;
         }
     };
@@ -115,7 +106,7 @@ pub fn handle_get(root: &str, args: &command::GetArgs){
         eprintln!("No files requested for get");
         return;
     } else if args.input_files.len() == 1 {
-        let links = match manager.list(&format!("{}*", args.input_files[0]), 0,false, true){
+        let links = match store_manager.list(&format!("{}*", args.input_files[0]), 0,false, true){
             Ok(links) => links,
             Err(e) => {
                 eprintln!("Failed to search files: {}", e);
@@ -128,7 +119,7 @@ pub fn handle_get(root: &str, args: &command::GetArgs){
             return;
         } else if links.len() == 1 {
             if links[0].name  == args.input_files[0] {
-                if let Err(e) = manager.get_and_save(&args.input_files, dest_path) {
+                if let Err(e) = store_manager.get_and_save(&args.input_files, dest_path) {
                     eprintln!("Failed to get files: {}", e);
                     return;
                 }
@@ -150,18 +141,27 @@ pub fn handle_get(root: &str, args: &command::GetArgs){
 
 pub fn handle_delete(root: &str, args: &command::DeleteArgs){
     let pattern = args.input_files.clone().unwrap_or_else(|| String::from(""));
-    let manager = match Manager::new(root) {
-        Ok(manager) => manager,
+    let store_manager = match StoreManager::new(root) {
+        Ok(store_manager) => store_manager,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
             return;
         }
     };
 
-    if let Err(e) = manager.delete(&pattern) {
+    if let Err(e) = store_manager.delete(&pattern) {
         eprintln!("Failed to delete files: {}", e);
         return;
     }
 
     println!("Files deleted successfully");
+}
+
+pub fn handle_tidy(args: &command::TidyArgs){
+    let mut tidy_manager = TidyManager::new();
+
+    if let Err(e) = tidy_manager.tidy(&args.target_dir, args.keep_new) {
+        eprintln!("Failed to tidy: {}", e);
+        return;
+    }
 }

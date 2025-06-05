@@ -1,5 +1,5 @@
-use std::{ error::Error, fs, io, os::unix::fs::MetadataExt, path::{Path, PathBuf} };
-use chrono::Utc;
+use std::{ collections::HashMap, error::Error, fs, io, os::unix::fs::{symlink, MetadataExt}, path::{Path, PathBuf} };
+use chrono::{DateTime, Utc};
 use nanoid;
 
 use super::dao::{Dao, Link, Source};
@@ -12,17 +12,21 @@ const NANOID_MAP: [char; 62] = [
     ];
 
 #[derive(Debug, Clone)]
-pub struct Manager {
+pub struct StoreManager {
     root: PathBuf,
     dao: Dao
 }
 
-impl Manager {
+pub struct TidyManager {
+    map_cache: HashMap<String, Vec<(PathBuf, String)>>
+}
+
+impl StoreManager {
     pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, Box<dyn Error>> {
         let root_path = root.as_ref().to_path_buf(); // Convert to owning type
         fs::create_dir_all(root_path.join("linadata"))?;
       
-        Ok(Manager {
+        Ok(StoreManager {
             root: root_path.clone(), // Store owned path
             dao: Dao::new(
                 root_path.join("linadata").join("meta.db")
@@ -257,4 +261,111 @@ impl Manager {
 
         format!("{}{}", utc_time_formated, nano_id)
     }
+}
+
+impl TidyManager {
+    pub fn new() -> Self {
+        TidyManager {
+            map_cache: HashMap::with_capacity(0x8000),
+        }
+    }
+
+    pub fn tidy<P: AsRef<Path>>(&mut self, target_path: P, keep_new: bool) -> Result<(), Box<dyn Error>> {
+        let paths = utils::path_walk(target_path)?;
+        
+        for path in paths { 
+            self.file_info_collector(&path);
+        }
+
+        for key in self.map_cache.keys() {
+            let file_infos = match self.map_cache.get(key) {
+                Some(files) if !files.is_empty() => files,
+                _ => continue,
+            };
+
+            let target_file_info = if keep_new {
+                self.find_extreme_file(file_infos, |a, b| a > b)
+            } else {
+                self.find_extreme_file(file_infos, |a, b| a < b)
+            };
+
+            for file_info in file_infos {
+                if file_info.1 != *target_file_info.1 && file_info.0 != *target_file_info.0{
+                    let relative_file_path = self.relative_path_with_same_root(&file_info.0, target_file_info.0);
+                    fs::remove_file(&file_info.0)?;
+                    symlink(relative_file_path, &file_info.0)?;
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    fn file_info_collector(&mut self, path: &Path){
+        let hash_code = match utils::get_hash256(path) {
+            Ok(hash_code) => hash_code,
+            Err(e) => panic!("Hash of file {} generate error: {}", path.display(), e.to_string())
+        };
+
+        let created_date = match fs::metadata(path){
+            Ok(metadata) => match metadata.created(){
+                Ok(date) => date,
+                Err(e) => panic!("Get file {} create date error: {}", path.display(), e.to_string())
+            },
+            Err(e) => panic!("Get file {} metadata error: {}", path.display(), e.to_string())
+        };
+
+        let formated_created_date = DateTime::<Utc>::from(created_date).format("%Y%m%d%H%M%S").to_string();
+
+        self.map_cache
+            .entry(hash_code)
+            .or_insert_with(Vec::new)
+            .push((path.to_path_buf(), formated_created_date));
+    }
+
+    fn find_extreme_file<'a, F>(&self, file_infos: &'a [(PathBuf, String)], compare: F) -> (&'a PathBuf, &'a String)
+    where
+        F: Fn(&String, &String) -> bool,
+    {
+        let mut extreme = (&file_infos[0].0, &file_infos[0].1);
+        for file_info in &file_infos[1..] {
+            if compare(&file_info.1, extreme.1) {
+                extreme = (&file_info.0, &file_info.1);
+            }
+        }
+        extreme
+    }
+
+    fn relative_path_with_same_root<P: AsRef<Path>>(&self, from: P, to: P) -> PathBuf{
+        let from_components: Vec<_> = from.as_ref().components().collect();
+        let to_components: Vec<_> = to.as_ref().components().collect();
+        let min_len = from_components.len().min(to_components.len());
+        let mut common = 0;
+
+        let mut result = PathBuf::with_capacity(0x10);
+
+        while common < min_len && from_components[common] == to_components[common] {
+            common += 1;
+        }
+
+        if from_components.len() - common > 1 {
+            for _ in &from_components[common + 1..] {
+                result.push("..");
+            }
+        } else if from_components.len() - common == 1 {
+            result.push(".");
+        }
+
+        for comp in &to_components[common..] {
+            result.push(comp.as_os_str());
+        }
+        
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests { 
+    use super::*;
+
 }
