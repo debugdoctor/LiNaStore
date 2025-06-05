@@ -1,7 +1,7 @@
 use blake3::Hasher;
 use rayon::{iter::{IntoParallelRefIterator, ParallelIterator}, ThreadPool, ThreadPoolBuilder};
 use core::panic;
-use std::{borrow::Cow, error::Error, fs, io::{self, Read, Write}, path::Path};
+use std::{borrow::Cow, error::Error, fs, io::{self, Read, Write}, path::{Path, PathBuf}};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 
 const BLOCK_SIZE: usize = 8;
@@ -12,7 +12,7 @@ pub fn get_hash256<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error
     let mut file = fs::File::open(file_path)?;
     let file_size = file.metadata()?.len();
     let mut total_read = 0;
-    let mut buffer = [0u8; 0x100000]; 
+    let mut buffer = [0u8; 0x200000]; 
 
     while total_read < file_size {
         let bytes_read = file.read(&mut buffer)?;
@@ -24,6 +24,24 @@ pub fn get_hash256<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error
     }
     
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub fn path_walk<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let path = Path::new(path.as_ref());
+    let mut result: Vec<PathBuf> = Vec::new();
+
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let current_entry = entry?.path();
+            if current_entry.is_dir() {
+                result.extend_from_slice(&path_walk(current_entry)?);
+            } else {
+                result.push(current_entry);
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// For example, there is a block size of 64 bytes.
@@ -57,6 +75,7 @@ impl BlockManager {
         BlockManager { chunk_size: 0x10000 - 0x400, thread_pool }
     }
 
+    #[allow(dead_code)]
     pub fn with_capacity(
         chunk_size: usize,
     ) -> Self {
@@ -225,5 +244,14 @@ mod tests {
         
         // The decoded data should match the original input
         assert_eq!(data, decompressed, "Encoded and decoded data should match original input");
+    }
+
+    #[test]
+    fn test_path_recursive() {
+        let path = Path::new(".");
+        let paths = path_walk(path).expect("Failed to walk path");
+        for path in paths {
+            println!("{}", path.display());
+        }
     }
 }

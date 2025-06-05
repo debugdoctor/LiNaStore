@@ -1,2 +1,2 @@
-# Lihastore
-A simple file storage using hashmap
+# linastore
+A simple, fast and low-cost file storage service
