@@ -1,0 +1,18 @@
+[package]
+name = "linabase"
+version = "0.1.0"
+edition = "2024"
+author = ["aimerick"]
+
+[dependencies]
+blake3 = "1.8.2"
+chrono = "0.4.41"
+flate2 = "1.1.2"
+nanoid = "0.4.0"
+rayon = "1.10.0"
+rusqlite = { version = "0.36.0", features = ["bundled"] }
+uuid = { version = "1.17.0", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = true

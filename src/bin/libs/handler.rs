@@ -1,4 +1,4 @@
-use super::service::{ StoreManager, TidyManager };
+use linabase::service::{ StoreManager, TidyManager };
 use super::command;
 use std::fs;
 use std::path::Path;

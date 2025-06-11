@@ -1,4 +1,3 @@
-// src/bin/lib/dao.rs
 use std::{error::Error, path::Path, result::Result, sync::Arc};
 use rusqlite::Connection;
 use uuid::Uuid;

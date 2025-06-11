@@ -44,6 +44,23 @@ pub fn path_walk<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>, Box<dyn Error>
     Ok(result)
 }
 
+pub fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Result<()> {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(src, dst)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+        symlink_file(src, dst)
+    }
+}
+
 /// For example, there is a block size of 64 bytes.
 /// 
 /// This block can be compressed as:
