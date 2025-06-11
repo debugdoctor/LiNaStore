@@ -1,4 +1,4 @@
-use std::{ collections::HashMap, error::Error, fs, io, os::unix::fs::{symlink, MetadataExt}, path::{Path, PathBuf} };
+use std::{ collections::HashMap, error::Error, fs, io, os::unix::fs::MetadataExt, path::{Path, PathBuf} };
 use chrono::{DateTime, Utc};
 use nanoid;
 
@@ -123,6 +123,10 @@ impl StoreManager {
                 let source = self.dao.get_source_by_id(&link.source_id)?
                     .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "Source not found")))?;
 
+                #[cfg(unix)]
+                let new_size = fs::metadata(&file)?.size();
+
+                #[cfg(windows)]
                 let new_size = fs::metadata(&file)?.size();
 
                 if cover {
@@ -292,8 +296,17 @@ impl TidyManager {
             for file_info in file_infos {
                 if file_info.1 != *target_file_info.1 && file_info.0 != *target_file_info.0{
                     let relative_file_path = self.relative_path_with_same_root(&file_info.0, target_file_info.0);
-                    fs::remove_file(&file_info.0)?;
-                    symlink(relative_file_path, &file_info.0)?;
+                    
+                    match fs::remove_file(&file_info.0) {
+                        Ok(_) => {},
+                        Err(_) => {
+                            eprintln!("Failed to tidy with file: {}", relative_file_path.display());
+                            continue;
+                        }
+                    }
+                    utils::create_symlink(relative_file_path, &file_info.0)?;
+                    // Result output visible for users
+                    println!("{} -> {}", file_info.0.display(), target_file_info.0.display());
                 }
             };
         }

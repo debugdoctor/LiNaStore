@@ -1,4 +1,5 @@
 mod libs;
+extern crate linabase;
 
 use std::env;
 use clap::Parser;
