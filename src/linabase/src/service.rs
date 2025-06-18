@@ -1,4 +1,4 @@
-use std::{ collections::HashMap, error::Error, fs, io, os::unix::fs::MetadataExt, path::{Path, PathBuf} };
+use std::{ collections::HashMap, error::Error, result::Result, fs, io, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
 use chrono::{DateTime, Utc};
 use nanoid;
 
@@ -49,6 +49,32 @@ impl StoreManager {
         Ok(links)
     }
 
+    pub fn get_binary_data(&self, file_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        if file_name.is_empty() {
+            return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No filename provided")));
+        }
+        let links = self.dao.get_links_by_name(file_name, false)?;
+        let link = links.get(0).ok_or_else(|| 
+            Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
+        )?;
+
+        let source = self.dao.get_source_by_id(&link.source_id)?
+            .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;
+
+        let source_path = self.root.join("linadata")
+                .join(&source.id[0..4])
+                .join(&source.id[4..6])
+                .join(&source.id);
+        
+
+        Ok(if source.compressed {
+            let bm = utils::BlockManager::new();
+            bm.decompress_all(&fs::read(&source_path)?,  source.size as usize)?
+        } else {
+            fs::read(&source_path)?
+        })
+    }
+
     pub fn get_and_save<P: AsRef<Path>>(&self, files: &Vec<String>, dest: P) -> Result<(), Box<dyn Error>> {
         if files.is_empty() {
             return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No files requested")));
@@ -86,6 +112,108 @@ impl StoreManager {
         Ok(())
     }
 
+    pub fn put_binary_data(&self, file_name: &str, input: &Vec<u8>, cover: bool, compressed: bool) -> Result<(), Box<dyn Error>> {
+        if file_name.is_empty() {
+            return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No filename provided")));
+        }
+
+        let links = self.dao.get_links_by_name(file_name, false)?;
+        let data_path = self.root.join("linadata");
+
+        if links.len() > 0 {
+            let link = links.get(0).ok_or_else(|| 
+                Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
+            )?;
+
+            let hash256 = utils::get_hash256_from_binary(input);
+            let source = self.dao.get_source_by_id(&link.source_id)?
+                .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "Source not found")))?;
+
+            let new_size = input.len() as u64;
+
+            if cover {
+                // Update hash256 and source compression and size
+                self.dao.update_source(&link.source_id, &hash256, compressed, new_size, source.count)?;
+                let target_file = data_path
+                    .join(&link.source_id[..4])
+                    .join(&link.source_id[4..6])
+                    .join(&link.source_id);
+
+                if compressed {
+                    let bm = utils::BlockManager::new();
+                    let data = bm.compress_all(input)?;
+                    let _ = fs::write(target_file, data)?;
+                } else {
+                    let _ = fs::write(target_file, input);
+                }
+                    
+            } else {
+                if hash256 == source.hash256 && source.compressed == compressed {
+                    return Ok(());
+                }
+
+                // 1. Source Release
+                let source_count = source.count.checked_sub(1).ok_or(
+                io::Error::new(io::ErrorKind::Other, "Source count is 0")
+                )?;
+
+                self.release_source(&link, &source, source_count)?;
+
+                // 2. Insert new source
+                let id = Self::file_name_gen();
+                self.dao.insert_source(&id, &hash256, compressed, new_size)?;
+                self.dao.update_link_source_id(&link.id, &id)?;
+                let target_file = data_path
+                    .join(&id[..4])
+                    .join(&id[4..6])
+                    .join(&id);
+                let _ = fs::write(target_file, input)?;
+            }
+        } else {
+            // Check hash256
+            let hash256 = utils::get_hash256_from_binary(input);
+            let ext = Path::new(&file_name)
+                .extension()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or("")
+                .to_string();
+
+            // If hash256 exists, count + 1
+            if let Some(source) = self.dao.get_source_by_hash256(&hash256)?{
+                self.dao.insert_link(file_name, &ext, &source.id)?;
+                // Update source count
+                return Ok(self.dao.update_source(
+                    &source.id,
+                    &source.hash256,
+                    source.compressed,
+                    source.size,
+                    source.count + 1)?);
+            }
+
+            let id = Self::file_name_gen();
+            let size = input.len() as u64;
+            // Create source directory
+            let source_dir = data_path.join(&id[..4]).join(&id[4..6]);
+            fs::create_dir_all(&source_dir)?;
+
+            self.dao.insert_source(&id, &hash256, compressed, size)?;
+            self.dao.insert_link(file_name, &ext, &id)?;
+
+            let target_file = source_dir
+                    .join(&id);
+
+            if compressed {
+                let bm = utils::BlockManager::new();
+                let data = bm.compress_all(input)?;
+                fs::write(target_file, data)?;
+            } else {
+                fs::write(target_file, input)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn put(&self, files: &Vec<String>, cover: bool, compressed: bool) -> Result<(), Box<dyn Error>> {
         if files.is_empty() {
             return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No files requested")));
@@ -119,14 +247,10 @@ impl StoreManager {
                     Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
                 )?;
 
-                let hash256 = utils::get_hash256(file_path)?;
+                let hash256 = utils::get_hash256_from_file(file_path)?;
                 let source = self.dao.get_source_by_id(&link.source_id)?
                     .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "Source not found")))?;
 
-                #[cfg(unix)]
-                let new_size = fs::metadata(&file)?.size();
-
-                #[cfg(windows)]
                 let new_size = fs::metadata(&file)?.size();
 
                 if cover {
@@ -170,7 +294,7 @@ impl StoreManager {
                 }
             } else {
                 // Check hash256
-                let hash256 = utils::get_hash256(file_path)?;
+                let hash256 = utils::get_hash256_from_file(file_path)?;
                 let ext = Path::new(&file)
                     .extension()
                     .unwrap_or_default()
@@ -212,12 +336,12 @@ impl StoreManager {
         Ok(())
     }
 
-    pub fn delete(&self, file: &str) -> Result<(), Box<dyn Error>>{
-        if file == "" {
+    pub fn delete(&self, pattern: &str) -> Result<(), Box<dyn Error>>{
+        if pattern == "" {
             return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No files requested")));
         }
 
-        let links = Self::list(&self, file, 0,false, true)?;
+        let links = Self::list(&self, pattern, 0,false, true)?;
         for link in links {
             let source = self.dao.get_source_by_id(&link.source_id)?
                 .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;
@@ -315,7 +439,7 @@ impl TidyManager {
     }
 
     fn file_info_collector(&mut self, path: &Path){
-        let hash_code = match utils::get_hash256(path) {
+        let hash_code = match utils::get_hash256_from_file(path) {
             Ok(hash_code) => hash_code,
             Err(e) => panic!("Hash of file {} generate error: {}", path.display(), e.to_string())
         };
@@ -379,6 +503,22 @@ impl TidyManager {
 
 #[cfg(test)]
 mod tests { 
-    use super::*;
+    use rand::Rng;
 
+    use super::*;
+    fn generate_random_binary(size: usize) -> Vec<u8> {
+        let mut rng = rand::rng();
+        let mut data = vec![0u8; size]; 
+        rng.fill(&mut data[..]); 
+        data
+    }
+    
+    #[test]
+    fn test_data_flow_store() {
+        let data = generate_random_binary(64 * 1024);
+        let sm = StoreManager::new(".").unwrap();
+        let _ = sm.put_binary_data("random.txt", &data, true, true);
+        let data_get = sm.get_binary_data("random.txt").unwrap();
+        assert_eq!(data, data_get, "Data flow test failed");
+    }
 }

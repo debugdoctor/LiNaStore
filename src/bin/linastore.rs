@@ -10,7 +10,7 @@ use crate::libs::command::{FileArgs, StoreArgs};
 fn main() {
   let cli = Cli::parse();
   let binding = env::current_dir()
-      .expect("Failed to get current directory");
+      .unwrap_or_else(|_| panic!("Failed to get current directory"));
   let current_dir = binding
       .to_str()
       .unwrap_or_else(|| panic!("Failed to convert current directory to string"));

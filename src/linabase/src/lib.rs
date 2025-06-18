@@ -1,3 +1,3 @@
-pub mod service;
 mod dao;
 mod utils;
+pub mod service;

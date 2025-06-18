@@ -6,8 +6,9 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 
 const BLOCK_SIZE: usize = 8;
 const GROUP_SIZE: usize = BLOCK_SIZE * 8;
+const BUFFER_SIZE: usize = 0x80000;
 
-pub fn get_hash256<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error>> {
+pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error>> {
     let mut hasher = Hasher::new();
     let mut file = fs::File::open(file_path)?;
     let file_size = file.metadata()?.len();
@@ -24,6 +25,16 @@ pub fn get_hash256<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error
     }
     
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub fn get_hash256_from_binary(input: &[u8]) -> String {
+    let mut hasher = Hasher::new();
+
+    for chunk in input.chunks(BUFFER_SIZE){
+        hasher.update(chunk);
+    }
+
+    hasher.finalize().to_hex().to_string()
 }
 
 pub fn path_walk<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>, Box<dyn Error>> {
