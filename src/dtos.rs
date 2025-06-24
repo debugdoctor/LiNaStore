@@ -1,4 +1,5 @@
 use chrono::Utc;
+use uuid::Uuid;
 
 #[derive(Clone, PartialEq)]
 pub struct PayLoad {
@@ -8,10 +9,13 @@ pub struct PayLoad {
     pub data: Vec<u8>,
 }
 
-/// flags definition
+/// Flags Definition
 /// ---
-///
-/// | Send? | Payload? | Reserved | Reserved | Reserved | Reserved | Cover? | Compress? |
+/// ```markdown
+/// | File Operation | Reserved | Reserved | Reserved | Reserved | Cover | Compress |
+/// |----------------|----------|----------|----------|----------|-------|----------|
+/// | 0x88 - 0x40    | 0x20     | 0x10     | 0x08     | 0x04     | 0x02  | 0x01     |
+/// ```
 #[derive(Clone, PartialEq)]
 pub struct ProtocolMessage {
     pub flags: u8,
@@ -22,7 +26,7 @@ pub struct ProtocolMessage {
 impl ProtocolMessage {
     pub fn new() -> Self {
         ProtocolMessage {
-            flags: 0,
+            flags: 0x40,
             status: Status::None,
             payload: PayLoad {
                 name: [0; 256],
@@ -32,13 +36,40 @@ impl ProtocolMessage {
             },
         }
     }
+
+    pub fn verify(&self) -> bool {
+        self.payload.checksum == self.calculate_checksum()
+    }
+
+    // Calculate CRC32 checksum
+    pub fn calculate_checksum(&self) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&self.payload.name);
+        hasher.update(&self.payload.length.to_le_bytes());
+        hasher.update(&self.payload.data);
+        hasher.finalize()
+    }
+
+    pub fn serialize_protocol_message(
+        &self,
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(0x1000);
+
+        payload.push(self.status.clone() as u8);
+        payload.extend_from_slice(&self.payload.length.to_le_bytes());
+        payload.extend_from_slice(&self.payload.checksum.to_le_bytes());
+        payload.extend_from_slice(&self.payload.data);
+        payload
+    }
 }
 
 
 
 pub enum FlagType {
-    SEND = 0x80,
-    PAYLOAD = 0x40,
+    DELETE = 0x80,
+    SEND = 0x48,
+    READ = 0x40,
+    PAYLOAD = 0x20,
     COVER = 0x2,
     COMPRESS = 0x1,
 }
@@ -57,7 +88,21 @@ impl Package {
     pub fn new() -> Self {
         Package {
             status: Status::None,
-            uni_id: [0; 16],
+            uni_id: Uuid::new_v4().into_bytes(),
+            behavior: Behavior::None,
+            content: Content {
+                flags: 0x40,
+                name: [0; 256],
+                data: Vec::new(),
+            },
+            created_at: Utc::now().timestamp(),
+        }
+    }
+
+    pub fn new_with_id(uni_id: &Uuid) -> Self {
+        Package {
+            status: Status::None,
+            uni_id: uni_id.into_bytes(),
             behavior: Behavior::None,
             content: Content {
                 flags: 0,
@@ -88,7 +133,7 @@ pub enum Status {
     None = 255,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Behavior {
     GetFile,
     PutFile,

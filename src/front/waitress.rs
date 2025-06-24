@@ -1,30 +1,30 @@
 use std::{net::SocketAddr, time::Duration};
 use bytes::{BytesMut};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}};
-use tracing::{event, Level};
+use tracing::{event, instrument, Level};
 use uuid::Uuid;
 use tokio::net::TcpListener;
 
-use crate::{conveyer::ConveyQueue, dtos::{Content, FlagType, Package, ProtocolMessage, Behavior}};
-
+use crate::{conveyer::ConveyQueue, dtos::{Behavior, Content, FlagType, Package, ProtocolMessage}, shutdown::Shutdown};
 
 impl ProtocolMessage {
+    #[instrument(skip_all)]
     async fn parse_protocol_message<T: AsyncReadExt + Unpin>(
         &mut self,
         stream: &mut T,
     ) -> Result<(), String> {
-        let flags = match stream.read_u8().await{
+        self.flags = match stream.read_u8().await{
             Ok(flags) => flags,
             Err(_) => {
                 return Err(format!("Failed to read flag"));
             },
         };
 
-        if flags & FlagType::PAYLOAD as u8 == 0 {
+        if self.flags & FlagType::PAYLOAD as u8 == 0 {
             return Ok(())
         } else {
-            match stream.read_exact(&mut self.payload.name).await{
-                Ok(_) => self.payload.name,
+            match stream.read_exact(&mut self.payload.name).await {
+                Ok(_) => {},
                 Err(_) => {
                     return Err("Failed to read name".to_string());
                 },
@@ -44,7 +44,6 @@ impl ProtocolMessage {
                 },
             };
 
-            let mut data = Vec::with_capacity(self.payload.length as usize);
             let mut chunk = BytesMut::with_capacity(0x10000);
 
             loop {
@@ -53,9 +52,9 @@ impl ProtocolMessage {
                         if n == 0 {
                             break;
                         }
-                        data.extend_from_slice(&chunk[..n]);
+                        self.payload.data.extend_from_slice(&chunk[..n]);
                         chunk.clear();
-                        if data.len() >= self.payload.length as usize {
+                        if self.payload.data.len() >= self.payload.length as usize {
                             break;
                         }
                     },
@@ -65,7 +64,7 @@ impl ProtocolMessage {
                 };
             }
 
-            if !self.verify() {
+            if self.verify() {
                 Ok(())
             } else {
                 Err("Invalid checksum".to_string())
@@ -73,35 +72,12 @@ impl ProtocolMessage {
 
         }
     }
-
-    fn serialize_protocol_message(
-        &self,
-    ) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(0x1000);
-
-        payload.push(self.flags);
-        payload.extend_from_slice(&self.payload.length.to_le_bytes());
-        payload.extend_from_slice(&self.payload.checksum.to_le_bytes());
-        payload.extend_from_slice(&self.payload.data);
-        payload
-    }
-
-    pub fn verify(&self) -> bool {
-        self.payload.checksum == self.calculate_checksum()
-    }
-
-    // Calculate CRC32 checksum
-    pub fn calculate_checksum(&self) -> u32 {
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&self.payload.name);
-        hasher.update(&self.payload.length.to_le_bytes());
-        hasher.update(&self.payload.data);
-        hasher.finalize()
-    }
 }
 
+
 // One waitress handles one incoming request
-async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+#[instrument(skip_all)]
+async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
         mut stream: T,
         peer_addr: SocketAddr
     ){
@@ -118,12 +94,12 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     };
 
     let uuid = Uuid::new_v4();
-    let uni_id = uuid.as_bytes();
+    let uni_id = uuid.into_bytes();
+    event!(Level::INFO, "[{}] Package {} generated", &log_id, uuid.to_string());
 
     // Order generation
-    let mut order_pkg = Package::new();
-    order_pkg.uni_id = *uni_id;
-    order_pkg.behavior = if message.flags & FlagType::SEND as u8 == 1 {
+    let mut order_pkg = Package::new_with_id(&uuid);
+    order_pkg.behavior = if message.flags & FlagType::SEND as u8 == FlagType::SEND as u8 {
         Behavior::PutFile
     } else {
         Behavior::GetFile
@@ -147,9 +123,10 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     let start_time = tokio::time::Instant::now();
     let overall_timeout = Duration::from_secs(10); // From memory id=416ac113, using 10s timeout
 
-    // Wait for message from conveyer
+    // Wait for package from conveyer
     let con_queue = ConveyQueue::get_instance();
     loop {
+        tokio::time::sleep(Duration::from_millis(2)).await;
         // Check overall timeout
         if tokio::time::Instant::now() > start_time + overall_timeout {
             event!(tracing::Level::ERROR, "[waitress {}] Overall timeout exceeded", &log_id);
@@ -157,14 +134,12 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
 
         let con_queue_clone = con_queue.clone();
-        let uni_id_value = *uni_id;
+        let uni_id_value = uni_id;
 
         match con_queue_clone.consume_service(uni_id_value) {
             Ok(Some(pkg)) => {
                 let mut response = ProtocolMessage::new();
-                response.flags = pkg.content.flags;
                 response.status = pkg.status;
-                response.payload.name = pkg.content.name;
                 response.payload.length = pkg.content.data.len() as u32;
                 response.payload.checksum = response.calculate_checksum();
                 response.payload.data = pkg.content.data;
@@ -172,22 +147,20 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 
                 if let Err(e) = stream.write_all(&resp_data).await {
                     event!(tracing::Level::ERROR, "Error writing to stream: {}", e);
-                    break;
-                } 
+                }
+                break;
             },
             Ok(None) => {},
             Err(err) => {
                 event!(tracing::Level::ERROR, "[waitress {}] {}", &log_id, err);
             }
         }
-
-        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
-pub async fn get_ready() -> ! {
+#[instrument(skip_all)]
+pub async fn run_custom_server(addr: &str) {
     event!(Level::INFO ,"Waitress starting");
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8096));
 
     let listener = match TcpListener::bind(addr).await{
         Ok(listener) => listener,
@@ -197,7 +170,13 @@ pub async fn get_ready() -> ! {
         }
     };
 
+    let shutdown_status = Shutdown::get_instance();
+
     loop {
+        if shutdown_status.is_shutdown() {
+            break;
+        }
+
         //  Accept the connection
         let (stream, addr ) = match listener.accept().await {
             Ok(req) => req,
@@ -207,16 +186,8 @@ pub async fn get_ready() -> ! {
             }
         };
 
-        event!(Level::INFO, "Accepted connection from {}", addr);
-        tokio::task::spawn( async move {
+        tokio::task::spawn(async move {
             waitress(stream, addr).await;
         });
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio_test::io::Builder;
-    use tracing_test::traced_test;
 }
