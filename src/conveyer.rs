@@ -72,7 +72,7 @@ impl ConveyQueue {
                     }
 
                     drop(queue);
-                    thread::sleep(Duration::from_millis(800));
+                    thread::sleep(Duration::from_secs(1));
                 }
             });
         };
@@ -101,6 +101,9 @@ impl ConveyQueue {
     pub fn consume_order(&self) -> Result<Option<Package>, String> {
         match self.order_queue.try_lock() {
             Ok(mut guard)  => {
+                if guard.is_empty() {
+                    return Ok(None);
+                }
                 Ok(guard.pop_front())
             },
             Err(e) => {
@@ -128,6 +131,10 @@ impl ConveyQueue {
                 return Err(format!("Failed to acquire queue lock: {:?}", e));
             },
         };
+
+        if queue.is_empty() {
+            return Ok(None);
+        }
         
         match queue.front() {
             Some(pkg) => {
@@ -144,12 +151,4 @@ impl ConveyQueue {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use uuid::Uuid;
-
-    use super::*;
-    use std::thread;
-    use std::sync::{Arc};
-    use std::time::Duration;
-
 }

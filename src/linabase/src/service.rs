@@ -142,9 +142,9 @@ impl StoreManager {
                 if compressed {
                     let bm = utils::BlockManager::new();
                     let data = bm.compress_all(input)?;
-                    let _ = fs::write(target_file, data)?;
+                    fs::write(target_file, data)?;
                 } else {
-                    let _ = fs::write(target_file, input);
+                    fs::write(target_file, input)?;
                 }
                     
             } else {
