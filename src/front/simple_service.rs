@@ -6,7 +6,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tracing::{event, instrument, Level};
 use uuid::Uuid;
-use crate::{conveyer::ConveyQueue, dtos::{Behavior, Package}, shutdown::Shutdown};
+use crate::{conveyer::ConveyQueue, dtos::{self, Behavior, Package}, shutdown::Shutdown};
 
 fn get_mime_type(filename: &str) -> &'static str {
     match Path::new(filename).extension().and_then(|e| e.to_str()) {
@@ -58,13 +58,13 @@ async fn handle_http(req: Request<hyper::body::Incoming>) -> Result<Response<Ful
     package.behavior = Behavior::GetFile;
 
     let name_bytes = path_vec[0].as_bytes();
-    if name_bytes.len() > 256 {
+    if name_bytes.len() > dtos::NAME_SIZE {
         return Ok(Response::builder()
                     .status(hyper::StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from("File name too long: max 256 bytes")))?
                 );
     }
-    let mut name_buf = [0u8; 256];
+    let mut name_buf = [0u8; dtos::NAME_SIZE];
     name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
     package.content.name = name_buf;
     package.behavior = Behavior::GetFile;
@@ -85,7 +85,7 @@ async fn handle_http(req: Request<hyper::body::Incoming>) -> Result<Response<Ful
     // Wait for package from conveyer
     let con_queue = ConveyQueue::get_instance();
     loop {
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         // Check overall timeout
         if tokio::time::Instant::now() > start_time + overall_timeout {
             event!(tracing::Level::ERROR, "[waitress {}] Overall timeout exceeded", &log_id);

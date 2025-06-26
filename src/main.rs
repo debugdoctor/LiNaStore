@@ -46,7 +46,7 @@ async fn main() -> Result<()>{
     });
     
     let _ = tokio::task::spawn(async move {
-        front::get_ready().await;
+        front::get_ready("0.0.0.0", "8086", "8096").await;
     });
 
     // Graceful shutdown

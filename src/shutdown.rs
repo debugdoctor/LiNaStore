@@ -16,12 +16,12 @@ impl Shutdown {
         SHUTDOWN.clone()
     }
 
-    /// Checks if shutdown has been triggered (safe for concurrent access)
+    /// Checks if shutdown has been triggered
     pub fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::SeqCst)
     }
 
-    /// Triggers the shutdown signal (safe for concurrent access)
+    /// Triggers the shutdown signal
     pub fn shutdown(&self) {
         self.is_shutdown.store(true, Ordering::SeqCst);
     }

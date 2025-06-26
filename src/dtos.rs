@@ -1,9 +1,11 @@
 use chrono::Utc;
 use uuid::Uuid;
 
+pub const NAME_SIZE: usize = 255;
+
 #[derive(Clone, PartialEq)]
 pub struct PayLoad {
-    pub name: [u8; 256],
+    pub name: [u8; NAME_SIZE],
     pub length: u32,
     pub checksum: u32,
     pub data: Vec<u8>,
@@ -17,19 +19,19 @@ pub struct PayLoad {
 /// | 0x88 - 0x40    | 0x20     | 0x10     | 0x08     | 0x04     | 0x02  | 0x01     |
 /// ```
 #[derive(Clone, PartialEq)]
-pub struct ProtocolMessage {
+pub struct LiNaProtocol {
     pub flags: u8,
-    pub status: Status,
+    pub status: Status, // Only for server response
     pub payload: PayLoad,
 }
 
-impl ProtocolMessage {
+impl LiNaProtocol {
     pub fn new() -> Self {
-        ProtocolMessage {
-            flags: 0x40,
+        LiNaProtocol {
+            flags: FlagType::None as u8,
             status: Status::None,
             payload: PayLoad {
-                name: [0; 256],
+                name: [0; 255],
                 length: 0,
                 checksum: 0,
                 data: Vec::new(),
@@ -66,12 +68,12 @@ impl ProtocolMessage {
 
 
 pub enum FlagType {
-    DELETE = 0x80,
-    SEND = 0x48,
-    READ = 0x40,
-    PAYLOAD = 0x20,
-    COVER = 0x2,
-    COMPRESS = 0x1,
+    Delete = 0xC0,
+    Write = 0x80,
+    Read = 0x40,
+    Cover = 0x02,
+    Compress = 0x01,
+    None = 0x00,
 }
 
 
@@ -92,7 +94,7 @@ impl Package {
             behavior: Behavior::None,
             content: Content {
                 flags: 0x40,
-                name: [0; 256],
+                name: [0; NAME_SIZE],
                 data: Vec::new(),
             },
             created_at: Utc::now().timestamp(),
@@ -106,7 +108,7 @@ impl Package {
             behavior: Behavior::None,
             content: Content {
                 flags: 0,
-                name: [0; 256],
+                name: [0; NAME_SIZE],
                 data: Vec::new(),
             },
             created_at: Utc::now().timestamp(),
@@ -117,7 +119,7 @@ impl Package {
 #[derive(Clone, PartialEq)]
 pub struct Content {
     pub flags: u8,
-    pub name: [u8; 256],
+    pub name: [u8; NAME_SIZE],
     pub data: Vec<u8>,
 }
 
@@ -137,5 +139,6 @@ pub enum Status {
 pub enum Behavior {
     GetFile,
     PutFile,
+    DeleteFile,
     None,
 }
