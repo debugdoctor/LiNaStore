@@ -336,12 +336,12 @@ impl StoreManager {
         Ok(())
     }
 
-    pub fn delete(&self, pattern: &str) -> Result<(), Box<dyn Error>>{
+    pub fn delete(&self, pattern: &str, use_regx: bool) -> Result<(), Box<dyn Error>>{
         if pattern == "" {
             return Err(Box::new(io::Error::new(io::ErrorKind::Other, "No files requested")));
         }
 
-        let links = Self::list(&self, pattern, 0,false, true)?;
+        let links = Self::list(&self, pattern, 0,false, use_regx)?;
         for link in links {
             let source = self.dao.get_source_by_id(&link.source_id)?
                 .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;

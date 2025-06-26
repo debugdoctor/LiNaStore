@@ -5,9 +5,9 @@ use tracing::{event, instrument, Level};
 use uuid::Uuid;
 use tokio::net::TcpListener;
 
-use crate::{conveyer::ConveyQueue, dtos::{Behavior, Content, FlagType, Package, ProtocolMessage}, shutdown::Shutdown};
+use crate::{conveyer::ConveyQueue, dtos::{Behavior, Content, FlagType, Package, LiNaProtocol}, shutdown::Shutdown};
 
-impl ProtocolMessage {
+impl LiNaProtocol {
     #[instrument(skip_all)]
     async fn parse_protocol_message<T: AsyncReadExt + Unpin>(
         &mut self,
@@ -20,7 +20,7 @@ impl ProtocolMessage {
             },
         };
 
-        if self.flags & FlagType::PAYLOAD as u8 == 0 {
+        if self.flags & FlagType::Write as u8 != FlagType::Write as u8 {
             return Ok(())
         } else {
             match stream.read_exact(&mut self.payload.name).await {
@@ -84,7 +84,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
     let log_id = Uuid::new_v4().to_string();
     event!(Level::INFO, "[waitress {}] Handling connection from {}", &log_id, peer_addr);
     
-    let mut message = ProtocolMessage::new();
+    let mut message = LiNaProtocol::new();
     match message.parse_protocol_message(&mut stream).await {
         Ok(message) => message,
         Err(err) => {
@@ -99,10 +99,14 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
     // Order generation
     let mut order_pkg = Package::new_with_id(&uuid);
-    order_pkg.behavior = if message.flags & FlagType::SEND as u8 == FlagType::SEND as u8 {
+    order_pkg.behavior = if message.flags & FlagType::Delete as u8 == FlagType::Write as u8 {
         Behavior::PutFile
-    } else {
+    } else if message.flags & FlagType::Delete as u8 == FlagType::Read as u8 {
         Behavior::GetFile
+    } else if message.flags & FlagType::Delete as u8 == FlagType::Delete as u8 {
+        Behavior::DeleteFile
+    } else {
+        Behavior::None
     };
     order_pkg.content = Content {
         flags: message.flags,
@@ -126,7 +130,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
     // Wait for package from conveyer
     let con_queue = ConveyQueue::get_instance();
     loop {
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         // Check overall timeout
         if tokio::time::Instant::now() > start_time + overall_timeout {
             event!(tracing::Level::ERROR, "[waitress {}] Overall timeout exceeded", &log_id);
@@ -138,7 +142,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
         match con_queue_clone.consume_service(uni_id_value) {
             Ok(Some(pkg)) => {
-                let mut response = ProtocolMessage::new();
+                let mut response = LiNaProtocol::new();
                 response.status = pkg.status;
                 response.payload.length = pkg.content.data.len() as u32;
                 response.payload.checksum = response.calculate_checksum();
@@ -159,7 +163,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 }
 
 #[instrument(skip_all)]
-pub async fn run_custom_server(addr: &str) {
+pub async fn run_advanced_server(addr: &str) {
     event!(Level::INFO ,"Waitress starting");
 
     let listener = match TcpListener::bind(addr).await{

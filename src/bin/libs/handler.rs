@@ -149,7 +149,7 @@ pub fn handle_delete(root: &str, args: &command::DeleteArgs){
         }
     };
 
-    if let Err(e) = store_manager.delete(&pattern) {
+    if let Err(e) = store_manager.delete(&pattern, true) {
         eprintln!("Failed to delete files: {}", e);
         return;
     }
