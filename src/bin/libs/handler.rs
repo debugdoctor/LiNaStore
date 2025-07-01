@@ -31,7 +31,7 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
         }
     };
 
-    let file_names = match store_manager.list(&pattern, args.n, isext, true){
+    let file_names = match store_manager.list(&pattern, args.n + 1, isext, true){
         Ok(file_names) => file_names,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
@@ -44,12 +44,13 @@ pub fn handle_list(root: &str, args: &command::ListArgs){
         return;
     }
 
-    for file_name in &file_names {
-        println!("{}", file_name.name);
-    }
-
-    if args.n != 0 && file_names.len() > args.n as usize {
-        println!("...");
+    for file_index in 0..file_names.len() as u64 {
+        if file_index < args.n {
+            println!("{}", file_names[file_index as usize].name);
+        } else {
+            println!("...");
+            break;
+        }
     }
 }
 

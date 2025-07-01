@@ -1,26 +1,34 @@
 use std::{thread, time::Duration};
 
 use linabase::service::StoreManager;
-use tracing::{event, instrument, Level};
-use uuid::Uuid;
+use tracing::{Level, event, instrument};
 
-use crate::{conveyer::ConveyQueue, dtos::{Behavior, FlagType, Package, Status}, shutdown::Shutdown};
+use crate::{
+    conveyer::ConveyQueue,
+    dtos::{Behavior, FlagType, Package, Status},
+    shutdown::Shutdown,
+};
 
-const FAST_MODE: u64 = 2;
-const SLOW_MODE: u64 = 10;
+const SHORT_SLEEP: u64 = 2;
+const MEDIUM_SLEEP: u64 = 12;
+const LONG_SLEEP: u64 = 20;
+
+const FAST_MODE: Duration = Duration::from_millis(SHORT_SLEEP);
+const NORMAL_MODE: Duration = Duration::from_millis(MEDIUM_SLEEP);
+const SLOW_MODE: Duration = Duration::from_millis(LONG_SLEEP);
+const IDLE_THRESHOLD: u64 = 0x7800;
 
 #[instrument(skip_all)]
-pub fn get_ready(root: &str){
+pub fn get_ready(root: &str) {
     event!(tracing::Level::INFO, "Porter started");
     // loop to check for new orders
-    let store_manager = match StoreManager::new(root){
+    let store_manager = match StoreManager::new(root) {
         Ok(store_manager) => store_manager,
-        Err(e) => panic!("{}", e.to_string())
+        Err(e) => panic!("{}", e.to_string()),
     };
 
     let mut dur = Duration::from_millis(2);
     let mut idle_delay = 0u64;
-
 
     let shutdown_status = Shutdown::get_instance();
     let conveyers = ConveyQueue::get_instance();
@@ -32,11 +40,9 @@ pub fn get_ready(root: &str){
 
         match conveyers.consume_order() {
             Ok(Some(pkg)) => {
-                idle_delay = 0x800;
+                idle_delay = 0x8000;
                 // Set fast mode for processing
-                dur = Duration::from_millis(FAST_MODE);
-
-                event!(Level::INFO, "Received order package {}", Uuid::from_bytes(pkg.uni_id).to_string());
+                dur = FAST_MODE;
 
                 let flags = pkg.content.flags;
                 let data = pkg.content.data;
@@ -46,10 +52,26 @@ pub fn get_ready(root: &str){
                 res_pkg.content.name = pkg.content.name;
                 res_pkg.content.flags = pkg.content.flags;
 
-
-                let valid_data_end = pkg.content.name.iter()
+                let valid_data_end = pkg
+                    .content
+                    .name
+                    .iter()
                     .position(|&b| b == 0)
                     .unwrap_or(pkg.content.name.len());
+
+                // File name validation check
+                if valid_data_end == 0 {
+                    res_pkg.status = Status::FileNameInvalid;
+                    match conveyers.produce_service(res_pkg) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            event!(Level::ERROR, "[porter] {}", e);
+                        }
+                    };
+
+                    thread::sleep(dur);
+                    continue;
+                }
 
                 let name = String::from_utf8_lossy(&pkg.content.name[..valid_data_end]).to_string();
 
@@ -61,95 +83,93 @@ pub fn get_ready(root: &str){
                             &data,
                             flags & FlagType::Cover as u8 == FlagType::Cover as u8,
                             flags & FlagType::Compress as u8 == FlagType::Compress as u8,
-                        ){
+                        ) {
                             Ok(_) => {
                                 event!(Level::INFO, "[porter] Success to putFile: {}", name);
                                 res_pkg.status = Status::Success;
                                 match conveyers.produce_service(res_pkg) {
-                                    Ok(_) => {},
+                                    Ok(_) => {}
                                     Err(e) => {
                                         event!(Level::ERROR, "[porter] {}", e);
                                     }
                                 };
-                            },
+                            }
                             Err(_) => {
                                 event!(Level::ERROR, "[porter] Failed to put data");
                                 res_pkg.status = Status::StoreFailed;
                                 match conveyers.produce_service(res_pkg) {
-                                    Ok(_) => {},
+                                    Ok(_) => {}
                                     Err(e) => {
                                         event!(Level::ERROR, "[porter] {}", e);
                                     }
                                 };
                             }
                         };
-                    },
-                    Behavior::GetFile => {
-                        match store_manager.get_binary_data(&name){
-                            Ok(data) => {
-                                res_pkg.status = Status::Success;
-                                res_pkg.content.data = data;
-                                match conveyers.produce_service(res_pkg) {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        event!(Level::ERROR, "[porter] {}", e);
-                                    }
-                                };
-                            },
-                            Err(_) => {
-                                res_pkg.status = Status::FileNotFound;
-                                match conveyers.produce_service(res_pkg) {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        event!(Level::ERROR, "[porter] {}", e);
-                                    }
-                                };
-                            }
+                    }
+                    Behavior::GetFile => match store_manager.get_binary_data(&name) {
+                        Ok(data) => {
+                            res_pkg.status = Status::Success;
+                            res_pkg.content.data = data;
+                            match conveyers.produce_service(res_pkg) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    event!(Level::ERROR, "[porter] {}", e);
+                                }
+                            };
+                        }
+                        Err(_) => {
+                            res_pkg.status = Status::FileNotFound;
+                            match conveyers.produce_service(res_pkg) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    event!(Level::ERROR, "[porter] {}", e);
+                                }
+                            };
                         }
                     },
-                    Behavior::DeleteFile => {
-                        match store_manager.delete(&name, false) {
-                            Ok(_) => {
-                                res_pkg.status = Status::Success;
-                                match conveyers.produce_service(res_pkg) {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        event!(Level::ERROR, "[porter] {}", e);
-                                    }
-                                };
-                            },
-                            Err(_) => {
-                                res_pkg.status = Status::FileNotFound;
-                                match conveyers.produce_service(res_pkg) {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        event!(Level::ERROR, "[porter] {}", e);
-                                    }
-                                };
-                            }
+                    Behavior::DeleteFile => match store_manager.delete(&name, false) {
+                        Ok(_) => {
+                            res_pkg.status = Status::Success;
+                            match conveyers.produce_service(res_pkg) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    event!(Level::ERROR, "[porter] {}", e);
+                                }
+                            };
+                        }
+                        Err(_) => {
+                            res_pkg.status = Status::FileNotFound;
+                            match conveyers.produce_service(res_pkg) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    event!(Level::ERROR, "[porter] {}", e);
+                                }
+                            };
                         }
                     },
                     _ => {
                         event!(Level::ERROR, "[porter] Unknown behavior");
                         res_pkg.status = Status::InternalError;
                         match conveyers.produce_service(res_pkg) {
-                            Ok(_) => {},
+                            Ok(_) => {}
                             Err(e) => {
                                 event!(Level::ERROR, "[porter] {}", e);
                             }
                         };
                     }
                 }
-                    
-            },
+            }
             Ok(None) => {
                 if idle_delay > 0 {
-                    idle_delay -= FAST_MODE;
+                    idle_delay = idle_delay.saturating_sub(
+                        if idle_delay >= IDLE_THRESHOLD { SHORT_SLEEP } else { MEDIUM_SLEEP }
+                    );
+                    dur = if idle_delay >= IDLE_THRESHOLD { FAST_MODE } else { NORMAL_MODE };
                 } else {
-                    // Set slow mode for idle
-                    dur = Duration::from_millis(SLOW_MODE);
+                    dur = SLOW_MODE;
                 }
-            },
+                event!(Level::DEBUG, "No order package, sleeping for {:?}", dur);
+            }
             Err(e) => {
                 event!(Level::ERROR, "[porter] {}", e);
             }

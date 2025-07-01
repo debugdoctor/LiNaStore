@@ -2,9 +2,9 @@ use clap::{Parser, Subcommand, ArgAction};
 
 #[derive(Parser, Clone)]
 pub struct ListArgs {
-    #[arg(short = 'n', long = "num", value_name = "NUMBER", default_value_t = 100, 
-        help = "Number of items to list (0 for unlimited, default: 100)")]
-    pub n: u32,
+    #[arg(short = 'n', long = "num", value_name = "NUMBER", default_value_t = 50, 
+        help = "Number of items to list (0 for unlimited, default: 50)")]
+    pub n: u64,
 
     #[arg(short = 'e', long = "ext", value_name = "EXTENSION")]
     pub isext: Option<String>,

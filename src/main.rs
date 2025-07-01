@@ -1,25 +1,24 @@
-mod front;
 mod conveyer;
-mod porter;
 mod dtos;
+mod front;
+mod porter;
 mod shutdown;
 
 use tracing::event;
-use tracing_subscriber;
 use tracing_appender;
+use tracing_subscriber;
 
+use anyhow::{Context, Result};
 use std::env;
-use anyhow::{Result, Context};
 
 use crate::shutdown::Shutdown;
 
 #[tokio::main]
-async fn main() -> Result<()>{
+async fn main() -> Result<()> {
     // Logging setup
     let file_appender = tracing_appender::rolling::daily("logs", "app.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_thread_ids(true)
@@ -44,7 +43,7 @@ async fn main() -> Result<()>{
     let _ = tokio::task::spawn(async move {
         porter::get_ready(&current_dir);
     });
-    
+
     let _ = tokio::task::spawn(async move {
         front::get_ready("0.0.0.0", "8086", "8096").await;
     });
@@ -52,12 +51,12 @@ async fn main() -> Result<()>{
     // Graceful shutdown
     let shutdown_signal = tokio::signal::ctrl_c();
     tokio::pin!(shutdown_signal);
-    
+
     match shutdown_signal.await {
         Ok(()) => {
             event!(tracing::Level::INFO, "Graceful shutdown");
             shutdown_state.shutdown();
-        },
+        }
         Err(e) => event!(tracing::Level::ERROR, "Shutdown signal error: {:?}", e),
     }
 

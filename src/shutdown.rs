@@ -1,10 +1,13 @@
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use lazy_static::lazy_static;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 lazy_static! {
     static ref SHUTDOWN: Arc<Shutdown> = Arc::new(Shutdown {
-            is_shutdown: AtomicBool::new(false),
-        });
+        is_shutdown: AtomicBool::new(false),
+    });
 }
 
 pub struct Shutdown {
