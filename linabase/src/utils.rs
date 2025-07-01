@@ -1,8 +1,17 @@
 use blake3::Hasher;
-use rayon::{iter::{IntoParallelRefIterator, ParallelIterator}, ThreadPool, ThreadPoolBuilder};
 use core::panic;
-use std::{borrow::Cow, error::Error, fs, io::{self, Read, Write}, path::{Path, PathBuf}};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use rayon::{
+    ThreadPool, ThreadPoolBuilder,
+    iter::{IntoParallelRefIterator, ParallelIterator},
+};
+use std::{
+    borrow::Cow,
+    error::Error,
+    fs,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+};
 
 const BLOCK_SIZE: usize = 8;
 const GROUP_SIZE: usize = BLOCK_SIZE * 8;
@@ -13,24 +22,27 @@ pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, Box
     let mut file = fs::File::open(file_path)?;
     let file_size = file.metadata()?.len();
     let mut total_read = 0;
-    let mut buffer = [0u8; 0x200000]; 
+    let mut buffer = [0u8; 0x200000];
 
     while total_read < file_size {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
-            return Err(Box::new(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF"))); // Unexpected EOF
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF",
+            ))); // Unexpected EOF
         }
         total_read += bytes_read as u64;
         hasher.update(&buffer[..bytes_read]);
     }
-    
+
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn get_hash256_from_binary(input: &[u8]) -> String {
     let mut hasher = Hasher::new();
 
-    for chunk in input.chunks(BUFFER_SIZE){
+    for chunk in input.chunks(BUFFER_SIZE) {
         hasher.update(chunk);
     }
 
@@ -73,7 +85,7 @@ pub fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Res
 }
 
 /// For example, there is a block size of 64 bytes.
-/// 
+///
 /// This block can be compressed as:
 /// ```
 /// |blocks_flg |max_value |
@@ -85,7 +97,8 @@ pub fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Res
 /// |    48     |    37    |
 /// |    48     |    7d    |
 /// ```
-/// 
+///
+#[derive(Debug)]
 pub struct BlockManager {
     chunk_size: usize,
     thread_pool: ThreadPool,
@@ -93,65 +106,72 @@ pub struct BlockManager {
 
 impl BlockManager {
     pub fn new() -> Self {
-        let thread_pool = match ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build() {
-                Ok(pool) => pool,
-                Err(err) => panic!("{}", err)
-            };
+        let thread_pool = match ThreadPoolBuilder::new().num_threads(4).build() {
+            Ok(pool) => pool,
+            Err(err) => panic!("{}", err),
+        };
 
-        BlockManager { chunk_size: 0x10000 - 0x400, thread_pool }
+        BlockManager {
+            chunk_size: 0x10000 - 0x400,
+            thread_pool,
+        }
     }
 
     #[allow(dead_code)]
-    pub fn with_capacity(
-        chunk_size: usize,
-    ) -> Self {
+    pub fn with_capacity(chunk_size: usize) -> Self {
         if chunk_size % GROUP_SIZE != 0 {
             panic!("Must be multiples of 64 Byte");
         }
-        
+
         if chunk_size > 0x10000 - 0x400 {
             panic!("Chunk size must be less than (not equal to) 64KiB");
         }
 
-        let thread_pool = match ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build() {
-                Ok(pool) => pool,
-                Err(err) => panic!("{}", err)
-            };
+        let thread_pool = match ThreadPoolBuilder::new().num_threads(4).build() {
+            Ok(pool) => pool,
+            Err(err) => panic!("{}", err),
+        };
 
-        BlockManager { chunk_size, thread_pool }
+        BlockManager {
+            chunk_size,
+            thread_pool,
+        }
     }
 
-    pub fn compress_all(&self, input: &Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> { 
+    pub fn compress_all(&self, input: &Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
         let chunks: Vec<&[u8]> = input.chunks(self.chunk_size).collect();
 
         let compressed_chunks = self.thread_pool.install(|| {
-            chunks.par_iter().map(|&chunk| {
-                let chunk_vec = chunk.to_vec();
+            chunks
+                .par_iter()
+                .map(|&chunk| {
+                    let chunk_vec = chunk.to_vec();
 
-                let compressed_chunk = self.__encode(&chunk_vec);
-                let raw_len = chunk_vec.len();
-                let compressed_chunk_len = compressed_chunk.len();
+                    let compressed_chunk = self.__encode(&chunk_vec);
+                    let raw_len = chunk_vec.len();
+                    let compressed_chunk_len = compressed_chunk.len();
 
-                // Build chunk result with header
-                let mut chunk_result = Vec::with_capacity(compressed_chunk_len + 3);
-                if compressed_chunk_len > raw_len {
-                    chunk_result.push(0);
-                    chunk_result.extend_from_slice(&(raw_len as u16).to_le_bytes());
-                    chunk_result.extend_from_slice(&chunk_vec);
-                } else {
-                    if compressed_chunk_len > 0x10000 {
-                        panic!("Compressed chunk length is greater than 64KiB: {:x}", compressed_chunk_len);
+                    // Build chunk result with header
+                    let mut chunk_result = Vec::with_capacity(compressed_chunk_len + 3);
+                    if compressed_chunk_len > raw_len {
+                        chunk_result.push(0);
+                        chunk_result.extend_from_slice(&(raw_len as u16).to_le_bytes());
+                        chunk_result.extend_from_slice(&chunk_vec);
+                    } else {
+                        if compressed_chunk_len > 0x10000 {
+                            panic!(
+                                "Compressed chunk length is greater than 64KiB: {:x}",
+                                compressed_chunk_len
+                            );
+                        }
+                        chunk_result.push(1);
+                        chunk_result
+                            .extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
+                        chunk_result.extend_from_slice(&compressed_chunk);
                     }
-                    chunk_result.push(1);
-                    chunk_result.extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
-                    chunk_result.extend_from_slice(&compressed_chunk);
-                }
-                chunk_result
-            }).collect::<Vec<_>>()
+                    chunk_result
+                })
+                .collect::<Vec<_>>()
         });
 
         let mut result = Vec::with_capacity(input.len());
@@ -162,7 +182,11 @@ impl BlockManager {
         Ok(result)
     }
 
-    pub fn decompress_all(&self, input: &Vec<u8>, original_size: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn decompress_all(
+        &self,
+        input: &Vec<u8>,
+        original_size: usize,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut i = 0;
         let mut chunks_with_flag = Vec::with_capacity(0x400000);
 
@@ -194,13 +218,16 @@ impl BlockManager {
         }
 
         let decompressed_chunks = self.thread_pool.install(|| {
-            chunks_with_flag.par_iter().map(|(flag, start, end)| {
-                match flag {
-                    0 => Cow::Borrowed(&input[*start..*end]), // Uncompressed chunk
-                    1 => Cow::Owned(self.__decode(&input[*start..*end])), // Compressed chunk
-                    _ => panic!("Unknown chunk flag"),
-                }
-            }).collect::<Vec<_>>()
+            chunks_with_flag
+                .par_iter()
+                .map(|(flag, start, end)| {
+                    match flag {
+                        0 => Cow::Borrowed(&input[*start..*end]), // Uncompressed chunk
+                        1 => Cow::Owned(self.__decode(&input[*start..*end])), // Compressed chunk
+                        _ => panic!("Unknown chunk flag"),
+                    }
+                })
+                .collect::<Vec<_>>()
         });
 
         let mut result = Vec::with_capacity(original_size + GROUP_SIZE);
@@ -215,10 +242,10 @@ impl BlockManager {
     fn __encode(&self, chunk: &[u8]) -> Vec<u8> {
         // Mutable size array
         let result = Vec::with_capacity(u16::MAX as usize);
-        
+
         let mut encoder = GzEncoder::new(result, Compression::fast());
         match encoder.write_all(chunk) {
-            Ok(_)  => {},
+            Ok(_) => {}
             Err(e) => panic!("Failed to encode chunk: {}", e),
         }
 
@@ -233,10 +260,10 @@ impl BlockManager {
         let mut decoder = GzDecoder::new(chunk);
 
         match decoder.read_to_end(&mut result) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => panic!("Failed to write chunk for decompression: {}", e),
         }
-        
+
         result
     }
 }
@@ -254,24 +281,30 @@ mod tests {
         let manager = BlockManager::new();
         let data = fs::read("../../Hadoop.jar").expect("Failed to read file");
 
-        
         // Encode the data
-        let compress_start = Instant::now(); 
+        let compress_start = Instant::now();
         let compressed = manager.compress_all(&data).expect(" Failed to compress");
         let compress_duration = compress_start.elapsed();
         println!("Compression time: {:.2?}", compress_duration);
 
-        println!("Compression ratio: {:.2}%", 
-            (compressed.len() as f64 / data.len() as f64) * 100.0);
-        
+        println!(
+            "Compression ratio: {:.2}%",
+            (compressed.len() as f64 / data.len() as f64) * 100.0
+        );
+
         // Decode and verify round-trip consistency
-        let decompress_start = Instant::now(); 
-        let decompressed = manager.decompress_all(&compressed, data.len()).expect(" Failed to decompress");
+        let decompress_start = Instant::now();
+        let decompressed = manager
+            .decompress_all(&compressed, data.len())
+            .expect(" Failed to decompress");
         let decompress_duration = decompress_start.elapsed();
         println!("Decompression time: {:.2?}", decompress_duration);
-        
+
         // The decoded data should match the original input
-        assert_eq!(data, decompressed, "Encoded and decoded data should match original input");
+        assert_eq!(
+            data, decompressed,
+            "Encoded and decoded data should match original input"
+        );
     }
 
     #[test]

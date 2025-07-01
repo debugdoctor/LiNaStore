@@ -1,17 +1,17 @@
 //! This module provides the data structures and functions necessary for managing
 //! the message queue.
-//! 
+//!
 //! The `ConveyQueue` struct is designed to hold a queue of orders, which can be
 //! considered as the ordering system for a restaurant or similar service.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::thread;
-use std::time::Duration;
 use chrono::Utc;
 use lazy_static::lazy_static;
 use rand::Rng;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use tokio::sync::Mutex;
 use tracing::event;
 
 use crate::dtos::Package;
@@ -20,7 +20,6 @@ pub struct ConveyQueue {
     order_queue: Arc<Mutex<VecDeque<Package>>>,
     service_queue: Arc<Mutex<VecDeque<Package>>>,
 }
-
 
 // Lazy singleton initialization
 lazy_static! {
@@ -34,7 +33,7 @@ impl ConveyQueue {
     // Initialize the singleton
     pub fn init() {
         let instance = INSTANCE.clone();
-        
+
         // Generic cleanup function for any queue
         let cleanup_queue = |queue: Arc<Mutex<VecDeque<Package>>>| {
             thread::spawn(move || {
@@ -43,12 +42,16 @@ impl ConveyQueue {
 
                 loop {
                     let mut queue = match queue.try_lock() {
-                        Ok(guard)  => guard,
+                        Ok(guard) => guard,
                         Err(e) => {
-                            event!(tracing::Level::WARN, "Failed to acquire queue lock: {:?}", e);
+                            event!(
+                                tracing::Level::WARN,
+                                "Failed to acquire queue lock: {:?}",
+                                e
+                            );
                             thread::sleep(Duration::from_millis(rng.random_range(10..20)));
                             continue;
-                        },
+                        }
                     };
 
                     let (should_remove, current_id) = {
@@ -87,10 +90,10 @@ impl ConveyQueue {
     }
 
     pub fn produce_order(&self, order: Package) -> Result<(), String> {
-        match self.order_queue.try_lock(){
+        match self.order_queue.try_lock() {
             Ok(mut queue) => {
                 queue.push_back(order);
-            },
+            }
             Err(_) => {
                 return Err("fail to push to order queue".to_string());
             }
@@ -100,23 +103,23 @@ impl ConveyQueue {
 
     pub fn consume_order(&self) -> Result<Option<Package>, String> {
         match self.order_queue.try_lock() {
-            Ok(mut guard)  => {
+            Ok(mut guard) => {
                 if guard.is_empty() {
                     return Ok(None);
                 }
                 Ok(guard.pop_front())
-            },
+            }
             Err(e) => {
                 return Err(format!("Failed to acquire queue lock: {:?}", e));
-            },
+            }
         }
     }
 
     pub fn produce_service(&self, order: Package) -> Result<(), String> {
-        match self.service_queue.try_lock(){
+        match self.service_queue.try_lock() {
             Ok(mut queue) => {
                 queue.push_back(order);
-            },
+            }
             Err(_) => {
                 return Err("fail to push to order queue".to_string());
             }
@@ -126,16 +129,16 @@ impl ConveyQueue {
 
     pub fn consume_service(&self, uni_id: [u8; 16]) -> Result<Option<Package>, String> {
         let mut queue = match self.service_queue.try_lock() {
-            Ok(guard)  => guard,
+            Ok(guard) => guard,
             Err(e) => {
                 return Err(format!("Failed to acquire queue lock: {:?}", e));
-            },
+            }
         };
 
         if queue.is_empty() {
             return Ok(None);
         }
-        
+
         match queue.front() {
             Some(pkg) => {
                 if pkg.uni_id == uni_id {
@@ -143,12 +146,11 @@ impl ConveyQueue {
                 } else {
                     return Ok(None);
                 }
-            },
-            None => Ok(None)
+            }
+            None => Ok(None),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}

@@ -1,11 +1,17 @@
+use bytes::BytesMut;
 use std::{net::SocketAddr, time::Duration};
-use bytes::{BytesMut};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}};
-use tracing::{event, instrument, Level};
-use uuid::Uuid;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tracing::{Level, event, instrument};
+use uuid::Uuid;
 
-use crate::{conveyer::ConveyQueue, dtos::{Behavior, Content, FlagType, Package, LiNaProtocol}, shutdown::Shutdown};
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+use crate::{
+    conveyer::ConveyQueue,
+    dtos::{Behavior, Content, FlagType, LiNaProtocol, Package},
+    shutdown::Shutdown,
+};
 
 impl LiNaProtocol {
     #[instrument(skip_all)]
@@ -13,55 +19,62 @@ impl LiNaProtocol {
         &mut self,
         stream: &mut T,
     ) -> Result<(), String> {
-        self.flags = match stream.read_u8().await{
+        self.flags = match stream.read_u8().await {
             Ok(flags) => flags,
             Err(_) => {
                 return Err(format!("Failed to read flag"));
-            },
+            }
         };
 
         if self.flags & FlagType::Write as u8 != FlagType::Write as u8 {
-            return Ok(())
+            return Ok(());
         } else {
             match stream.read_exact(&mut self.payload.name).await {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(_) => {
                     return Err("Failed to read name".to_string());
-                },
+                }
             };
 
-            self.payload.length = match stream.read_u32_le().await{
+            self.payload.length = match stream.read_u32_le().await {
                 Ok(length) => length,
                 Err(_) => {
                     return Err("Failed to read length".to_string());
-                },
+                }
             };
 
-            self.payload.checksum = match stream.read_u32_le().await{
+            self.payload.checksum = match stream.read_u32_le().await {
                 Ok(checksum) => checksum,
                 Err(_) => {
                     return Err("Failed to read checksum".to_string());
-                },
+                }
             };
 
             let mut chunk = BytesMut::with_capacity(0x10000);
 
-            loop {
-                match stream.read_buf(&mut chunk).await {
-                    Ok(n) => {
-                        if n == 0 {
-                            break;
+            if self.payload.length == 0 {
+                return Ok(());
+            } else {
+                loop {
+                    match tokio::time::timeout(READ_TIMEOUT, stream.read_buf(&mut chunk)).await {
+                        Ok(Ok(n)) => {
+                            if n == 0 {
+                                break;
+                            }
+                            self.payload.data.extend_from_slice(&chunk[..n]);
+                            chunk.clear();
+                            if self.payload.data.len() >= self.payload.length as usize {
+                                break;
+                            }
                         }
-                        self.payload.data.extend_from_slice(&chunk[..n]);
-                        chunk.clear();
-                        if self.payload.data.len() >= self.payload.length as usize {
-                            break;
+                        Ok(Err(_)) => {
+                            return Err("Failed to read data".to_string());
                         }
-                    },
-                    Err(_) => {
-                        return Err("Failed to read data".to_string());
-                    },
-                };
+                        Err(_) => {
+                            return Err("Read operation timed out".to_string());
+                        }
+                    };
+                }
             }
 
             if self.verify() {
@@ -69,24 +82,27 @@ impl LiNaProtocol {
             } else {
                 Err("Invalid checksum".to_string())
             }
-
         }
     }
 }
 
-
 // One waitress handles one incoming request
 #[instrument(skip_all)]
 async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
-        mut stream: T,
-        peer_addr: SocketAddr
-    ){
+    mut stream: T,
+    peer_addr: SocketAddr,
+) {
     let log_id = Uuid::new_v4().to_string();
-    event!(Level::INFO, "[waitress {}] Handling connection from {}", &log_id, peer_addr);
-    
+    event!(
+        Level::INFO,
+        "[waitress {}] Handling connection from {}",
+        &log_id,
+        peer_addr
+    );
+
     let mut message = LiNaProtocol::new();
     match message.parse_protocol_message(&mut stream).await {
-        Ok(message) => message,
+        Ok(()) => {},
         Err(err) => {
             event!(Level::ERROR, "[{}] {}", &log_id, err);
             return;
@@ -95,7 +111,6 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
     let uuid = Uuid::new_v4();
     let uni_id = uuid.into_bytes();
-    event!(Level::INFO, "[{}] Package {} generated", &log_id, uuid.to_string());
 
     // Order generation
     let mut order_pkg = Package::new_with_id(&uuid);
@@ -133,7 +148,11 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
         tokio::time::sleep(Duration::from_millis(10)).await;
         // Check overall timeout
         if tokio::time::Instant::now() > start_time + overall_timeout {
-            event!(tracing::Level::ERROR, "[waitress {}] Overall timeout exceeded", &log_id);
+            event!(
+                tracing::Level::ERROR,
+                "[waitress {}] Overall timeout exceeded",
+                &log_id
+            );
             break;
         }
 
@@ -148,13 +167,13 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                 response.payload.checksum = response.calculate_checksum();
                 response.payload.data = pkg.content.data;
                 let resp_data = response.serialize_protocol_message();
-                
+
                 if let Err(e) = stream.write_all(&resp_data).await {
                     event!(tracing::Level::ERROR, "Error writing to stream: {}", e);
                 }
                 break;
-            },
-            Ok(None) => {},
+            }
+            Ok(None) => {}
             Err(err) => {
                 event!(tracing::Level::ERROR, "[waitress {}] {}", &log_id, err);
             }
@@ -164,9 +183,9 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
 #[instrument(skip_all)]
 pub async fn run_advanced_server(addr: &str) {
-    event!(Level::INFO ,"Waitress starting");
+    event!(Level::INFO, "Waitress starting");
 
-    let listener = match TcpListener::bind(addr).await{
+    let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(_) => {
             event!(Level::ERROR, "Failed to bind to address {}", addr);
@@ -182,7 +201,7 @@ pub async fn run_advanced_server(addr: &str) {
         }
 
         //  Accept the connection
-        let (stream, addr ) = match listener.accept().await {
+        let (stream, addr) = match listener.accept().await {
             Ok(req) => req,
             Err(_) => {
                 event!(Level::ERROR, "Failed to accept connection");

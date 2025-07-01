@@ -16,7 +16,7 @@ pub struct PayLoad {
 /// ```markdown
 /// | File Operation | Reserved | Reserved | Reserved | Reserved | Cover | Compress |
 /// |----------------|----------|----------|----------|----------|-------|----------|
-/// | 0x88 - 0x40    | 0x20     | 0x10     | 0x08     | 0x04     | 0x02  | 0x01     |
+/// | 0xC0 - 0x40    | 0x20     | 0x10     | 0x08     | 0x04     | 0x02  | 0x01     |
 /// ```
 #[derive(Clone, PartialEq)]
 pub struct LiNaProtocol {
@@ -52,9 +52,7 @@ impl LiNaProtocol {
         hasher.finalize()
     }
 
-    pub fn serialize_protocol_message(
-        &self,
-    ) -> Vec<u8> {
+    pub fn serialize_protocol_message(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(0x1000);
 
         payload.push(self.status.clone() as u8);
@@ -65,8 +63,6 @@ impl LiNaProtocol {
     }
 }
 
-
-
 pub enum FlagType {
     Delete = 0xC0,
     Write = 0x80,
@@ -75,7 +71,6 @@ pub enum FlagType {
     Compress = 0x01,
     None = 0x00,
 }
-
 
 #[derive(Clone, PartialEq)]
 pub struct Package {
@@ -86,7 +81,7 @@ pub struct Package {
     pub created_at: i64,
 }
 
-impl Package { 
+impl Package {
     pub fn new() -> Self {
         Package {
             status: Status::None,
@@ -129,8 +124,7 @@ pub enum Status {
     Success = 0,
     FileNotFound = 1,
     StoreFailed = 2,
-    InvalidRequest = 3,
-    FileNameInvalid = 4,
+    FileNameInvalid = 3,
     InternalError = 127,
     None = 255,
 }
