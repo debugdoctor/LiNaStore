@@ -3,10 +3,18 @@ import io
 import binascii
 
 class LiNaStoreClient:
+    DELETE = 0xC0
+    WRITE = 0x80
+    READ = 0x40
+    COVER = 0x02
+    COMPRESS = 0x01
+    NONE = 0x00
+
     def __init__(self, ip_address: str, port: int):
         self.ip_address = ip_address
         self.port = port
         self.socket = None
+        
     def connect(self):
         # Logic to connect to the LiNaStore service
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
