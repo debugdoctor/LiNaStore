@@ -87,17 +87,14 @@ pub fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Res
 /// For example, there is a block size of 64 bytes.
 ///
 /// This block can be compressed as:
-/// ```
-/// |blocks_flg |max_value |
-/// |-----------|----------|
-/// |block1_flag|----------|
+/// ```markdown
+/// | Comp flag |  length  |
 /// |-----------|----------|
 /// |    2a     |    4d    |
 /// |    32     |    48    |
 /// |    48     |    37    |
 /// |    48     |    7d    |
 /// ```
-///
 #[derive(Debug)]
 pub struct BlockManager {
     chunk_size: usize,
@@ -154,6 +151,7 @@ impl BlockManager {
                     // Build chunk result with header
                     let mut chunk_result = Vec::with_capacity(compressed_chunk_len + 3);
                     if compressed_chunk_len > raw_len {
+                        // Add uncompressed flag
                         chunk_result.push(0);
                         chunk_result.extend_from_slice(&(raw_len as u16).to_le_bytes());
                         chunk_result.extend_from_slice(&chunk_vec);
@@ -164,6 +162,7 @@ impl BlockManager {
                                 compressed_chunk_len
                             );
                         }
+                        // Add compressed flag
                         chunk_result.push(1);
                         chunk_result
                             .extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());

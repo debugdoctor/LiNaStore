@@ -3,6 +3,7 @@ mod dtos;
 mod front;
 mod porter;
 mod shutdown;
+mod vars;
 
 use tracing::event;
 use tracing_appender;
@@ -21,10 +22,11 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_thread_ids(true)
+        .with_thread_ids(false)
         .with_file(false)
         // .with_thread_names(true)
         .with_ansi(false)
+        .with_target(false)
         .init();
 
     let current_dir = env::current_dir()
@@ -36,16 +38,18 @@ async fn main() -> Result<()> {
     // Initialize Shutdown Manager
     let shutdown_state = Shutdown::get_instance();
 
+    vars::EnvVar::get_instance();
+
     // Initialize the order queue
     conveyer::ConveyQueue::init();
     event!(tracing::Level::INFO, "Message queue initialized");
 
     let _ = tokio::task::spawn(async move {
-        porter::get_ready(&current_dir);
+        porter::porter(&current_dir);
     });
 
     let _ = tokio::task::spawn(async move {
-        front::get_ready("0.0.0.0", "8086", "8096").await;
+        front::front().await;
     });
 
     // Graceful shutdown

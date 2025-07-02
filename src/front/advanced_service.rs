@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+use crate::vars;
 use crate::{
     conveyer::ConveyQueue,
     dtos::{Behavior, Content, FlagType, LiNaProtocol, Package},
@@ -14,11 +15,13 @@ use crate::{
 };
 
 impl LiNaProtocol {
-    #[instrument(skip_all)]
     async fn parse_protocol_message<T: AsyncReadExt + Unpin>(
         &mut self,
         stream: &mut T,
     ) -> Result<(), String> {
+        // Get envars
+        let envars = vars::EnvVar::get_instance();
+
         self.flags = match stream.read_u8().await {
             Ok(flags) => flags,
             Err(_) => {
@@ -74,6 +77,10 @@ impl LiNaProtocol {
                             return Err("Read operation timed out".to_string());
                         }
                     };
+
+                    if self.payload.data.len() > envars.max_payload_size {
+                        return Err("Data length exceeds maximum limit".to_string());
+                    }
                 }
             }
 

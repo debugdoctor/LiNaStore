@@ -9,17 +9,17 @@ use crate::{
     shutdown::Shutdown,
 };
 
-const SHORT_SLEEP: u64 = 2;
-const MEDIUM_SLEEP: u64 = 12;
-const LONG_SLEEP: u64 = 20;
+const SHORT_SLEEP: u64 = 0x200;
+const MEDIUM_SLEEP: u64 = 0x2000;
+const LONG_SLEEP: u64 = 0x4000;
 
-const FAST_MODE: Duration = Duration::from_millis(SHORT_SLEEP);
-const NORMAL_MODE: Duration = Duration::from_millis(MEDIUM_SLEEP);
-const SLOW_MODE: Duration = Duration::from_millis(LONG_SLEEP);
+const FAST_MODE: Duration = Duration::from_micros(SHORT_SLEEP);
+const NORMAL_MODE: Duration = Duration::from_micros(MEDIUM_SLEEP);
+const SLOW_MODE: Duration = Duration::from_micros(LONG_SLEEP);
 const IDLE_THRESHOLD: u64 = 0x7800;
 
 #[instrument(skip_all)]
-pub fn get_ready(root: &str) {
+pub fn porter(root: &str) {
     event!(tracing::Level::INFO, "Porter started");
     // loop to check for new orders
     let store_manager = match StoreManager::new(root) {
@@ -27,7 +27,7 @@ pub fn get_ready(root: &str) {
         Err(e) => panic!("{}", e.to_string()),
     };
 
-    let mut dur = Duration::from_millis(2);
+    let mut dur = FAST_MODE;
     let mut idle_delay = 0u64;
 
     let shutdown_status = Shutdown::get_instance();
