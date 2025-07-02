@@ -1,22 +1,27 @@
 use tracing::{event, instrument};
 
+use crate::vars;
+
 use super::advanced_service::run_advanced_server;
-use super::simple_service::run_http_server;
+use super::http_service::run_http_server;
 
 #[instrument(skip_all)]
-pub async fn get_ready<S: Into<String>>(ip: S, http_port: S, advanced_port: S) {
+pub async fn front() {
     event!(tracing::Level::INFO, "Front started");
 
-    // Ownership transfer
-    let ip_str = ip.into();
-    let http_port_str = http_port.into();
-    let advanced_port_str = advanced_port.into();
-    let ip_clone = ip_str.clone();
+    // Read environment variables
+    let envars = vars::EnvVar::get_instance();
+
+    let ip = envars.ip_address.clone();
+    let http_port = envars.http_port.clone();
+    let advanced_port = envars.advanced_port.clone();
+
+    let ip_clone = ip.clone();
 
     let _ = tokio::task::spawn(async move {
-        let _ = run_http_server(&format!("{}:{}", ip_str, http_port_str)).await;
+        let _ = run_http_server(&format!("{}:{}", ip, http_port)).await;
     });
     let _ = tokio::task::spawn(async move {
-        let _ = run_advanced_server(&format!("{}:{}", ip_clone, advanced_port_str)).await;
+        let _ = run_advanced_server(&format!("{}:{}", ip_clone, advanced_port)).await;
     });
 }
