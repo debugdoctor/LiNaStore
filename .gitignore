@@ -17,10 +17,15 @@ target/
 #.idea/
 
 # Added by cargo
-
 test/
 logs/
-linadata/
 
+# Ide config
+.idea/
+.vscode/
+*.iml
+
+# Custom
+linadata/
 *.sql
 *.db

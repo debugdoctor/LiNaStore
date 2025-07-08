@@ -40,7 +40,12 @@ impl LiNaProtocol {
             };
 
             self.payload.length = match stream.read_u32_le().await {
-                Ok(length) => length,
+                Ok(length) => {
+                    if length > envars.max_payload_size as u32 {
+                        return Err("Payload too large".to_string());
+                    }
+                    length
+                },
                 Err(_) => {
                     return Err("Failed to read length".to_string());
                 }
@@ -77,10 +82,6 @@ impl LiNaProtocol {
                             return Err("Read operation timed out".to_string());
                         }
                     };
-
-                    if self.payload.data.len() > envars.max_payload_size {
-                        return Err("Data length exceeds maximum limit".to_string());
-                    }
                 }
             }
 
@@ -170,6 +171,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             Ok(Some(pkg)) => {
                 let mut response = LiNaProtocol::new();
                 response.status = pkg.status;
+                response.payload.name = pkg.content.name;
                 response.payload.length = pkg.content.data.len() as u32;
                 response.payload.checksum = response.calculate_checksum();
                 response.payload.data = pkg.content.data;
