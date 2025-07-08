@@ -85,8 +85,8 @@ pub fn porter(root: &str) {
                             flags & FlagType::Compress as u8 == FlagType::Compress as u8,
                         ) {
                             Ok(_) => {
-                                event!(Level::INFO, "[porter] Success to putFile: {}", name);
                                 res_pkg.status = Status::Success;
+                                res_pkg.content.name = pkg.content.name;
                                 match conveyers.produce_service(res_pkg) {
                                     Ok(_) => {}
                                     Err(e) => {
@@ -109,6 +109,7 @@ pub fn porter(root: &str) {
                     Behavior::GetFile => match store_manager.get_binary_data(&name) {
                         Ok(data) => {
                             res_pkg.status = Status::Success;
+                            res_pkg.content.name = pkg.content.name;
                             res_pkg.content.data = data;
                             match conveyers.produce_service(res_pkg) {
                                 Ok(_) => {}
@@ -130,6 +131,7 @@ pub fn porter(root: &str) {
                     Behavior::DeleteFile => match store_manager.delete(&name, false) {
                         Ok(_) => {
                             res_pkg.status = Status::Success;
+                            res_pkg.content.name = pkg.content.name;
                             match conveyers.produce_service(res_pkg) {
                                 Ok(_) => {}
                                 Err(e) => {

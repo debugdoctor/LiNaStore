@@ -56,6 +56,7 @@ impl LiNaProtocol {
         let mut payload = Vec::with_capacity(0x1000);
 
         payload.push(self.status.clone() as u8);
+        payload.extend_from_slice(&self.payload.name);
         payload.extend_from_slice(&self.payload.length.to_le_bytes());
         payload.extend_from_slice(&self.payload.checksum.to_le_bytes());
         payload.extend_from_slice(&self.payload.data);

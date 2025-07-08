@@ -36,7 +36,7 @@ impl EnvVar {
                 "67108864".to_string()
             })
             .parse()
-            .unwrap_or(67108864);
+            .unwrap_or(0x4000000);
 
         EnvVar {
             ip_address,
