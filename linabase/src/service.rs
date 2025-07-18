@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     error::Error,
     fs, io,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     result::Result,
 };
@@ -307,7 +306,19 @@ impl StoreManager {
                     Box::new(io::Error::new(io::ErrorKind::NotFound, "Source not found"))
                 })?;
 
-                let new_size = fs::metadata(&file)?.size();
+                let new_size: u64;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    new_size = fs::metadata(&file)?.size();
+                }
+
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    new_size = fs::metadata(&file)?.file_size();
+                }
 
                 if cover {
                     // Update hash256 and source compression and size
