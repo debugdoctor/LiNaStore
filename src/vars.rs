@@ -8,7 +8,7 @@ pub struct EnvVar {
     pub ip_address: String,
     pub advanced_port: String,
     pub http_port: String,
-    pub max_payload_size: usize,
+    pub max_payload_size: usize
 }
 
 lazy_static! {
