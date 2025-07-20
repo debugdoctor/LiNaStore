@@ -74,6 +74,7 @@ pub fn porter(root: &str) {
                 }
 
                 let name = String::from_utf8_lossy(&pkg.content.name[..valid_data_end]).to_string();
+                event!(Level::INFO, "[porter] Processing {}", name);
 
                 // Processing different behaviors
                 match pkg.behavior {
@@ -163,10 +164,16 @@ pub fn porter(root: &str) {
             }
             Ok(None) => {
                 if idle_delay > 0 {
-                    idle_delay = idle_delay.saturating_sub(
-                        if idle_delay >= IDLE_THRESHOLD { SHORT_SLEEP } else { MEDIUM_SLEEP }
-                    );
-                    dur = if idle_delay >= IDLE_THRESHOLD { FAST_MODE } else { NORMAL_MODE };
+                    idle_delay = idle_delay.saturating_sub(if idle_delay >= IDLE_THRESHOLD {
+                        SHORT_SLEEP
+                    } else {
+                        MEDIUM_SLEEP
+                    });
+                    dur = if idle_delay >= IDLE_THRESHOLD {
+                        FAST_MODE
+                    } else {
+                        NORMAL_MODE
+                    };
                 } else {
                     dur = SLOW_MODE;
                 }

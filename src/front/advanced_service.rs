@@ -148,7 +148,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
     // Time control
     let start_time = tokio::time::Instant::now();
-    let overall_timeout = Duration::from_secs(10); // From memory id=416ac113, using 10s timeout
+    let overall_timeout = Duration::from_secs(10);
 
     // Wait for package from conveyer
     let con_queue = ConveyQueue::get_instance();
@@ -179,7 +179,10 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
                 if let Err(e) = stream.write_all(&resp_data).await {
                     event!(tracing::Level::ERROR, "Error writing to stream: {}", e);
+                    break;
                 }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 break;
             }
             Ok(None) => {}
