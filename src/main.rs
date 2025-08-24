@@ -6,7 +6,6 @@ mod shutdown;
 mod vars;
 
 use tracing::event;
-use tracing_appender;
 use tracing_subscriber;
 
 use anyhow::{Context, Result};
