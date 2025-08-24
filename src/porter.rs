@@ -71,10 +71,16 @@ pub fn porter(root: &str) {
                 
                 // SQLite-optimized sleep strategy
                 if idle_delay > 0 {
-                    idle_delay = idle_delay.saturating_sub(
-                        if idle_delay >= IDLE_THRESHOLD { SHORT_SLEEP } else { MEDIUM_SLEEP }
-                    );
-                    dur = if idle_delay >= IDLE_THRESHOLD { FAST_MODE } else { NORMAL_MODE };
+                    idle_delay = idle_delay.saturating_sub(if idle_delay >= IDLE_THRESHOLD {
+                        SHORT_SLEEP
+                    } else {
+                        MEDIUM_SLEEP
+                    });
+                    dur = if idle_delay >= IDLE_THRESHOLD {
+                        FAST_MODE
+                    } else {
+                        NORMAL_MODE
+                    };
                 } else {
                     // Adjust sleep time based on consecutive empty cycles, more conservative for SQLite
                     dur = match consecutive_empty {
