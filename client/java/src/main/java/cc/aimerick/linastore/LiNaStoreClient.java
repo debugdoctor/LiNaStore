@@ -1,15 +1,17 @@
+package cc.aimerick.server.utils;
 
-package cc.aimerick.linastore;
+import cc.aimerick.server.enumeration.LiNaFlags;
 
-import java.io.*;
-import java.net.*;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.zip.CRC32;
-/**
- * A client for LiNaStore server.
- */
+
 public class LiNaStoreClient {
     private Socket socket;
     private final InetSocketAddress address;
@@ -31,7 +33,11 @@ public class LiNaStoreClient {
      */
     private void connect() throws IOException {
         socket = new Socket();
-        socket.connect(address, timeout);
+        try{
+            socket.connect(address, timeout);
+        } catch (IOException e) {
+            throw new IOException("Failed to connect to server: " , e);
+        }
     }
 
     /**
@@ -54,6 +60,8 @@ public class LiNaStoreClient {
     public boolean uploadFile(String fileName, byte[] data, int flags) throws IOException {
         try {
             connect();
+            InputStream is = socket.getInputStream();
+            OutputStream os = socket.getOutputStream();
 
             // Prepare flag byte
             byte flagByte = (byte) (flags & 0xFF);
@@ -71,29 +79,33 @@ public class LiNaStoreClient {
 
             // CRC32 checksum
             CRC32 crc32 = new CRC32();
-            crc32.update(new byte[]{flagByte});
             crc32.update(fullFileNameBuffer);
             crc32.update(lengthBuffer);
             crc32.update(data);
-            byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(crc32.getValue()).array();
+            byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt((int) crc32.getValue()).array();
 
             // Send all parts
-            try (OutputStream os = socket.getOutputStream()) {
+            try {
                 os.write(flagByte);
                 os.write(fullFileNameBuffer);
                 os.write(lengthBuffer);
                 os.write(checksumBuffer);
                 os.write(data);
+            } catch (IOException e){
+                throw new IOException("Failed to send data for file: " + fileName, e);
             }
 
             // Read response
-            InputStream is = socket.getInputStream();
-            byte[] response = new byte[LINA_HEADER_LENGTH];
-            int bytesRead = is.read(response);
-            if (bytesRead > 0 && response[0] != 0) {
-                throw new IOException("Server returned error code: " + response[0]);
+            try {
+                byte[] response = new byte[LINA_HEADER_LENGTH];
+                int bytesRead = is.read(response);
+                if (bytesRead > 0 && response[0] != 0) {
+                     throw new IOException("Server returned error: " + response[0] + " for file: " + fileName);
+                }
+                return response[0] == 0;
+            } catch (IOException e){
+                throw new IOException("Failed to read response for file: " + fileName, e);
             }
-            return response[0] == 0;
         } finally {
             disconnect();
         }
@@ -109,6 +121,8 @@ public class LiNaStoreClient {
     public byte[] downloadFile(String fileName) throws IOException {
         try {
             connect();
+            OutputStream os = socket.getOutputStream();
+            InputStream is = socket.getInputStream();
 
             // Prepare flag byte
             byte flagByte = (byte) LiNaFlags.READ.getValue();
@@ -131,15 +145,16 @@ public class LiNaStoreClient {
             byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putLong(crc32.getValue()).array();
 
             // Send request
-            try (OutputStream os = socket.getOutputStream()) {
+            try {
                 os.write(flagByte);
                 os.write(fullFileNameBuffer);
                 os.write(lengthBuffer);
                 os.write(checksumBuffer);
+            } catch (IOException e){
+                throw new IOException("Failed to send request for file: " + fileName, e);
             }
 
             // Read response
-            InputStream is = socket.getInputStream();
             byte[] header = new byte[LINA_HEADER_LENGTH]; // 1(flag) + 255(name) + 4(length) + 4(checksum)
             int totalRead = 0;
             while (totalRead < header.length) {
@@ -193,6 +208,8 @@ public class LiNaStoreClient {
     public boolean deleteFile(String fileName) throws IOException {
         try {
             connect();
+            OutputStream os = socket.getOutputStream();
+            InputStream is = socket.getInputStream();
 
             // Prepare flag byte
             byte flagByte = (byte) LiNaFlags.DELETE.getValue();
@@ -215,16 +232,18 @@ public class LiNaStoreClient {
             byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putLong(crc32.getValue()).array();
 
             // Send request
-            try (OutputStream os = socket.getOutputStream()) {
+            try {
                 os.write(flagByte);
                 os.write(fullFileNameBuffer);
                 os.write(lengthBuffer);
                 os.write(checksumBuffer);
+            } catch (IOException e){
+                throw new IOException("Failed to send request for file: " + fileName, e);
             }
 
             // Read response
             byte[] response = new byte[LINA_HEADER_LENGTH];
-            int bytesRead = socket.getInputStream().read(response);
+            int bytesRead = is.read(response);
             if (bytesRead > 0) {
                 return response[0] == 0;
             }
