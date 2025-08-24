@@ -44,7 +44,6 @@ async fn handle_http(
     }
 
     let log_id = Uuid::new_v4().to_string();
-    event!(Level::INFO, "[waitress {}] Handling connection", &log_id);
 
     let uri = req.uri().to_string();
     let path_vec: Vec<&str> = uri.strip_prefix("/").unwrap_or(&uri).split('/').collect();

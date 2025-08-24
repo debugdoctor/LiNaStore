@@ -1,0 +1,16 @@
+services:
+  linastore:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linastore-server
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./linadata:/app/linadata
+      # Mount local directory for development (uncomment for development)
+      # - ./linadata:/app/data
+    ports:
+      - "8086:8086"
+      - "8096:8096"
