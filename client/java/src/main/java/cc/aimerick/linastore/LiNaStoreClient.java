@@ -248,15 +248,15 @@ public class LiNaStoreClient {
 
             // Test upload
             byte[] testData = "This is a test file.".getBytes(StandardCharsets.UTF_8);
-            client.upload(testFile, testData, LiNaFlags.WRITE.getValue());
+            client.uploadFile(testFile, testData, LiNaFlags.WRITE.getValue());
             System.out.println("Upload complete.");
 
             // Test download
-            byte[] downloadedData = client.download(testFile);
+            byte[] downloadedData = client.downloadFile(testFile);
             System.out.println("Downloaded data: " + new String(downloadedData));
 
             // Test delete
-            boolean deleted = client.delete(testFile);
+            boolean deleted = client.deleteFile(testFile);
             System.out.println("Delete success: " + deleted);
 
         } catch (IOException e) {

@@ -11,21 +11,20 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tracing::event;
+use tokio::sync::RwLock;
 
 use crate::dtos::Package;
 
 pub struct ConveyQueue {
-    order_queue: Arc<Mutex<VecDeque<Package>>>,
-    service_queue: Arc<Mutex<VecDeque<Package>>>,
+    order_queue: Arc<RwLock<VecDeque<Package>>>,
+    service_queue: Arc<RwLock<VecDeque<Package>>>,
 }
 
 // Lazy singleton initialization
 lazy_static! {
     static ref INSTANCE: Arc<ConveyQueue> = Arc::new(ConveyQueue {
-        order_queue: Arc::new(Mutex::new(VecDeque::new())),
-        service_queue: Arc::new(Mutex::new(VecDeque::new())),
+        order_queue: Arc::new(RwLock::new(VecDeque::new())),
+        service_queue: Arc::new(RwLock::new(VecDeque::new())),
     });
 }
 
@@ -35,46 +34,55 @@ impl ConveyQueue {
         let instance = INSTANCE.clone();
 
         // Generic cleanup function for any queue
-        let cleanup_queue = |queue: Arc<Mutex<VecDeque<Package>>>| {
+        let cleanup_queue = |queue: Arc<RwLock<VecDeque<Package>>>| {
             thread::spawn(move || {
                 let mut rng = rand::rng();
                 let mut visited_uuid = [0u8; 16];
 
                 loop {
-                    let mut queue = match queue.try_lock() {
+                    // Use read lock for cleanup to allow concurrent reads
+                    let queue_guard = match queue.try_read() {
                         Ok(guard) => guard,
-                        Err(e) => {
-                            event!(
-                                tracing::Level::WARN,
-                                "Failed to acquire queue lock: {:?}",
-                                e
-                            );
-                            thread::sleep(Duration::from_millis(rng.random_range(10..20)));
+                        Err(_) => {
+                            // Silently skip if can't acquire read lock
+                            thread::sleep(Duration::from_millis(rng.random_range(50..100)));
                             continue;
                         }
                     };
 
-                    let (should_remove, current_id) = {
-                        if let Some(pkg) = queue.front() {
+                    let should_remove = {
+                        if let Some(pkg) = queue_guard.front() {
                             let now = Utc::now().timestamp();
-                            let (created_at, order_id) = (pkg.created_at, &pkg.uni_id);
-                            let remove = now - created_at > 2 && visited_uuid == *order_id;
-                            (remove, Some(*order_id)) // Copy UUID value
+                            let created_at = pkg.created_at;
+                            let order_id = pkg.uni_id;
+                            now - created_at > 2 && visited_uuid == order_id
                         } else {
-                            (false, None)
+                            false
                         }
                     };
 
+                    // Drop read lock immediately to minimize lock time
+                    drop(queue_guard);
+
                     if should_remove {
-                        queue.pop_front();
+                        // Only acquire write lock when we need to remove
+                        if let Ok(mut write_guard) = queue.try_write() {
+                            if let Some(pkg) = write_guard.front() {
+                                visited_uuid = pkg.uni_id;
+                                write_guard.pop_front();
+                            }
+                            // Drop write lock immediately
+                            drop(write_guard);
+                        }
+                    } else {
+                        // Update visited_uuid without write lock if possible
+                        if let Ok(read_guard) = queue.try_read() {
+                            if let Some(pkg) = read_guard.front() {
+                                visited_uuid = pkg.uni_id;
+                            }
+                        }
                     }
 
-                    // Update visited_uuid after potential mutation
-                    if let Some(id) = current_id {
-                        visited_uuid = id;
-                    }
-
-                    drop(queue);
                     thread::sleep(Duration::from_secs(1));
                 }
             });
@@ -89,66 +97,89 @@ impl ConveyQueue {
         INSTANCE.clone()
     }
 
-    pub fn produce_order(&self, order: Package) -> Result<(), String> {
-        match self.order_queue.try_lock() {
-            Ok(mut queue) => {
-                queue.push_back(order);
-            }
-            Err(_) => {
-                return Err("fail to push to order queue".to_string());
+    // Helper function to retry with exponential backoff
+    fn deal_with_retry<F, T, E>(mut f: F, max_retries: usize) -> Result<T, E>
+    where
+        F: FnMut() -> Result<T, E>,
+    {
+        let mut retries = 0;
+        let mut delay = Duration::from_millis(1);
+        
+        loop {
+            match f() {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if retries >= max_retries {
+                        return Err(e);
+                    }
+                    thread::sleep(delay);
+                    delay = Duration::from_millis(delay.as_millis() as u64 * 2);
+                    retries += 1;
+                }
             }
         }
-        Ok(())
+    }
+
+    pub fn produce_order(&self, order: Package) -> Result<(), String> {
+        Self::deal_with_retry(
+            || {
+                self.order_queue.try_write()
+                    .map_err(|_| "fail to push to order queue".to_string())
+                    .map(|mut queue| {
+                        queue.push_back(order.clone());
+                    })
+            },
+            3
+        )
     }
 
     pub fn consume_order(&self) -> Result<Option<Package>, String> {
-        match self.order_queue.try_lock() {
-            Ok(mut guard) => {
+        Self::deal_with_retry(
+            || {
+                let mut guard = self.order_queue.try_write()
+                    .map_err(|e| format!("Failed to acquire queue lock: {:?}", e))?;
+                
                 if guard.is_empty() {
                     return Ok(None);
                 }
                 Ok(guard.pop_front())
-            }
-            Err(e) => {
-                return Err(format!("Failed to acquire queue lock: {:?}", e));
-            }
-        }
+            },
+            3
+        )
     }
 
     pub fn produce_service(&self, order: Package) -> Result<(), String> {
-        match self.service_queue.try_lock() {
-            Ok(mut queue) => {
-                queue.push_back(order);
-            }
-            Err(_) => {
-                return Err("fail to push to order queue".to_string());
-            }
-        }
-        Ok(())
+        Self::deal_with_retry(
+            || {
+                self.service_queue.try_write()
+                    .map_err(|_| "fail to push to order queue".to_string())
+                    .map(|mut queue| {
+                        queue.push_back(order.clone());
+                    })
+            },
+            3
+        )
     }
 
     pub fn consume_service(&self, uni_id: [u8; 16]) -> Result<Option<Package>, String> {
-        let mut queue = match self.service_queue.try_lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                return Err(format!("Failed to acquire queue lock: {:?}", e));
-            }
-        };
+        Self::deal_with_retry(
+            || {
+                let mut queue = self.service_queue.try_write()
+                    .map_err(|e| format!("Failed to acquire queue lock: {:?}", e))?;
 
-        if queue.is_empty() {
-            return Ok(None);
-        }
-
-        match queue.front() {
-            Some(pkg) => {
-                if pkg.uni_id == uni_id {
-                    return Ok(queue.pop_front());
-                } else {
+                if queue.is_empty() {
                     return Ok(None);
                 }
-            }
-            None => Ok(None),
-        }
+
+                if let Some(pkg) = queue.front() {
+                    if pkg.uni_id == uni_id {
+                        return Ok(queue.pop_front());
+                    }
+                }
+                Ok(None)
+            },
+            3
+        )
     }
 }
 
