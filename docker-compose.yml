@@ -1,8 +1,6 @@
 services:
   linastore:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: aimerick/linastore-server:latest
     container_name: linastore-server
     restart: unless-stopped
     environment:
