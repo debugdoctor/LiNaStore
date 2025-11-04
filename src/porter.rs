@@ -118,13 +118,13 @@ fn process_package(
 ) -> Result<(), String> {
     let mut res_pkg = Package::new();
     res_pkg.uni_id = pkg.uni_id;
-    res_pkg.content.name = pkg.content.name.clone();
+    res_pkg.content.identifier = pkg.content.identifier.clone();
     res_pkg.content.flags = pkg.content.flags;
 
     // Optimize filename validation: use iterator to avoid repeated computation
-    let valid_data_end = pkg.content.name.iter()
+    let valid_data_end = pkg.content.identifier.iter()
         .position(|&b| b == 0)
-        .unwrap_or(pkg.content.name.len());
+        .unwrap_or(pkg.content.identifier.len());
 
     if valid_data_end == 0 {
         res_pkg.status = Status::FileNameInvalid;
@@ -132,12 +132,12 @@ fn process_package(
     }
 
     // Optimize string conversion: avoid unnecessary allocation
-    let name = if valid_data_end == pkg.content.name.len() {
+    let identifier = if valid_data_end == pkg.content.identifier.len() {
         // No null terminator, use entire array directly
-        unsafe { String::from_utf8_unchecked(pkg.content.name.to_vec()) }
+        unsafe { String::from_utf8_unchecked(pkg.content.identifier.to_vec()) }
     } else {
         // Has null terminator, only convert valid portion
-        unsafe { String::from_utf8_unchecked(pkg.content.name[..valid_data_end].to_vec()) }
+        unsafe { String::from_utf8_unchecked(pkg.content.identifier[..valid_data_end].to_vec()) }
     };
 
     // SQLite serial processing: each operation is independent to avoid transaction conflicts
@@ -147,7 +147,7 @@ fn process_package(
             let should_cover = flags & FlagType::Cover as u8 == FlagType::Cover as u8;
             let should_compress = flags & FlagType::Compress as u8 == FlagType::Compress as u8;
             
-            match store_manager.put_binary_data(&name, &pkg.content.data, should_cover, should_compress) {
+            match store_manager.put_binary_data(&identifier, &pkg.content.data, should_cover, should_compress) {
                 Ok(_) => {
                     res_pkg.status = Status::Success;
                     send_response(&res_pkg, conveyers)
@@ -159,7 +159,7 @@ fn process_package(
             }
         }
         Behavior::GetFile => {
-            match store_manager.get_binary_data(&name) {
+            match store_manager.get_binary_data(&identifier) {
                 Ok(data) => {
                     res_pkg.status = Status::Success;
                     res_pkg.content.data = data;
@@ -172,7 +172,7 @@ fn process_package(
             }
         }
         Behavior::DeleteFile => {
-            match store_manager.delete(&name, false) {
+            match store_manager.delete(&identifier, false) {
                 Ok(_) => {
                     res_pkg.status = Status::Success;
                     send_response(&res_pkg, conveyers)

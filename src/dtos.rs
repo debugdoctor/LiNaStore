@@ -5,7 +5,7 @@ pub const NAME_SIZE: usize = 255;
 
 #[derive(Clone, PartialEq)]
 pub struct PayLoad {
-    pub name: [u8; NAME_SIZE],
+    pub identifier: [u8; NAME_SIZE],
     pub length: u32,
     pub checksum: u32,
     pub data: Vec<u8>,
@@ -14,9 +14,9 @@ pub struct PayLoad {
 /// Flags Definition
 /// ---
 /// ```markdown
-/// | File Operation | Reserved | Reserved | Reserved | Reserved | Cover | Compress |
+/// | File Operation | Communicate Options | Reserved | Reserved | Cover | Compress |
 /// |----------------|----------|----------|----------|----------|-------|----------|
-/// | 0xC0 - 0x40    | 0x20     | 0x10     | 0x08     | 0x04     | 0x02  | 0x01     |
+/// | 0xC0 - 0x40    |     0x20 - 0x10     | 0x08     | 0x04     | 0x02  | 0x01     |
 /// ```
 #[derive(Clone, PartialEq)]
 pub struct LiNaProtocol {
@@ -31,7 +31,7 @@ impl LiNaProtocol {
             flags: FlagType::None as u8,
             status: Status::None,
             payload: PayLoad {
-                name: [0; 255],
+                identifier: [0; 255],
                 length: 0,
                 checksum: 0,
                 data: Vec::new(),
@@ -46,7 +46,7 @@ impl LiNaProtocol {
     // Calculate CRC32 checksum
     pub fn calculate_checksum(&self) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&self.payload.name);
+        hasher.update(&self.payload.identifier);
         hasher.update(&self.payload.length.to_le_bytes());
         hasher.update(&self.payload.data);
         hasher.finalize()
@@ -56,7 +56,7 @@ impl LiNaProtocol {
         let mut payload = Vec::with_capacity(0x1000);
 
         payload.push(self.status.clone() as u8);
-        payload.extend_from_slice(&self.payload.name);
+        payload.extend_from_slice(&self.payload.identifier);
         payload.extend_from_slice(&self.payload.length.to_le_bytes());
         payload.extend_from_slice(&self.payload.checksum.to_le_bytes());
         payload.extend_from_slice(&self.payload.data);
@@ -68,6 +68,7 @@ pub enum FlagType {
     Delete = 0xC0,
     Write = 0x80,
     Read = 0x40,
+    Auth = 0x30,
     Cover = 0x02,
     Compress = 0x01,
     None = 0x00,
@@ -90,7 +91,7 @@ impl Package {
             behavior: Behavior::None,
             content: Content {
                 flags: 0x40,
-                name: [0; NAME_SIZE],
+                identifier: [0; NAME_SIZE],
                 data: Vec::new(),
             },
             created_at: Utc::now().timestamp(),
@@ -104,7 +105,7 @@ impl Package {
             behavior: Behavior::None,
             content: Content {
                 flags: 0,
-                name: [0; NAME_SIZE],
+                identifier: [0; NAME_SIZE],
                 data: Vec::new(),
             },
             created_at: Utc::now().timestamp(),
@@ -115,7 +116,7 @@ impl Package {
 #[derive(Clone, PartialEq)]
 pub struct Content {
     pub flags: u8,
-    pub name: [u8; NAME_SIZE],
+    pub identifier: [u8; NAME_SIZE],
     pub data: Vec<u8>,
 }
 

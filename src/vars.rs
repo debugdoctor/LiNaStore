@@ -8,7 +8,8 @@ pub struct EnvVar {
     pub ip_address: String,
     pub advanced_port: String,
     pub http_port: String,
-    pub max_payload_size: usize
+    pub max_payload_size: usize,
+    pub password_enabled: bool,
 }
 
 lazy_static! {
@@ -37,12 +38,24 @@ impl EnvVar {
             })
             .parse()
             .unwrap_or(0x4000000);
+        
+        let password_enabled = std::env::var("LINASTORE_PASSWORD")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .is_some();
+
+        if password_enabled {
+            event!(tracing::Level::INFO, "Password protection is enabled for advanced service");
+        } else {
+            event!(tracing::Level::INFO, "Password protection is disabled - advanced service is open");
+        }
 
         EnvVar {
             ip_address,
             http_port,
             advanced_port,
             max_payload_size,
+            password_enabled,
         }
     }
 

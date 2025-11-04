@@ -88,8 +88,8 @@ void LiNaClient::check_recv(char* buf, size_t len, const char* context)
 }
 
 LiNaClient::LiNaClient(std::string addr, int port)
+    : sock(INVALID_SOCKET)
 {
-    this->sock = socket(AF_INET, SOCK_STREAM, 0);
     memset(&this->server_addr, 0, sizeof(this->server_addr));
     this->server_addr.sin_family = AF_INET;
     this->server_addr.sin_addr.s_addr = inet_addr(addr.c_str());
@@ -99,8 +99,34 @@ LiNaClient::LiNaClient(std::string addr, int port)
 LiNaClient::~LiNaClient() {
     disconnect();
 }
+
 bool LiNaClient::connect(){
-    return ::connect(this->sock, (struct sockaddr*)&this->server_addr, sizeof(this->server_addr)) == 0;
+    if (sock != INVALID_SOCKET) {
+        return true; // Already connected
+    }
+    
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        throw LiNaClientException("Failed to create socket");
+    }
+    
+    int result = ::connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    if (result != 0) {
+        #ifdef _WIN32
+            int error = WSAGetLastError();
+            closesocket(sock);
+        #else
+            int error = errno;
+            close(sock);
+        #endif
+        sock = INVALID_SOCKET;
+        
+        std::ostringstream oss;
+        oss << "Failed to connect to server: " << error;
+        throw LiNaClientException(oss.str());
+    }
+    
+    return true;
 }
 
 bool LiNaClient::disconnect(){
@@ -111,19 +137,24 @@ bool LiNaClient::disconnect(){
             int ret = close(sock);
         #endif
         sock = INVALID_SOCKET;
-        return ret == 0;  // Reset after closing
+        return ret == 0;
     }
+    return true; // Already disconnected
 }
 
 bool LiNaClient::uploadFile(std::string name, std::vector<char> data, uint8_t flags)
 {
-    // Name copy
+    // Name validation
     if(name.empty()) {
         throw LiNaClientException("File name cannot be empty");
     }
     
+    if (data.empty()) {
+        throw LiNaClientException("File data cannot be empty");
+    }
+    
     // 255 bytes padding for name
-    std::vector<uint8_t> name_buf(LINA_NAME_LENGTH);
+    std::vector<uint8_t> name_buf(LINA_NAME_LENGTH, 0);
     if(name.length() > LINA_NAME_LENGTH) {
         throw LiNaClientException("File name exceeds maximum length");
     }
@@ -142,19 +173,31 @@ bool LiNaClient::uploadFile(std::string name, std::vector<char> data, uint8_t fl
     // Connect to LiNa server
     connect();
 
-    std::vector<std::pair<const void*, size_t>> send_buffers;
-    send_buffers.push_back({name_buf.data(), name_buf.size()});
-    send_buffers.push_back({length.data(), length.size()});
-    send_buffers.push_back({checksum.data(), checksum.size()});
-    send_buffers.push_back({data.data(), data.size()});
-    
-    check_sendv(send_buffers, "file upload data");
+    try {
+        std::vector<std::pair<const void*, size_t>> send_buffers;
+        send_buffers.push_back({&flags, 1}); // Add flags buffer
+        send_buffers.push_back({name_buf.data(), name_buf.size()});
+        send_buffers.push_back({length.data(), length.size()});
+        send_buffers.push_back({checksum.data(), checksum.size()});
+        send_buffers.push_back({data.data(), data.size()});
+        
+        check_sendv(send_buffers, "file upload data");
 
-    std::vector<char> header_buf(LINA_HEADER_LENGTH);
-    check_recv(header_buf.data(), header_buf.size(), "response header");
-    disconnect();
-
-    return header_buf[0] == 0;
+        std::vector<char> header_buf(LINA_HEADER_LENGTH);
+        check_recv(header_buf.data(), header_buf.size(), "response header");
+        
+        if (header_buf[0] != 0) {
+            std::ostringstream oss;
+            oss << "Server returned error code: " << static_cast<int>(header_buf[0]) << " for file: " << name;
+            throw LiNaClientException(oss.str());
+        }
+        
+        disconnect();
+        return true;
+    } catch (...) {
+        disconnect();
+        throw;
+    }
 }
 
 std::vector<char> LiNaClient::downloadFile(std::string name)
@@ -163,7 +206,7 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
         throw LiNaClientException("File name cannot be empty");
     }
     
-    std::vector<uint8_t> name_buf(LINA_NAME_LENGTH);
+    std::vector<uint8_t> name_buf(LINA_NAME_LENGTH, 0);
     if(name.length() > LINA_NAME_LENGTH) {
         throw LiNaClientException("File name exceeds maximum length");
     }
@@ -178,50 +221,73 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
 
     connect();
 
-    std::vector<std::pair<const void*, size_t>> send_buffers;
-    send_buffers.push_back({name_buf.data(), name_buf.size()});
-    send_buffers.push_back({length.data(), length.size()});
-    send_buffers.push_back({checksum.data(), checksum.size()});
+    try {
+        uint8_t flags = LINA_READ;
+        std::vector<std::pair<const void*, size_t>> send_buffers;
+        send_buffers.push_back({&flags, 1}); // Add flags buffer
+        send_buffers.push_back({name_buf.data(), name_buf.size()});
+        send_buffers.push_back({length.data(), length.size()});
+        send_buffers.push_back({checksum.data(), checksum.size()});
 
-    check_sendv(send_buffers, "file download data");
+        check_sendv(send_buffers, "file download data");
 
-    std::vector<char> header_buf(LINA_HEADER_LENGTH);
-    check_recv(header_buf.data(), header_buf.size(), "response header");
+        std::vector<char> header_buf(LINA_HEADER_LENGTH);
+        check_recv(header_buf.data(), header_buf.size(), "response header");
 
-    // Header break down
-    uint16_t p = 0;
-    uint8_t flags = header_buf[p++];
-    std::vector<uint8_t> name_recv(header_buf.begin() + p, header_buf.begin() + p + LINA_NAME_LENGTH);
-    p += LINA_NAME_LENGTH;
-    std::vector<uint8_t> length_recv(header_buf.begin() + p, header_buf.begin() + p + 4);
-    uint32_t length_u32 = to_long(length_recv, 4);
-    p += 4;
-    std::vector<uint8_t> checksum_recv(header_buf.begin() + p, header_buf.begin() + p + 4);
-    p += 4;
+        // Check response flag first
+        if (header_buf[0] != 0) {
+            std::ostringstream oss;
+            oss << "Server returned error code: " << static_cast<int>(header_buf[0]) << " for file: " << name;
+            throw LiNaClientException(oss.str());
+        }
 
+        // Header break down
+        uint16_t p = 1; // Skip the flag byte
+        std::vector<uint8_t> name_recv(header_buf.begin() + p, header_buf.begin() + p + LINA_NAME_LENGTH);
+        p += LINA_NAME_LENGTH;
+        std::vector<uint8_t> length_recv(header_buf.begin() + p, header_buf.begin() + p + 4);
+        uint32_t length_u32 = to_long(length_recv, 4);
+        p += 4;
+        std::vector<uint8_t> checksum_recv(header_buf.begin() + p, header_buf.begin() + p + 4);
 
-    std::vector<char> data_recv(length_u32);
-    check_recv(data_recv.data() , length_u32, "response body");
-    // Disconnect
-    disconnect();
+        if (length_u32 > 0) {
+            std::vector<char> data_recv(length_u32);
+            check_recv(data_recv.data(), length_u32, "response body");
+            
+            // Disconnect
+            disconnect();
 
-    crc32.update(name_recv);
-    crc32.update(length_recv);
-    std::vector<uint8_t> data_u8(data_recv.begin(), data_recv.end());
-    crc32.update(data_u8);
+            crc32.update(name_recv);
+            crc32.update(length_recv);
+            std::vector<uint8_t> data_u8(data_recv.begin(), data_recv.end());
+            crc32.update(data_u8);
 
-    if (crc32.finalize() != to_long(checksum_recv, 4)) {
-        throw LiNaClientException("CRC32 checksum mismatch");
+            if (crc32.finalize() != to_long(checksum_recv, 4)) {
+                std::ostringstream oss;
+                oss << "CRC32 checksum mismatch for file: " << name;
+                throw LiNaClientException(oss.str());
+            }
+            
+            return data_recv;
+        } else {
+            disconnect();
+            return std::vector<char>(); // Empty file
+        }
+    } catch (...) {
+        disconnect();
+        throw;
     }
-    
-    return data_recv;
 }
 
 bool LiNaClient::deleteFile(std::string name)
 {
+    if(name.empty()) {
+        throw LiNaClientException("File name cannot be empty");
+    }
+    
     uint8_t flags = LINA_DELETE;
 
-    std::vector<uint8_t> name_buf(LINA_NAME_LENGTH);
+    std::vector<uint8_t> name_buf(LINA_NAME_LENGTH, 0);
     if(name.length() > LINA_NAME_LENGTH) {
         throw LiNaClientException("File name exceeds maximum length");
     }
@@ -232,20 +298,33 @@ bool LiNaClient::deleteFile(std::string name)
     crc32.update(name_buf);
     crc32.update(length);
 
-    std::vector<char> checksum = to_vector<char>(crc32.finalize(), 4);
+    std::vector<uint8_t> checksum = to_vector<uint8_t>(crc32.finalize(), 4);
 
     connect();
     
-    std::vector<std::pair<const void*, size_t>> send_buffers;
-    send_buffers.push_back({name_buf.data(), name_buf.size()});
-    send_buffers.push_back({length.data(), length.size()});
-    send_buffers.push_back({checksum.data(), checksum.size()});
+    try {
+        std::vector<std::pair<const void*, size_t>> send_buffers;
+        send_buffers.push_back({&flags, 1}); // Add flags buffer
+        send_buffers.push_back({name_buf.data(), name_buf.size()});
+        send_buffers.push_back({length.data(), length.size()});
+        send_buffers.push_back({checksum.data(), checksum.size()});
 
-    check_sendv(send_buffers, "file delete data");
+        check_sendv(send_buffers, "file delete data");
 
-    std::vector<char> header_buf(LINA_HEADER_LENGTH);
-    check_recv(header_buf.data(), header_buf.size(), "response header");
-    // Disconnect
-    disconnect();
-    return header_buf[0] == 0;
+        std::vector<char> header_buf(LINA_HEADER_LENGTH);
+        check_recv(header_buf.data(), header_buf.size(), "response header");
+        
+        if (header_buf[0] != 0) {
+            std::ostringstream oss;
+            oss << "Server returned error code: " << static_cast<int>(header_buf[0]) << " for file: " << name;
+            throw LiNaClientException(oss.str());
+        }
+        
+        // Disconnect
+        disconnect();
+        return true;
+    } catch (...) {
+        disconnect();
+        throw;
+    }
 }

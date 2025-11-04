@@ -95,6 +95,10 @@ pub fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Res
 /// |    48     |    37    |
 /// |    48     |    7d    |
 /// ```
+/// BlockManager handles compression and decompression of data chunks using parallel processing
+///
+/// This struct provides efficient block-based compression with configurable thread pool
+/// and chunk sizes for optimal performance on different hardware configurations.
 #[derive(Debug)]
 pub struct BlockManager {
     chunk_size: usize,
@@ -102,31 +106,63 @@ pub struct BlockManager {
 }
 
 impl BlockManager {
+    /// Create a new BlockManager with default settings
+    ///
+    /// Uses system-appropriate thread count and optimal chunk size
+    ///
+    /// # Panics
+    /// Panics if thread pool creation fails
     pub fn new() -> Self {
-        let thread_pool = match ThreadPoolBuilder::new().num_threads(4).build() {
+        // Use number of available CPU cores for optimal performance
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(4); // Cap at 4 threads to avoid excessive resource usage
+
+        let thread_pool = match ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|index| format!("linastore-compress-{}", index))
+            .build()
+        {
             Ok(pool) => pool,
-            Err(err) => panic!("{}", err),
+            Err(err) => panic!("Failed to create thread pool: {}", err),
         };
 
         BlockManager {
-            chunk_size: 0x10000 - 0x400,
+            chunk_size: 0x10000 - 0x400, // 63KiB for optimal compression
             thread_pool,
         }
     }
 
-    #[allow(dead_code)]
+    /// Create a new BlockManager with custom chunk size
+    ///
+    /// # Arguments
+    /// * `chunk_size` - Size of each chunk for compression
+    ///
+    /// # Panics
+    /// Panics if chunk_size is not a multiple of GROUP_SIZE or exceeds maximum
     pub fn with_capacity(chunk_size: usize) -> Self {
         if chunk_size % GROUP_SIZE != 0 {
-            panic!("Must be multiples of 64 Byte");
+            panic!("Chunk size must be a multiple of {} bytes", GROUP_SIZE);
         }
 
         if chunk_size > 0x10000 - 0x400 {
             panic!("Chunk size must be less than (not equal to) 64KiB");
         }
 
-        let thread_pool = match ThreadPoolBuilder::new().num_threads(4).build() {
+        // Use number of available CPU cores for optimal performance
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(4);
+
+        let thread_pool = match ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|index| format!("linastore-compress-{}", index))
+            .build()
+        {
             Ok(pool) => pool,
-            Err(err) => panic!("{}", err),
+            Err(err) => panic!("Failed to create thread pool: {}", err),
         };
 
         BlockManager {

@@ -4,6 +4,7 @@ mod front;
 mod porter;
 mod shutdown;
 mod vars;
+mod auth;
 
 use tracing::event;
 use tracing_subscriber;
