@@ -36,7 +36,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>LiNaStoreClient</mainClass>
+                            <mainClass>cc.aimerick.linastore.LiNaStoreClient</mainClass>
                         </manifest>
                     </archive>
                 </configuration>

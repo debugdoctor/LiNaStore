@@ -64,11 +64,11 @@ async fn handle_http(
     if name_bytes.len() > dtos::NAME_SIZE {
         return Ok(Response::builder()
             .status(hyper::StatusCode::BAD_REQUEST)
-            .body(Full::new(Bytes::from("File name too long: max 256 bytes")))?);
+            .body(Full::new(Bytes::from("File identifier too long: max 256 bytes")))?);
     }
     let mut name_buf = [0u8; dtos::NAME_SIZE];
     name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
-    package.content.name = name_buf;
+    package.content.identifier = name_buf;
     package.behavior = Behavior::GetFile;
 
     // Send to queue
@@ -106,13 +106,13 @@ async fn handle_http(
             Ok(Some(pkg)) => {
                 let valid_data_end = pkg
                     .content
-                    .name
+                    .identifier
                     .iter()
                     .position(|&b| b == 0)
-                    .unwrap_or(pkg.content.name.len());
+                    .unwrap_or(pkg.content.identifier.len());
 
                 let content_type = get_mime_type(
-                    &String::from_utf8_lossy(&pkg.content.name[..valid_data_end]).to_string(),
+                    &String::from_utf8_lossy(&pkg.content.identifier[..valid_data_end]).to_string(),
                 );
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::OK)

@@ -1,4 +1,4 @@
-package cc.aimerick.linastore;
+package com.aimerick.linastore;
 
 public enum LiNaFlags {
     DELETE(0xC0),
