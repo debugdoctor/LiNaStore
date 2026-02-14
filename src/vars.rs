@@ -1,7 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tracing::{event, instrument};
-use lazy_static::lazy_static;
 
 
 pub struct EnvVar {
@@ -9,12 +8,11 @@ pub struct EnvVar {
     pub advanced_port: String,
     pub http_port: String,
     pub max_payload_size: usize,
+    pub password: String,
     pub password_enabled: bool,
 }
 
-lazy_static! {
-    pub static ref ENV: Arc<EnvVar> = Arc::new(EnvVar::initialize());
-}
+static ENV: OnceLock<Arc<EnvVar>> = OnceLock::new();
 
 impl EnvVar {
     #[instrument(name = "EnvVar", skip_all)]
@@ -38,6 +36,12 @@ impl EnvVar {
             })
             .parse()
             .unwrap_or(0x4000000);
+
+        let password = std::env::var("LINASTORE_PASSWORD")
+            .unwrap_or_else(|_| {
+                event!(tracing::Level::WARN, "LINASTORE_PASSWORD not set, using default");
+                "".to_string()
+            });
         
         let password_enabled = std::env::var("LINASTORE_PASSWORD")
             .ok()
@@ -55,11 +59,12 @@ impl EnvVar {
             http_port,
             advanced_port,
             max_payload_size,
+            password,
             password_enabled,
         }
     }
 
     pub fn get_instance() -> Arc<EnvVar> {
-        ENV.clone()
+        ENV.get_or_init(|| Arc::new(EnvVar::initialize())).clone()
     }
 }

@@ -1,14 +1,10 @@
-use lazy_static::lazy_static;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    OnceLock,
 };
 
-lazy_static! {
-    static ref SHUTDOWN: Arc<Shutdown> = Arc::new(Shutdown {
-        is_shutdown: AtomicBool::new(false),
-    });
-}
+static SHUTDOWN: OnceLock<Arc<Shutdown>> = OnceLock::new();
 
 pub struct Shutdown {
     is_shutdown: AtomicBool,
@@ -16,7 +12,13 @@ pub struct Shutdown {
 
 impl Shutdown {
     pub fn get_instance() -> Arc<Shutdown> {
-        SHUTDOWN.clone()
+        SHUTDOWN
+            .get_or_init(|| {
+                Arc::new(Shutdown {
+                    is_shutdown: AtomicBool::new(false),
+                })
+            })
+            .clone()
     }
 
     /// Checks if shutdown has been triggered
