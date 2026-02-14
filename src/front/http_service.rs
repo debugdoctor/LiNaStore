@@ -71,61 +71,63 @@ async fn handle_http(
     package.content.identifier = name_buf;
     package.behavior = Behavior::GetFile;
 
+    // Register waiter before sending to queue
+    let con_queue = ConveyQueue::get_instance();
+    let receiver = match con_queue.register_waiter(uni_id) {
+        Some(rx) => rx,
+        None => {
+            event!(Level::ERROR, "Failed to register waiter for request");
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from("Failed to process request")))?);
+        }
+    };
+
     // Send to queue
-    if let Err(e) = ConveyQueue::get_instance().produce_order(package) {
+    if let Err(e) = con_queue.produce_order(package) {
         event!(Level::ERROR, "Failed to produce order: {}", e);
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
             .body(Full::new(Bytes::from("Failed to process request")))?);
     }
 
-    // Time control
-    let start_time = tokio::time::Instant::now();
-    let overall_timeout = Duration::from_secs(10);
+    // Wait for response via channel with timeout
+    let timeout = Duration::from_secs(10);
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(pkg)) => {
+            let valid_data_end = pkg
+                .content
+                .identifier
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(pkg.content.identifier.len());
 
-    // Wait for package from conveyer
-    let con_queue = ConveyQueue::get_instance();
-    loop {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // Check overall timeout
-        if tokio::time::Instant::now() > start_time + overall_timeout {
+            let content_type = get_mime_type(
+                &String::from_utf8_lossy(&pkg.content.identifier[..valid_data_end]).to_string(),
+            );
+            Ok(Response::builder()
+                .status(hyper::StatusCode::OK)
+                .header("X-Content-Type-Options", "nosniff")
+                .header("X-Frame-Options", "DENY")
+                .header("Content-Type", content_type)
+                .header("Content-Length", pkg.content.data.len().to_string())
+                .body(Full::new(Bytes::from(pkg.content.data)))?)
+        }
+        Ok(Err(_)) => {
+            event!(Level::ERROR, "[waitress {}] Channel closed unexpectedly", &log_id);
+            Ok(Response::builder()
+                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from("Channel closed unexpectedly")))?)
+        }
+        Err(_) => {
             event!(
-                tracing::Level::ERROR,
-                "[waitress {}] Overall timeout exceeded",
+                Level::ERROR,
+                "[waitress {}] Timeout exceeded",
                 &log_id
             );
-            return Ok(Response::builder()
+            Ok(Response::builder()
                 .status(hyper::StatusCode::REQUEST_TIMEOUT)
-                .body(Full::new(Bytes::from("Overall timeout exceeded")))?);
-        }
-
-        let con_queue_clone = con_queue.clone();
-        let uni_id_value = uni_id;
-
-        match con_queue_clone.consume_service(uni_id_value) {
-            Ok(Some(pkg)) => {
-                let valid_data_end = pkg
-                    .content
-                    .identifier
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(pkg.content.identifier.len());
-
-                let content_type = get_mime_type(
-                    &String::from_utf8_lossy(&pkg.content.identifier[..valid_data_end]).to_string(),
-                );
-                return Ok(Response::builder()
-                    .status(hyper::StatusCode::OK)
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("X-Frame-Options", "DENY")
-                    .header("Content-Type", content_type)
-                    .header("Content-Length", pkg.content.data.len().to_string())
-                    .body(Full::new(Bytes::from(pkg.content.data)))?);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                event!(tracing::Level::ERROR, "[waitress {}] {}", &log_id, err);
-            }
+                .body(Full::new(Bytes::from("Request timeout")))?)
         }
     }
 }

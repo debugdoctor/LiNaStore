@@ -37,8 +37,13 @@ async fn main() -> Result<()> {
     conveyer::ConveyQueue::init();
     event!(tracing::Level::INFO, "Message queue initialized");
 
+    // Spawn session cleanup task
     let _ = tokio::task::spawn(async move {
-        porter::porter(&current_dir);
+        auth::cleanup_expired_sessions().await;
+    });
+
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(porter::porter(&current_dir));
     });
 
     let _ = tokio::task::spawn(async move {

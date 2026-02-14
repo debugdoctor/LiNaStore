@@ -613,8 +613,10 @@ impl TidyManager {
 #[cfg(test)]
 mod tests {
     use rand::Rng;
+    use tempfile::TempDir;
 
     use super::*;
+
     fn generate_random_binary(size: usize) -> Vec<u8> {
         let mut rng = rand::rng();
         let mut data = vec![0u8; size];
@@ -629,5 +631,269 @@ mod tests {
         let _ = sm.put_binary_data("random.txt", &data, true, true);
         let data_get = sm.get_binary_data("random.txt").unwrap();
         assert_eq!(data, data_get, "Data flow test failed");
+    }
+
+    #[test]
+    fn test_store_manager_new() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path());
+        assert!(sm.is_ok());
+        
+        // Verify linadata directory was created
+        let linadata_path = temp_dir.path().join("linadata");
+        assert!(linadata_path.exists());
+    }
+
+    #[test]
+    fn test_put_binary_data_new_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![1, 2, 3, 4, 5];
+        
+        let result = sm.put_binary_data("test.txt", &data, false, false);
+        assert!(result.is_ok());
+        
+        // Verify file can be retrieved
+        let retrieved = sm.get_binary_data("test.txt").expect("Failed to get data");
+        assert_eq!(data, retrieved);
+    }
+
+    #[test]
+    fn test_put_binary_data_compressed() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![42u8; 10000]; // Highly compressible data
+        
+        let result = sm.put_binary_data("compressed.txt", &data, false, true);
+        assert!(result.is_ok());
+        
+        let retrieved = sm.get_binary_data("compressed.txt").expect("Failed to get data");
+        assert_eq!(data, retrieved);
+    }
+
+    #[test]
+    fn test_put_binary_data_cover() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data1 = vec![1, 2, 3, 4, 5];
+        let data2 = vec![6, 7, 8, 9, 10];
+        
+        // Put initial data
+        sm.put_binary_data("test.txt", &data1, false, false).expect("Failed to put data");
+        
+        // Cover with new data
+        sm.put_binary_data("test.txt", &data2, true, false).expect("Failed to cover data");
+        
+        let retrieved = sm.get_binary_data("test.txt").expect("Failed to get data");
+        assert_eq!(data2, retrieved);
+    }
+
+    #[test]
+    fn test_put_binary_data_empty_filename() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![1, 2, 3, 4, 5];
+        
+        let result = sm.put_binary_data("", &data, false, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_binary_data_not_found() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        
+        let result = sm.get_binary_data("nonexistent.txt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_binary_data_empty_filename() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        
+        let result = sm.get_binary_data("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_all_files() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data1 = vec![1, 2, 3];
+        let data2 = vec![4, 5, 6];
+        
+        sm.put_binary_data("file1.txt", &data1, false, false).expect("Failed to put data");
+        sm.put_binary_data("file2.txt", &data2, false, false).expect("Failed to put data");
+        
+        let links = sm.list("", 0, false, true).expect("Failed to list files");
+        assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn test_list_by_name() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![1, 2, 3];
+        
+        sm.put_binary_data("test_file.txt", &data, false, false).expect("Failed to put data");
+        
+        let links = sm.list("test_file.txt", 0, false, false).expect("Failed to list files");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].name, "test_file.txt");
+    }
+
+    #[test]
+    fn test_list_by_extension() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data1 = vec![1, 2, 3];
+        let data2 = vec![4, 5, 6];
+        let data3 = vec![7, 8, 9];
+        
+        sm.put_binary_data("file1.txt", &data1, false, false).expect("Failed to put data");
+        sm.put_binary_data("file2.txt", &data2, false, false).expect("Failed to put data");
+        sm.put_binary_data("file3.pdf", &data3, false, false).expect("Failed to put data");
+        
+        let txt_links = sm.list("txt", 0, true, false).expect("Failed to list files");
+        assert_eq!(txt_links.len(), 2);
+        
+        let pdf_links = sm.list("pdf", 0, true, false).expect("Failed to list files");
+        assert_eq!(pdf_links.len(), 1);
+    }
+
+    #[test]
+    fn test_list_with_limit() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![1, 2, 3];
+        
+        for i in 0..5 {
+            let filename = format!("file{}.txt", i);
+            sm.put_binary_data(&filename, &data, false, false).expect("Failed to put data");
+        }
+        
+        let links = sm.list("", 3, false, true).expect("Failed to list files");
+        assert_eq!(links.len(), 3);
+    }
+
+    #[test]
+    fn test_delete_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![1, 2, 3];
+        
+        sm.put_binary_data("test.txt", &data, false, false).expect("Failed to put data");
+        
+        // Verify file exists
+        let links = sm.list("test.txt", 0, false, false).expect("Failed to list files");
+        assert_eq!(links.len(), 1);
+        
+        // Delete file
+        sm.delete("test.txt", false).expect("Failed to delete file");
+        
+        // Verify file is deleted
+        let links_after = sm.list("test.txt", 0, false, false).expect("Failed to list files");
+        assert!(links_after.is_empty());
+    }
+
+    #[test]
+    fn test_delete_empty_pattern() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        
+        let result = sm.delete("", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_and_save() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let save_dir = TempDir::new().expect("Failed to create save dir");
+        let data = vec![1, 2, 3, 4, 5];
+        
+        sm.put_binary_data("test.txt", &data, false, false).expect("Failed to put data");
+        
+        let files = vec!["test.txt".to_string()];
+        sm.get_and_save(&files, save_dir.path()).expect("Failed to get and save");
+        
+        let saved_path = save_dir.path().join("test.txt");
+        assert!(saved_path.exists());
+        
+        let saved_data = std::fs::read(&saved_path).expect("Failed to read saved file");
+        assert_eq!(data, saved_data);
+    }
+
+    #[test]
+    fn test_get_and_save_empty_files() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let save_dir = TempDir::new().expect("Failed to create save dir");
+        let files: Vec<String> = vec![];
+        
+        let result = sm.get_and_save(&files, save_dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_file_name_gen() {
+        let name1 = StoreManager::file_name_gen();
+        let name2 = StoreManager::file_name_gen();
+        
+        // Names should be different
+        assert_ne!(name1, name2);
+        
+        // Names should be 22 characters (14 for timestamp + 8 for nanoid)
+        assert_eq!(name1.len(), 22);
+        assert_eq!(name2.len(), 22);
+    }
+
+    #[test]
+    fn test_deduplication_same_content() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = vec![1, 2, 3, 4, 5];
+        
+        // Put same data with different names
+        sm.put_binary_data("file1.txt", &data, false, false).expect("Failed to put data");
+        sm.put_binary_data("file2.txt", &data, false, false).expect("Failed to put data");
+        
+        // Both should retrieve the same data
+        let data1 = sm.get_binary_data("file1.txt").expect("Failed to get data");
+        let data2 = sm.get_binary_data("file2.txt").expect("Failed to get data");
+        assert_eq!(data1, data2);
+        assert_eq!(data1, data);
+    }
+
+    #[test]
+    fn test_large_file() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).expect("Failed to create StoreManager");
+        let data = generate_random_binary(1024 * 1024); // 1MB
+        
+        sm.put_binary_data("large.txt", &data, false, false).expect("Failed to put data");
+        
+        let retrieved = sm.get_binary_data("large.txt").expect("Failed to get data");
+        assert_eq!(data, retrieved);
+    }
+
+    #[test]
+    fn test_tidy_manager_new() {
+        let tm = TidyManager::new();
+        assert!(tm.map_cache.is_empty());
+    }
+
+    #[test]
+    fn test_relative_path_with_same_root() {
+        let tm = TidyManager::new();
+        
+        // Test same directory
+        let result = tm.relative_path_with_same_root("/a/b/c.txt", "/a/b/d.txt");
+        assert_eq!(result, PathBuf::from("./d.txt"));
+        
+        // Test parent directory
+        let result = tm.relative_path_with_same_root("/a/b/c.txt", "/a/d.txt");
+        assert_eq!(result, PathBuf::from("../d.txt"));
     }
 }

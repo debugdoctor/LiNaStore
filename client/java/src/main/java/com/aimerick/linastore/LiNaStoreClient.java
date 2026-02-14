@@ -18,6 +18,7 @@ public class LiNaStoreClient {
     private final int timeout;
     private final static int LINA_NAME_MAX_LENGTH = 255;
     private final static int LINA_HEADER_LENGTH = 0x108;
+    private String sessionToken = null;
     
     // Custom exceptions for better error handling
     public static class LiNaStoreException extends Exception {
@@ -138,14 +139,28 @@ public class LiNaStoreClient {
             }
             System.arraycopy(fileNameBytes, 0, fullFileNameBuffer, 0, fileNameBytes.length);
 
+            // Prepare data with optional session token
+            byte[] payloadData;
+            if (sessionToken != null && !sessionToken.isEmpty()) {
+                // Combine session token with null terminator and file data
+                byte[] tokenBytes = sessionToken.getBytes(StandardCharsets.UTF_8);
+                
+                payloadData = new byte[tokenBytes.length + 1 + data.length];
+                System.arraycopy(tokenBytes, 0, payloadData, 0, tokenBytes.length);
+                payloadData[tokenBytes.length] = 0; // Null terminator
+                System.arraycopy(data, 0, payloadData, tokenBytes.length + 1, data.length);
+            } else {
+                payloadData = data;
+            }
+
             // Length of data
-            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(data.length).array();
+            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(payloadData.length).array();
 
             // CRC32 checksum
             CRC32 crc32 = new CRC32();
             crc32.update(fullFileNameBuffer);
             crc32.update(lengthBuffer);
-            crc32.update(data);
+            crc32.update(payloadData);
             byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt((int) crc32.getValue()).array();
 
             // Send all parts
@@ -154,7 +169,7 @@ public class LiNaStoreClient {
                 os.write(fullFileNameBuffer);
                 os.write(lengthBuffer);
                 os.write(checksumBuffer);
-                os.write(data);
+                os.write(payloadData);
                 os.flush();
             } catch (IOException e){
                 throw new LiNaStoreConnectionException("Failed to send data for file: " + fileName, e);
@@ -218,13 +233,22 @@ public class LiNaStoreClient {
             }
             System.arraycopy(fileNameBytes, 0, fullFileNameBuffer, 0, fileNameBytes.length);
 
-            // Length buffer (zero)
-            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0).array();
+            // Prepare data with optional session token
+            byte[] payloadData;
+            if (sessionToken != null && !sessionToken.isEmpty()) {
+                payloadData = sessionToken.getBytes(StandardCharsets.UTF_8);
+            } else {
+                payloadData = new byte[0];
+            }
+
+            // Length buffer
+            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(payloadData.length).array();
 
             // CRC32 checksum
             CRC32 crc32 = new CRC32();
             crc32.update(fullFileNameBuffer);
             crc32.update(lengthBuffer);
+            crc32.update(payloadData);
             byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt((int) crc32.getValue()).array();
 
             // Send request
@@ -233,6 +257,7 @@ public class LiNaStoreClient {
                 os.write(fullFileNameBuffer);
                 os.write(lengthBuffer);
                 os.write(checksumBuffer);
+                os.write(payloadData);
                 os.flush();
             } catch (IOException e){
                 throw new LiNaStoreConnectionException("Failed to send request for file: " + fileName, e);
@@ -339,13 +364,22 @@ public class LiNaStoreClient {
             }
             System.arraycopy(fileNameBytes, 0, fullFileNameBuffer, 0, fileNameBytes.length);
 
-            // Length buffer (zero)
-            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0).array();
+            // Prepare data with optional session token
+            byte[] payloadData;
+            if (sessionToken != null && !sessionToken.isEmpty()) {
+                payloadData = sessionToken.getBytes(StandardCharsets.UTF_8);
+            } else {
+                payloadData = new byte[0];
+            }
+
+            // Length buffer
+            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(payloadData.length).array();
 
             // CRC32 checksum
             CRC32 crc32 = new CRC32();
             crc32.update(fullFileNameBuffer);
             crc32.update(lengthBuffer);
+            crc32.update(payloadData);
             byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt((int) crc32.getValue()).array();
 
             // Send request
@@ -354,6 +388,7 @@ public class LiNaStoreClient {
                 os.write(fullFileNameBuffer);
                 os.write(lengthBuffer);
                 os.write(checksumBuffer);
+                os.write(payloadData);
                 os.flush();
             } catch (IOException e){
                 throw new LiNaStoreConnectionException("Failed to send delete request for file: " + fileName, e);
@@ -390,28 +425,180 @@ public class LiNaStoreClient {
     }
 
     /**
+     * Authenticates with the server using a password and stores the session token.
+     *
+     * @param password The password for authentication.
+     * @return True if authentication successful.
+     * @throws LiNaStoreException If authentication fails due to network or protocol issues.
+     */
+    public boolean authenticate(String password) throws LiNaStoreException {
+        if (password == null || password.isEmpty()) {
+            throw new LiNaStoreProtocolException("Password cannot be null or empty");
+        }
+        
+        try {
+            connect();
+            InputStream is;
+            OutputStream os;
+            try {
+                is = socket.getInputStream();
+                os = socket.getOutputStream();
+            } catch (IOException e) {
+                throw new LiNaStoreConnectionException("Failed to get streams for socket", e);
+            }
+
+            // Prepare flag byte for authentication
+            byte flagByte = (byte) LiNaFlags.AUTH.getValue();
+
+            // Prepare password buffer (255 bytes)
+            byte[] fullPasswordBuffer = new byte[LINA_NAME_MAX_LENGTH];
+            byte[] passwordBytes = password.getBytes(StandardCharsets.UTF_8);
+            if (passwordBytes.length > LINA_NAME_MAX_LENGTH) {
+                throw new LiNaStoreProtocolException("Password is too long: " + passwordBytes.length + " bytes");
+            }
+            System.arraycopy(passwordBytes, 0, fullPasswordBuffer, 0, passwordBytes.length);
+
+            // Length buffer (zero for auth)
+            byte[] lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0).array();
+
+            // CRC32 checksum
+            CRC32 crc32 = new CRC32();
+            crc32.update(fullPasswordBuffer);
+            crc32.update(lengthBuffer);
+            byte[] checksumBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt((int) crc32.getValue()).array();
+
+            // Send authentication request
+            try {
+                os.write(flagByte);
+                os.write(fullPasswordBuffer);
+                os.write(lengthBuffer);
+                os.write(checksumBuffer);
+                os.flush();
+            } catch (IOException e){
+                throw new LiNaStoreConnectionException("Failed to send authentication request", e);
+            }
+
+            // Read response header
+            byte[] header = new byte[LINA_HEADER_LENGTH];
+            int totalRead = 0;
+            while (totalRead < header.length) {
+                int read;
+                try {
+                    read = is.read(header, totalRead, header.length - totalRead);
+                } catch (IOException e) {
+                    throw new LiNaStoreConnectionException("Failed to read authentication response", e);
+                }
+                if (read == -1) {
+                    throw new LiNaStoreConnectionException("Connection closed while reading authentication response");
+                }
+                totalRead += read;
+            }
+
+            if (totalRead < header.length) {
+                throw new LiNaStoreProtocolException("Incomplete authentication response received: " + totalRead + " < " + header.length);
+            }
+
+            // Check response flag
+            if (header[0] != 0) {
+                throw new LiNaStoreProtocolException("Authentication failed with error code: " + header[0]);
+            }
+
+            // Extract session token from response data (variable length)
+            int dataLength = ByteBuffer.wrap(header, 256, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+            if (dataLength > 0) {
+                byte[] tokenData = new byte[dataLength];
+                totalRead = 0;
+                while (totalRead < dataLength) {
+                    int read;
+                    try {
+                        read = is.read(tokenData, totalRead, dataLength - totalRead);
+                    } catch (IOException e) {
+                        throw new LiNaStoreConnectionException("Failed to read session token", e);
+                    }
+                    if (read == -1) {
+                        throw new LiNaStoreConnectionException("Connection closed while reading session token");
+                    }
+                    totalRead += read;
+                }
+                
+                // Store session token
+                this.sessionToken = new String(tokenData, StandardCharsets.UTF_8).trim();
+                return true;
+            } else {
+                throw new LiNaStoreProtocolException("No session token received from server");
+            }
+        } finally {
+            disconnect();
+        }
+    }
+
+    /**
+     * Gets the current session token.
+     *
+     * @return The session token if authenticated, null otherwise.
+     */
+    public String getSessionToken() {
+        return sessionToken;
+    }
+
+    /**
+     * Checks if the client is authenticated.
+     *
+     * @return True if authenticated, false otherwise.
+     */
+    public boolean isAuthenticated() {
+        return sessionToken != null && !sessionToken.isEmpty();
+    }
+
+    /**
+     * Logs out by invalidating the session token.
+     */
+    public void logout() {
+        sessionToken = null;
+    }
+
+    /**
      * Main method for testing.
      */
     public static void main(String[] args) {
         String host = "localhost";
-        int port = 8080;
+        int port = 8096; // Advanced service port
         String testFile = "test.txt";
+        String password = "test123"; // Test password
 
         try {
             LiNaStoreClient client = new LiNaStoreClient(host, port);
 
-            // Test upload
-            byte[] testData = "This is a test file.".getBytes(StandardCharsets.UTF_8);
-            client.uploadFile(testFile, testData, LiNaFlags.WRITE.getValue());
-            System.out.println("Upload complete.");
-
-            // Test download
-            byte[] downloadedData = client.downloadFile(testFile);
-            System.out.println("Downloaded data: " + new String(downloadedData));
-
-            // Test delete
-            boolean deleted = client.deleteFile(testFile);
-            System.out.println("Delete success: " + deleted);
+            // Test authentication
+            System.out.println("Testing authentication...");
+            boolean authSuccess = client.authenticate(password);
+            if (authSuccess) {
+                System.out.println("Authentication successful!");
+                System.out.println("Session token: " + client.getSessionToken());
+                
+                // Test upload with authentication
+                byte[] testData = "This is a test file with authentication.".getBytes(StandardCharsets.UTF_8);
+                boolean uploadSuccess = client.uploadFile(testFile, testData, LiNaFlags.WRITE.getValue());
+                if (uploadSuccess) {
+                    System.out.println("Upload with authentication successful.");
+                    
+                    // Test download with authentication
+                    byte[] downloadedData = client.downloadFile(testFile);
+                    System.out.println("Downloaded data: " + new String(downloadedData));
+                    
+                    // Test delete with authentication
+                    boolean deleted = client.deleteFile(testFile);
+                    System.out.println("Delete success: " + deleted);
+                } else {
+                    System.out.println("Upload failed.");
+                }
+                
+                // Test logout
+                client.logout();
+                System.out.println("Logged out successfully.");
+            } else {
+                System.out.println("Authentication failed!");
+            }
 
         } catch (LiNaStoreException e) {
             System.err.println("LiNaStore error: " + e.getMessage());

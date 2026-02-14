@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 use linabase::service::StoreManager;
 use tracing::{Level, event, instrument};
@@ -9,104 +9,66 @@ use crate::{
     shutdown::Shutdown,
 };
 
-// Sleep time constants optimized for SQLite serial processing
-const SHORT_SLEEP: u64 = 0x200;   // 512 microseconds - fast response
-const MEDIUM_SLEEP: u64 = 0x2000; // 8192 microseconds - medium wait
-const LONG_SLEEP: u64 = 0x4000;   // 16384 microseconds - long wait
-const IDLE_THRESHOLD: u64 = 0x6000; // Increased threshold to reduce frequent switching
-
-const FAST_MODE: Duration = Duration::from_micros(SHORT_SLEEP);
-const NORMAL_MODE: Duration = Duration::from_micros(MEDIUM_SLEEP);
-const SLOW_MODE: Duration = Duration::from_micros(LONG_SLEEP);
-
 // Error logging interval to avoid log flooding
 const ERROR_LOG_INTERVAL: u32 = 100;
 
 #[instrument(skip_all)]
-pub fn porter(root: &str) {
-    event!(tracing::Level::INFO, "Porter started with SQLite serial processing");
+pub async fn porter(root: &str) {
+    event!(tracing::Level::INFO, "Porter started with transaction-based order processing");
     
     let store_manager = match StoreManager::new(root) {
         Ok(store_manager) => store_manager,
         Err(e) => panic!("{}", e.to_string()),
     };
 
-    let mut dur;
-    let mut idle_delay = 0u64;
-    let mut consecutive_empty = 0u32;
     let mut error_count = 0u32;
 
     let shutdown_status = Shutdown::get_instance();
     let conveyers = ConveyQueue::get_instance();
+    let mut order_notifier = conveyers.subscribe_orders();
 
     loop {
         if shutdown_status.is_shutdown() {
             break;
         }
 
-        // SQLite serial processing: process one package at a time to avoid database lock contention
-        match conveyers.consume_order() {
-            Ok(Some(pkg)) => {
-                consecutive_empty = 0;
-                idle_delay = 0x8000;
-                dur = FAST_MODE;
+        // Wait for order notification using watch channel
+        let _ = order_notifier.changed().await;
 
-                // Process single package
-                match process_package(&pkg, &store_manager, &conveyers) {
-                    Ok(_) => {
-                        // Successfully processed, maintain fast mode
-                    }
-                    Err(e) => {
-                        error_count += 1;
-                        // Limit error log frequency to avoid flooding
-                        if error_count % ERROR_LOG_INTERVAL == 0 {
-                            event!(Level::ERROR, "[porter] Failed to process package ({} errors): {}", 
-                                   error_count, e);
+        // Process all available orders
+        loop {
+            match conveyers.consume_order() {
+                Ok(Some(pkg)) => {
+                    // Process single package
+                    match process_package(&pkg, &store_manager, &conveyers) {
+                        Ok(_) => {
+                            // Successfully processed
+                        }
+                        Err(e) => {
+                            error_count += 1;
+                            // Limit error log frequency to avoid flooding
+                            if error_count % ERROR_LOG_INTERVAL == 0 {
+                                event!(Level::ERROR, "[porter] Failed to process package ({} errors): {}",
+                                       error_count, e);
+                            }
                         }
                     }
                 }
-            }
-            Ok(None) => {
-                consecutive_empty += 1;
-                
-                // SQLite-optimized sleep strategy
-                if idle_delay > 0 {
-                    idle_delay = idle_delay.saturating_sub(if idle_delay >= IDLE_THRESHOLD {
-                        SHORT_SLEEP
-                    } else {
-                        MEDIUM_SLEEP
-                    });
-                    dur = if idle_delay >= IDLE_THRESHOLD {
-                        FAST_MODE
-                    } else {
-                        NORMAL_MODE
-                    };
-                } else {
-                    // Adjust sleep time based on consecutive empty cycles, more conservative for SQLite
-                    dur = match consecutive_empty {
-                        0..=20 => SLOW_MODE,      // Increased initial wait time
-                        21..=100 => Duration::from_millis(100), // Medium wait
-                        _ => Duration::from_millis(200),        // Long wait to reduce CPU usage
-                    };
+                Ok(None) => {
+                    // No more orders, wait for next notification
+                    break;
                 }
-                
-                if consecutive_empty % 200 == 0 {
-                    event!(Level::DEBUG, "No order package for {} cycles, sleeping for {:?}", 
-                           consecutive_empty, dur);
+                Err(e) => {
+                    error_count += 1;
+                    if error_count % ERROR_LOG_INTERVAL == 0 {
+                        event!(Level::ERROR, "[porter] Queue error ({} errors): {}", error_count, e);
+                    }
+                    // Brief wait on error to avoid frequent retries
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    break;
                 }
-            }
-            Err(e) => {
-                error_count += 1;
-                if error_count % ERROR_LOG_INTERVAL == 0 {
-                    event!(Level::ERROR, "[porter] Queue error ({} errors): {}", error_count, e);
-                }
-                // Brief wait on error to avoid frequent retries
-                thread::sleep(Duration::from_millis(10));
-                continue;
             }
         }
-
-        thread::sleep(dur);
     }
 }
 

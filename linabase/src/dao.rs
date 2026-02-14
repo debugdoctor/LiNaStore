@@ -294,3 +294,336 @@ impl Dao {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_dao_new() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path);
+        
+        assert!(dao.is_ok());
+    }
+
+    #[test]
+    fn test_insert_link() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        // Insert source first (foreign key constraint)
+        dao.insert_source(&source_id, hash256, false, 1024).expect("Failed to insert source");
+        
+        let result = dao.insert_link("test_file.txt", "txt", &source_id);
+        if let Err(e) = &result {
+            eprintln!("Error inserting link: {:?}", e);
+        }
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_links_by_name_exact() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_link("test_file.txt", "txt", &source_id).expect("Failed to insert link");
+        
+        let links = dao.get_links_by_name("test_file.txt", false).expect("Failed to get links");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].name, "test_file.txt");
+        assert_eq!(links[0].ext, "txt");
+    }
+
+    #[test]
+    fn test_get_links_by_name_fuzzy() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id1 = Uuid::new_v4().to_string();
+        let source_id2 = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id1, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_source(&source_id2, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_link("test_file1.txt", "txt", &source_id1).expect("Failed to insert link");
+        dao.insert_link("test_file2.txt", "txt", &source_id2).expect("Failed to insert link");
+        
+        let links = dao.get_links_by_name("test_file%", true).expect("Failed to get links");
+        assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn test_get_links_by_name_not_found() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        
+        let links = dao.get_links_by_name("nonexistent.txt", false).expect("Failed to get links");
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_get_links_by_ext() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id1 = Uuid::new_v4().to_string();
+        let source_id2 = Uuid::new_v4().to_string();
+        let source_id3 = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id1, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_source(&source_id2, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_source(&source_id3, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_link("file1.txt", "txt", &source_id1).expect("Failed to insert link");
+        dao.insert_link("file2.txt", "txt", &source_id2).expect("Failed to insert link");
+        dao.insert_link("file3.pdf", "pdf", &source_id3).expect("Failed to insert link");
+        
+        let txt_links = dao.get_links_by_ext("txt").expect("Failed to get links");
+        assert_eq!(txt_links.len(), 2);
+        
+        let pdf_links = dao.get_links_by_ext("pdf").expect("Failed to get links");
+        assert_eq!(pdf_links.len(), 1);
+    }
+
+    #[test]
+    fn test_get_n_links() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id1 = Uuid::new_v4().to_string();
+        let source_id2 = Uuid::new_v4().to_string();
+        let source_id3 = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id1, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_source(&source_id2, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_source(&source_id3, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_link("file1.txt", "txt", &source_id1).expect("Failed to insert link");
+        dao.insert_link("file2.txt", "txt", &source_id2).expect("Failed to insert link");
+        dao.insert_link("file3.txt", "txt", &source_id3).expect("Failed to insert link");
+        
+        let all_links = dao.get_n_links(0).expect("Failed to get all links");
+        assert_eq!(all_links.len(), 3);
+        
+        let two_links = dao.get_n_links(2).expect("Failed to get 2 links");
+        assert_eq!(two_links.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_link_by_id() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_link("test_file.txt", "txt", &source_id).expect("Failed to insert link");
+        
+        let links = dao.get_links_by_name("test_file.txt", false).expect("Failed to get links");
+        assert_eq!(links.len(), 1);
+        
+        let link_id = &links[0].id;
+        dao.delete_link_by_id(link_id).expect("Failed to delete link");
+        
+        let links_after = dao.get_links_by_name("test_file.txt", false).expect("Failed to get links");
+        assert!(links_after.is_empty());
+    }
+
+    #[test]
+    fn test_insert_source() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        let result = dao.insert_source(&id, hash256, false, 1024);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_source_by_id() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&id, hash256, false, 1024).expect("Failed to insert source");
+        
+        let source = dao.get_source_by_id(&id).expect("Failed to get source");
+        assert!(source.is_some());
+        
+        let source = source.unwrap();
+        assert_eq!(source.id, id);
+        assert_eq!(source.hash256, hash256);
+        assert_eq!(source.compressed, false);
+        assert_eq!(source.size, 1024);
+    }
+
+    #[test]
+    fn test_get_source_by_id_not_found() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let id = Uuid::new_v4().to_string();
+        
+        let source = dao.get_source_by_id(&id).expect("Failed to get source");
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn test_get_source_by_hash256() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&id, hash256, false, 1024).expect("Failed to insert source");
+        
+        let source = dao.get_source_by_hash256(hash256).expect("Failed to get source");
+        assert!(source.is_some());
+        
+        let source = source.unwrap();
+        assert_eq!(source.hash256, hash256);
+    }
+
+    #[test]
+    fn test_update_link_source_id() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id1 = Uuid::new_v4().to_string();
+        let source_id2 = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id1, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_source(&source_id2, hash256, false, 1024).expect("Failed to insert source");
+        dao.insert_link("test_file.txt", "txt", &source_id1).expect("Failed to insert link");
+        
+        let links = dao.get_links_by_name("test_file.txt", false).expect("Failed to get links");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_id, source_id1);
+        
+        let link_id = &links[0].id;
+        dao.update_link_source_id(link_id, &source_id2).expect("Failed to update link");
+        
+        let links_after = dao.get_links_by_name("test_file.txt", false).expect("Failed to get links");
+        assert_eq!(links_after.len(), 1);
+        assert_eq!(links_after[0].source_id, source_id2);
+    }
+
+    #[test]
+    fn test_update_source() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&id, hash256, false, 1024).expect("Failed to insert source");
+        
+        let new_hash256 = "new_hash_9876543210fedcba";
+        dao.update_source(&id, new_hash256, true, 2048, 5).expect("Failed to update source");
+        
+        let source = dao.get_source_by_id(&id).expect("Failed to get source");
+        assert!(source.is_some());
+        
+        let source = source.unwrap();
+        assert_eq!(source.hash256, new_hash256);
+        assert_eq!(source.compressed, true);
+        assert_eq!(source.size, 2048);
+        assert_eq!(source.count, 5);
+    }
+
+    #[test]
+    fn test_delete_source_by_id() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&id, hash256, false, 1024).expect("Failed to insert source");
+        
+        let source = dao.get_source_by_id(&id).expect("Failed to get source");
+        assert!(source.is_some());
+        
+        dao.delete_source_by_id(&id).expect("Failed to delete source");
+        
+        let source_after = dao.get_source_by_id(&id).expect("Failed to get source");
+        assert!(source_after.is_none());
+    }
+
+    #[test]
+    fn test_link_and_source_integration() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        // Insert source first
+        dao.insert_source(&source_id, hash256, false, 1024).expect("Failed to insert source");
+        
+        // Insert link referencing the source
+        dao.insert_link("test_file.txt", "txt", &source_id).expect("Failed to insert link");
+        
+        // Verify link exists and references correct source
+        let links = dao.get_links_by_name("test_file.txt", false).expect("Failed to get links");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_id, source_id);
+        
+        // Verify source exists
+        let source = dao.get_source_by_id(&source_id).expect("Failed to get source");
+        assert!(source.is_some());
+    }
+
+    #[test]
+    fn test_multiple_links_same_source() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        let source_id = Uuid::new_v4().to_string();
+        let hash256 = "test_hash_1234567890abcdef";
+        
+        dao.insert_source(&source_id, hash256, false, 1024).expect("Failed to insert source");
+        
+        dao.insert_link("link1.txt", "txt", &source_id).expect("Failed to insert link");
+        dao.insert_link("link2.txt", "txt", &source_id).expect("Failed to insert link");
+        dao.insert_link("link3.txt", "txt", &source_id).expect("Failed to insert link");
+        
+        let txt_links = dao.get_links_by_ext("txt").expect("Failed to get links");
+        assert_eq!(txt_links.len(), 3);
+        
+        for link in &txt_links {
+            assert_eq!(link.source_id, source_id);
+        }
+    }
+
+    #[test]
+    fn test_empty_database() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path().join("test.db");
+        let dao = Dao::new(path).expect("Failed to create DAO");
+        
+        let links = dao.get_n_links(0).expect("Failed to get links");
+        assert!(links.is_empty());
+        
+        let source = dao.get_source_by_id(&Uuid::new_v4().to_string()).expect("Failed to get source");
+        assert!(source.is_none());
+    }
+}
