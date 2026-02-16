@@ -2,6 +2,13 @@
 -- This migration creates tables for storing user credentials and session tokens
 -- Compatible with SQLite, MySQL, and PostgreSQL (tested with sqlx migrations)
 
+-- Migration records table: tracks applied migration versions
+CREATE TABLE IF NOT EXISTS mig_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version VARCHAR(255) NOT NULL UNIQUE,
+    applied_at BIGINT NOT NULL
+);
+
 -- Users table: stores username and password hash
 CREATE TABLE users (
     id CHAR(36) PRIMARY KEY,
@@ -32,3 +39,7 @@ CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
 
 -- Create index on user_id for user session lookups
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+
+-- Record this migration as applied
+INSERT OR IGNORE INTO mig_records (version, applied_at)
+VALUES ('000001_init_auth', CAST(strftime('%s','now') AS BIGINT));

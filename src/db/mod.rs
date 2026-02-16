@@ -5,10 +5,17 @@
 
 use anyhow::{Context, Result};
 use sqlx::{migrate::Migrator, Pool};
-use std::fs::OpenOptions;
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{Level, event};
+
+const MIGRATIONS_SQLITE_DIR: &str = "./src/db/migrations/sqlite";
+#[cfg(feature = "mysql")]
+const MIGRATIONS_MYSQL_DIR: &str = "./src/db/migrations/mysql";
+#[cfg(feature = "postgres")]
+const MIGRATIONS_POSTGRES_DIR: &str = "./src/db/migrations/postgres";
 
 /// Database type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +53,7 @@ pub enum DbPool {
 
 /// Database connection wrapper
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DbConnection {
     db_type: DbType,
     pool: Arc<DbPool>,
@@ -370,27 +378,133 @@ fn ensure_sqlite_parent_dir(db_url: &str) -> Result<()> {
 }
 
 async fn migrator_sqlite() -> Result<Migrator> {
-    Migrator::new(std::path::Path::new("./src/db/migrations/sqlite"))
+    Migrator::new(std::path::Path::new(MIGRATIONS_SQLITE_DIR))
         .await
         .context("Failed to create migrator")
 }
 
 #[cfg(feature = "mysql")]
 async fn migrator_mysql() -> Result<Migrator> {
-    Migrator::new(std::path::Path::new("./src/db/migrations/mysql"))
+    Migrator::new(std::path::Path::new(MIGRATIONS_MYSQL_DIR))
         .await
         .context("Failed to create migrator")
 }
 
 #[cfg(feature = "postgres")]
 async fn migrator_postgres() -> Result<Migrator> {
-    Migrator::new(std::path::Path::new("./src/db/migrations/postgres"))
+    Migrator::new(std::path::Path::new(MIGRATIONS_POSTGRES_DIR))
         .await
         .context("Failed to create migrator")
 }
 
+fn list_migration_versions(dir: &Path) -> Result<Vec<String>> {
+    let mut versions = Vec::new();
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("Failed to read migration directory: {:?}", dir))?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| "Failed to read migration directory entry")?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        versions.push(stem.to_string());
+    }
+
+    versions.sort();
+    Ok(versions)
+}
+
+fn is_missing_mig_records_table(err: &sqlx::Error) -> bool {
+    let msg = err.to_string();
+    (msg.contains("mig_records") && msg.contains("does not exist"))
+        || msg.contains("no such table: mig_records")
+        || (msg.contains("mig_records") && msg.contains("doesn't exist"))
+}
+
+async fn fetch_mig_versions<DB>(pool: &Pool<DB>) -> Result<Vec<String>>
+where
+    DB: sqlx::Database,
+{
+    let rows = sqlx::query_scalar::<_, String>("SELECT version FROM mig_records")
+        .fetch_all(pool)
+        .await;
+
+    match rows {
+        Ok(list) => Ok(list),
+        Err(e) => {
+            if is_missing_mig_records_table(&e) {
+                Ok(Vec::new())
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+async fn all_mig_records_present_sqlite(
+    pool: &Pool<sqlx::Sqlite>,
+    versions: &[String],
+) -> Result<bool> {
+    if versions.is_empty() {
+        return Ok(false);
+    }
+
+    let existing = fetch_mig_versions(pool).await?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    let existing: HashSet<String> = existing.into_iter().collect();
+    Ok(versions.iter().all(|version| existing.contains(version.as_str())))
+}
+
+#[cfg(feature = "mysql")]
+async fn all_mig_records_present_mysql(
+    pool: &Pool<sqlx::MySql>,
+    versions: &[String],
+) -> Result<bool> {
+    if versions.is_empty() {
+        return Ok(false);
+    }
+
+    let existing = fetch_mig_versions(pool).await?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    let existing: HashSet<String> = existing.into_iter().collect();
+    Ok(versions.iter().all(|version| existing.contains(version.as_str())))
+}
+
+#[cfg(feature = "postgres")]
+async fn all_mig_records_present_postgres(
+    pool: &Pool<sqlx::Postgres>,
+    versions: &[String],
+) -> Result<bool> {
+    if versions.is_empty() {
+        return Ok(false);
+    }
+
+    let existing = fetch_mig_versions(pool).await?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    let existing: HashSet<String> = existing.into_iter().collect();
+    Ok(versions.iter().all(|version| existing.contains(version.as_str())))
+}
+
 async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (SQLite)");
+    let versions = list_migration_versions(Path::new(MIGRATIONS_SQLITE_DIR))?;
+    if all_mig_records_present_sqlite(pool, &versions).await? {
+        event!(
+            Level::INFO,
+            "All migrations already recorded in mig_records (SQLite); skipping"
+        );
+        return Ok(());
+    }
     let migrator = migrator_sqlite().await?;
     migrator
         .run(pool)
@@ -403,6 +517,14 @@ async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
 #[cfg(feature = "mysql")]
 async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (MySQL)");
+    let versions = list_migration_versions(Path::new(MIGRATIONS_MYSQL_DIR))?;
+    if all_mig_records_present_mysql(pool, &versions).await? {
+        event!(
+            Level::INFO,
+            "All migrations already recorded in mig_records (MySQL); skipping"
+        );
+        return Ok(());
+    }
     let migrator = migrator_mysql().await?;
     migrator
         .run(pool)
@@ -415,6 +537,14 @@ async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
 #[cfg(feature = "postgres")]
 async fn run_migrations_postgres(pool: &Pool<sqlx::Postgres>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (PostgreSQL)");
+    let versions = list_migration_versions(Path::new(MIGRATIONS_POSTGRES_DIR))?;
+    if all_mig_records_present_postgres(pool, &versions).await? {
+        event!(
+            Level::INFO,
+            "All migrations already recorded in mig_records (PostgreSQL); skipping"
+        );
+        return Ok(());
+    }
     let migrator = migrator_postgres().await?;
     migrator
         .run(pool)

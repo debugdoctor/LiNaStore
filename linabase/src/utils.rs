@@ -4,6 +4,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rayon::{
     ThreadPool, ThreadPoolBuilder,
     iter::{IntoParallelRefIterator, ParallelIterator},
+    slice::ParallelSlice,
 };
 use std::{
     borrow::Cow,
@@ -11,6 +12,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    ptr,
 };
 
 const BLOCK_SIZE: usize = 8;
@@ -191,57 +193,70 @@ impl BlockManager {
     }
 
     pub fn compress_all(&self, input: &Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
-        let chunks: Vec<&[u8]> = input.chunks(self.chunk_size).collect();
-
         // Determine thread count based on input size
         let thread_count = self.determine_thread_count(input.len());
 
-        // Create appropriate thread pool based on size
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(thread_count)
-            .thread_name(|index| format!("linastore-compress-{}", index))
-            .build()
-            .expect("Failed to create thread pool");
+        let compress_chunk = |chunk: &[u8]| -> Vec<u8> {
+            let compressed_chunk = self.__encode(chunk);
+            let raw_len = chunk.len();
+            let compressed_chunk_len = compressed_chunk.len();
 
-        let compressed_chunks: Vec<Vec<u8>> = pool.install(|| {
-            chunks
-                .par_iter()
-                .map(|&chunk| {
-                    let chunk_vec = chunk.to_vec();
+            // Build chunk result with header
+            let mut chunk_result = Vec::with_capacity(compressed_chunk_len + 3);
+            if compressed_chunk_len > raw_len {
+                // Add uncompressed flag
+                chunk_result.push(0);
+                chunk_result.extend_from_slice(&(raw_len as u16).to_le_bytes());
+                chunk_result.extend_from_slice(chunk);
+            } else {
+                if compressed_chunk_len > 0x10000 {
+                    panic!(
+                        "Compressed chunk length is greater than 64KiB: {:x}",
+                        compressed_chunk_len
+                    );
+                }
+                // Add compressed flag
+                chunk_result.push(1);
+                chunk_result
+                    .extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
+                chunk_result.extend_from_slice(&compressed_chunk);
+            }
+            chunk_result
+        };
 
-                    let compressed_chunk = self.__encode(&chunk_vec);
-                    let raw_len = chunk_vec.len();
-                    let compressed_chunk_len = compressed_chunk.len();
+        let compressed_chunks: Vec<Vec<u8>> = if thread_count == 1 {
+            input.chunks(self.chunk_size).map(compress_chunk).collect()
+        } else {
+            self.thread_pool.install(|| {
+                input.par_chunks(self.chunk_size).map(compress_chunk).collect()
+            })
+        };
 
-                    // Build chunk result with header
-                    let mut chunk_result = Vec::with_capacity(compressed_chunk_len + 3);
-                    if compressed_chunk_len > raw_len {
-                        // Add uncompressed flag
-                        chunk_result.push(0);
-                        chunk_result.extend_from_slice(&(raw_len as u16).to_le_bytes());
-                        chunk_result.extend_from_slice(&chunk_vec);
-                    } else {
-                        if compressed_chunk_len > 0x10000 {
-                            panic!(
-                                "Compressed chunk length is greater than 64KiB: {:x}",
-                                compressed_chunk_len
-                            );
-                        }
-                        // Add compressed flag
-                        chunk_result.push(1);
-                        chunk_result
-                            .extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
-                        chunk_result.extend_from_slice(&compressed_chunk);
-                    }
-                    chunk_result
-                })
-                .collect()
-        });
-
-        let mut result = Vec::with_capacity(input.len());
-        for chunk_data in compressed_chunks {
-            result.extend_from_slice(&chunk_data);
+        let total_len: usize = compressed_chunks.iter().map(|c| c.len()).sum();
+        let mut result = Vec::with_capacity(total_len);
+        // SAFETY: we set the length to the total output size and then
+        // fully initialize it by copying each chunk into the buffer.
+        unsafe {
+            result.set_len(total_len);
         }
+        let mut offset = 0usize;
+        for chunk_data in compressed_chunks {
+            let len = chunk_data.len();
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: `offset + len` is always within `total_len`, and
+            // the source slice is valid for `len` bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    chunk_data.as_ptr(),
+                    result.as_mut_ptr().add(offset),
+                    len,
+                );
+            }
+            offset += len;
+        }
+        debug_assert_eq!(offset, total_len);
 
         Ok(result)
     }
@@ -294,11 +309,28 @@ impl BlockManager {
                 .collect::<Vec<_>>()
         });
 
-        let mut result = Vec::with_capacity(original_size + GROUP_SIZE);
-
-        for chunk_result in decompressed_chunks {
-            result.extend_from_slice(&chunk_result);
+        let total_len: usize = decompressed_chunks.iter().map(|c| c.len()).sum();
+        let mut result = Vec::with_capacity(total_len.max(original_size));
+        // SAFETY: we set the length to the total output size and then
+        // fully initialize it by copying each chunk into the buffer.
+        unsafe {
+            result.set_len(total_len);
         }
+        let mut offset = 0usize;
+        for chunk_result in decompressed_chunks {
+            let bytes = chunk_result.as_ref();
+            let len = bytes.len();
+            if len == 0 {
+                continue;
+            }
+            // SAFETY: `offset + len` is always within `total_len`, and
+            // the source slice is valid for `len` bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), result.as_mut_ptr().add(offset), len);
+            }
+            offset += len;
+        }
+        debug_assert_eq!(offset, total_len);
 
         Ok(result)
     }

@@ -57,7 +57,7 @@ impl EnvVar {
                 tracing::Level::WARN,
                 "LINASTORE_DB_URL not set, using default"
             );
-            "sqlite://./.linaserver/meta".to_string()
+            "sqlite://./linadata/meta.db".to_string()
         });
 
         let (admin_username, admin_password) = match auth_required {

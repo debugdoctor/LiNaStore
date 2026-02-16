@@ -104,6 +104,10 @@ class LiNaStoreClient:
         """
         if not self.auto_refresh:
             return
+
+        # Auth-free mode: no token and no cached credentials means no refresh needed.
+        if self.session_token is None and not (self._cached_username and self._cached_password):
+            return
         
         if self._is_token_expired():
             if self._cached_username and self._cached_password:
@@ -377,9 +381,7 @@ class LiNaStoreClient:
 
             try:
                 header_len = self.LINA_HEADER_BASE_LENGTH + len(identifier)
-                resp = self.socket.recv(header_len)
-                if len(resp) < header_len:
-                    raise LiNaStoreProtocolError(f"Incomplete response received: {len(resp)} < {header_len}")
+                resp = self._recv_all(header_len)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to receive response for file {file_name}: {str(e)}")
 
@@ -419,19 +421,23 @@ class LiNaStoreClient:
             if len(identifier) > self.LINA_NAME_MAX_LENGTH:
                 raise LiNaStoreProtocolError(f"File name too long: {len(identifier)} > {self.LINA_NAME_MAX_LENGTH}")
             ilen = len(identifier).to_bytes(1, 'little')
-            dlen = int(0).to_bytes(4, 'little')
-            checksum = binascii.crc32(ilen + identifier + dlen).to_bytes(4, 'little')
+            
+            # Include session token in data field for authenticated requests
+            if self.session_token:
+                data = self.session_token.encode() + b'\x00'
+            else:
+                data = b''
+            dlen = len(data).to_bytes(4, 'little')
+            checksum = binascii.crc32(ilen + identifier + dlen + data).to_bytes(4, 'little')
                                                                
             try:
-                self.socket.sendall(flags + ilen + identifier + dlen + checksum)
+                self.socket.sendall(flags + ilen + identifier + dlen + checksum + data)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to send request for file {file_name}: {str(e)}")
 
             try:
                 header_len = self.LINA_HEADER_BASE_LENGTH + len(identifier)
-                header = self.socket.recv(header_len)
-                if len(header) < header_len:
-                    raise LiNaStoreProtocolError(f"Incomplete header received: {len(header)} < {header_len}")
+                header = self._recv_all(header_len)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to receive header for file {file_name}: {str(e)}")
             
@@ -498,19 +504,23 @@ class LiNaStoreClient:
             if len(identifier) > self.LINA_NAME_MAX_LENGTH:
                 raise LiNaStoreProtocolError(f"File name too long: {len(identifier)} > {self.LINA_NAME_MAX_LENGTH}")
             ilen = len(identifier).to_bytes(1, 'little')
-            dlen = int(0).to_bytes(4, 'little')
-            checksum = binascii.crc32(ilen + identifier + dlen).to_bytes(4, 'little')
+            
+            # Include session token in data field for authenticated requests
+            if self.session_token:
+                data = self.session_token.encode() + b'\x00'
+            else:
+                data = b''
+            dlen = len(data).to_bytes(4, 'little')
+            checksum = binascii.crc32(ilen + identifier + dlen + data).to_bytes(4, 'little')
 
             try:
-                self.socket.sendall(flags + ilen + identifier + dlen + checksum)
+                self.socket.sendall(flags + ilen + identifier + dlen + checksum + data)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to send delete request for file {file_name}: {str(e)}")
 
             try:
                 header_len = self.LINA_HEADER_BASE_LENGTH + len(identifier)
-                resp = self.socket.recv(header_len)
-                if len(resp) < header_len:
-                    raise LiNaStoreProtocolError(f"Incomplete response received: {len(resp)} < {header_len}")
+                resp = self._recv_all(header_len)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to receive delete response for file {file_name}: {str(e)}")
 
@@ -533,5 +543,6 @@ class LiNaStoreClient:
         return data
 
     def verify_checksum(self, identifier: bytes, length: int, data: bytes, checksum: int):
-        calculated_checksum = binascii.crc32(identifier + length.to_bytes(4, 'little') + data)
+        ilen = len(identifier).to_bytes(1, 'little')
+        calculated_checksum = binascii.crc32(ilen + identifier + length.to_bytes(4, 'little') + data)
         return calculated_checksum == checksum

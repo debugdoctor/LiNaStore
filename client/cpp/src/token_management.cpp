@@ -24,6 +24,11 @@ bool LiNaClient::refreshTokenIfNeeded() {
     if (!auto_refresh) {
         return true;  // Auto-refresh disabled
     }
+
+    // Auth-free mode: no token and no cached credentials means no refresh needed.
+    if (session_token.empty() && (cached_username.empty() || cached_password.empty())) {
+        return true;
+    }
     
     if (isTokenExpired()) {
         if (!cached_username.empty() && !cached_password.empty()) {

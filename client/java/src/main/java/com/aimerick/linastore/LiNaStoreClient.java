@@ -167,6 +167,11 @@ public class LiNaStoreClient {
         if (!autoRefresh) {
             return;  // Auto-refresh disabled
         }
+
+        // Auth-free mode: no token and no cached credentials means no refresh needed.
+        if (sessionToken == null && (cachedUsername == null || cachedPassword == null)) {
+            return;
+        }
         
         if (isTokenExpired()) {
             if (cachedUsername != null && cachedPassword != null) {
