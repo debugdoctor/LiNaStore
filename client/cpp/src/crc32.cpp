@@ -17,16 +17,12 @@ void CRC32::initTable() {
     } while(++index);
 }
 
-void CRC32::reset() {
-    crc = 0xFFFFFFFF;
-}
-
-void CRC32::update(std::vector<uint8_t> data) { 
+void CRC32::update(std::vector<uint8_t> data) {
     for (uint8_t byte : data) {
         crc = (crc >> 8) ^ table[(crc & 0xFF) ^ byte];
     }
 }
 
-uint32_t CRC32::get_value() { 
+uint32_t CRC32::finalize() {
     return ~crc;
 }

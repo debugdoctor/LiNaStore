@@ -23,7 +23,7 @@ void CRC32_update(CRC32* crc32, uint8_t* data, size_t len) {
 }
 
 uint64_t CRC32_finalize(CRC32* crc32) {
-    uint32_t result = crc32->value;
+    uint32_t result = ~crc32->value;
     crc32->value = 0xffffffff;
     return result;
 }

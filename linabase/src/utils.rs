@@ -192,10 +192,10 @@ impl BlockManager {
 
     pub fn compress_all(&self, input: &Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
         let chunks: Vec<&[u8]> = input.chunks(self.chunk_size).collect();
-        
+
         // Determine thread count based on input size
         let thread_count = self.determine_thread_count(input.len());
-        
+
         // Create appropriate thread pool based on size
         let pool = ThreadPoolBuilder::new()
             .num_threads(thread_count)
@@ -382,39 +382,69 @@ mod tests {
     #[test]
     fn test_dynamic_thread_selection() {
         let manager = BlockManager::new();
-        
+
         // Test small file (< 256KB) - should use 1 thread
         let small_data = vec![0u8; 100 * 1024]; // 100KB
-        let small_compressed = manager.compress_all(&small_data).expect("Failed to compress small data");
+        let small_compressed = manager
+            .compress_all(&small_data)
+            .expect("Failed to compress small data");
         let small_decompressed = manager
             .decompress_all(&small_compressed, small_data.len())
             .expect("Failed to decompress small data");
-        assert_eq!(small_data, small_decompressed, "Small file round-trip failed");
-        
+        assert_eq!(
+            small_data, small_decompressed,
+            "Small file round-trip failed"
+        );
+
         // Test large file (>= 256KB) - should use max_threads (typically 4)
         let large_data = vec![42u8; 512 * 1024]; // 512KB
-        let large_compressed = manager.compress_all(&large_data).expect("Failed to compress large data");
+        let large_compressed = manager
+            .compress_all(&large_data)
+            .expect("Failed to compress large data");
         let large_decompressed = manager
             .decompress_all(&large_compressed, large_data.len())
             .expect("Failed to decompress large data");
-        assert_eq!(large_data, large_decompressed, "Large file round-trip failed");
-        
+        assert_eq!(
+            large_data, large_decompressed,
+            "Large file round-trip failed"
+        );
+
         println!("Dynamic thread selection test passed!");
     }
 
     #[test]
     fn test_thread_count_determination() {
         let manager = BlockManager::new();
-        
+
         // Small file should use 1 thread
-        assert_eq!(manager.determine_thread_count(100 * 1024), 1, "100KB should use 1 thread");
-        assert_eq!(manager.determine_thread_count(512 * 1024), 1, "512KB should use 1 thread");
-        assert_eq!(manager.determine_thread_count(1023 * 1024), 1, "1023KB should use 1 thread");
-        
+        assert_eq!(
+            manager.determine_thread_count(100 * 1024),
+            1,
+            "100KB should use 1 thread"
+        );
+        assert_eq!(
+            manager.determine_thread_count(512 * 1024),
+            1,
+            "512KB should use 1 thread"
+        );
+        assert_eq!(
+            manager.determine_thread_count(1023 * 1024),
+            1,
+            "1023KB should use 1 thread"
+        );
+
         // Large file should use max_threads
-        assert_eq!(manager.determine_thread_count(1024 * 1024), manager.max_threads, "1MB should use max_threads");
-        assert_eq!(manager.determine_thread_count(2 * 1024 * 1024), manager.max_threads, "2MB should use max_threads");
-        
+        assert_eq!(
+            manager.determine_thread_count(1024 * 1024),
+            manager.max_threads,
+            "1MB should use max_threads"
+        );
+        assert_eq!(
+            manager.determine_thread_count(2 * 1024 * 1024),
+            manager.max_threads,
+            "2MB should use max_threads"
+        );
+
         println!("Thread count determination test passed!");
     }
 
@@ -423,15 +453,15 @@ mod tests {
         let data = b"Hello, World!";
         let hash1 = get_hash256_from_binary(data);
         let hash2 = get_hash256_from_binary(data);
-        
+
         // Same input should produce same hash
         assert_eq!(hash1, hash2);
-        
+
         // Different input should produce different hash
         let different_data = b"Hello, Different World!";
         let hash3 = get_hash256_from_binary(different_data);
         assert_ne!(hash1, hash3);
-        
+
         // Hash should be a hex string of 64 characters (BLAKE3 produces 32 bytes = 64 hex chars)
         assert_eq!(hash1.len(), 64);
     }
@@ -440,7 +470,7 @@ mod tests {
     fn test_get_hash256_from_binary_empty() {
         let data = b"";
         let hash = get_hash256_from_binary(data);
-        
+
         // Empty input should still produce a valid hash
         assert_eq!(hash.len(), 64);
     }
@@ -449,7 +479,7 @@ mod tests {
     fn test_get_hash256_from_binary_large() {
         let data = vec![42u8; 1024 * 1024]; // 1MB of data
         let hash = get_hash256_from_binary(&data);
-        
+
         // Large input should produce a valid hash
         assert_eq!(hash.len(), 64);
     }
@@ -458,12 +488,12 @@ mod tests {
     fn test_block_manager_with_capacity() {
         let manager = BlockManager::with_capacity(0x10000 - 0x800); // Valid chunk size
         let data = vec![1, 2, 3, 4, 5];
-        
+
         let compressed = manager.compress_all(&data).expect("Failed to compress");
         let decompressed = manager
             .decompress_all(&compressed, data.len())
             .expect("Failed to decompress");
-        
+
         assert_eq!(data, decompressed);
     }
 
@@ -483,12 +513,14 @@ mod tests {
     fn test_compress_decompress_empty() {
         let manager = BlockManager::new();
         let data = vec![];
-        
-        let compressed = manager.compress_all(&data).expect("Failed to compress empty data");
+
+        let compressed = manager
+            .compress_all(&data)
+            .expect("Failed to compress empty data");
         let decompressed = manager
             .decompress_all(&compressed, data.len())
             .expect("Failed to decompress empty data");
-        
+
         assert_eq!(data, decompressed);
         assert!(compressed.is_empty());
     }
@@ -497,12 +529,14 @@ mod tests {
     fn test_compress_decompress_single_byte() {
         let manager = BlockManager::new();
         let data = vec![42];
-        
-        let compressed = manager.compress_all(&data).expect("Failed to compress single byte");
+
+        let compressed = manager
+            .compress_all(&data)
+            .expect("Failed to compress single byte");
         let decompressed = manager
             .decompress_all(&compressed, data.len())
             .expect("Failed to decompress single byte");
-        
+
         assert_eq!(data, decompressed);
     }
 
@@ -510,12 +544,12 @@ mod tests {
     fn test_compress_decompress_repeated_data() {
         let manager = BlockManager::new();
         let data = vec![42u8; 10000]; // Highly compressible data
-        
+
         let compressed = manager.compress_all(&data).expect("Failed to compress");
         let decompressed = manager
             .decompress_all(&compressed, data.len())
             .expect("Failed to decompress");
-        
+
         assert_eq!(data, decompressed);
         // Compressed should be smaller than original for repeated data
         assert!(compressed.len() < data.len());
@@ -528,12 +562,12 @@ mod tests {
         for i in 0..data.len() {
             data[i] = (i % 256) as u8;
         }
-        
+
         let compressed = manager.compress_all(&data).expect("Failed to compress");
         let decompressed = manager
             .decompress_all(&compressed, data.len())
             .expect("Failed to decompress");
-        
+
         assert_eq!(data, decompressed);
     }
 
@@ -541,7 +575,7 @@ mod tests {
     fn test_decompress_invalid_data() {
         let manager = BlockManager::new();
         let invalid_data = vec![0, 1, 2, 3, 4, 5]; // Invalid chunk format
-        
+
         let result = manager.decompress_all(&invalid_data, 100);
         assert!(result.is_err());
     }
@@ -550,7 +584,7 @@ mod tests {
     fn test_decompress_incomplete_chunk() {
         let manager = BlockManager::new();
         let incomplete_data = vec![1, 0, 100]; // Flag=1, length=100, but no data
-        
+
         let result = manager.decompress_all(&incomplete_data, 100);
         assert!(result.is_err());
     }
@@ -559,35 +593,35 @@ mod tests {
     fn test_path_walk_empty_directory() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let paths = path_walk(temp_dir.path()).expect("Failed to walk path");
-        
+
         assert!(paths.is_empty());
     }
 
     #[test]
     fn test_path_walk_with_files() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        
+
         // Create some test files
         fs::write(temp_dir.path().join("file1.txt"), b"content1").expect("Failed to write file");
         fs::write(temp_dir.path().join("file2.txt"), b"content2").expect("Failed to write file");
-        
+
         let paths = path_walk(temp_dir.path()).expect("Failed to walk path");
-        
+
         assert_eq!(paths.len(), 2);
     }
 
     #[test]
     fn test_path_walk_nested_directories() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        
+
         // Create nested structure
         let subdir = temp_dir.path().join("subdir");
         fs::create_dir_all(&subdir).expect("Failed to create subdir");
         fs::write(subdir.join("nested.txt"), b"nested content").expect("Failed to write file");
         fs::write(temp_dir.path().join("root.txt"), b"root content").expect("Failed to write file");
-        
+
         let paths = path_walk(temp_dir.path()).expect("Failed to walk path");
-        
+
         assert_eq!(paths.len(), 2);
     }
 
