@@ -1153,6 +1153,12 @@ bool refresh_token_if_needed(LiNaClient* client, char* error_msg, size_t msg_len
     if (!client->auto_refresh) {
         return true;  // Auto-refresh disabled
     }
+
+    // Auth-free mode: no token and no cached credentials means no refresh needed.
+    if ((client->session_token == NULL || client->session_token[0] == '\0') &&
+        !(client->cached_username && client->cached_password)) {
+        return true;
+    }
     
     if (is_token_expired(client)) {
         if (client->cached_username && client->cached_password) {
