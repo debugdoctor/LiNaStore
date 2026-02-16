@@ -1,5 +1,5 @@
 mod advanced_service;
-mod manager;
 mod http_service;
+mod manager;
 
 pub use manager::front;

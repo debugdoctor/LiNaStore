@@ -1,18 +1,18 @@
-use linabase::service::{ StoreManager, TidyManager };
 use super::command;
+use linabase::service::{StoreManager, TidyManager};
+use std::error::Error;
 use std::fs;
 use std::path::Path;
-use std::error::Error;
 
-/// Handle the list command to display files in the storage
+/// Handle list command to display files in storage
 ///
 /// # Arguments
-/// * `root` - The root directory of the storage
-/// * `args` - Command line arguments for the list operation
+/// * `root` - The root directory of storage
+/// * `args` - Command line arguments for list operation
 ///
 /// # Returns
 /// * `Result<(), Box<dyn Error>>` - Ok if successful, Err with error details
-pub fn handle_list(root: &str, args: &command::ListArgs) -> Result<(), Box<dyn Error>> {
+pub async fn handle_list(root: &str, args: &command::ListArgs) -> Result<(), Box<dyn Error>> {
     // Validate input parameters
     if args.n == 0 {
         return Err("Number of items to list cannot be zero".into());
@@ -20,7 +20,12 @@ pub fn handle_list(root: &str, args: &command::ListArgs) -> Result<(), Box<dyn E
 
     // Determine search pattern and whether to search by extension
     let (pattern, isext) = if args.isext.is_none() {
-        (args.input_files.clone().unwrap_or_else(|| String::from("*")), false)
+        (
+            args.input_files
+                .clone()
+                .unwrap_or_else(|| String::from("*")),
+            false,
+        )
     } else {
         match &args.isext {
             Some(ext) => (ext.to_string(), true),
@@ -29,11 +34,11 @@ pub fn handle_list(root: &str, args: &command::ListArgs) -> Result<(), Box<dyn E
     };
 
     // Initialize store manager with error handling
-    let store_manager = StoreManager::new(root)
+    let store_manager = StoreManager::new(root).await
         .map_err(|e| format!("Failed to initialize storage manager: {}", e))?;
 
     // Retrieve file list with error handling
-    let file_names = store_manager.list(&pattern, args.n + 1, isext, true)
+    let file_names = store_manager.list(&pattern, args.n + 1, isext, true).await
         .map_err(|e| format!("Failed to retrieve file list: {}", e))?;
 
     // Handle empty results
@@ -55,21 +60,21 @@ pub fn handle_list(root: &str, args: &command::ListArgs) -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// Handle the put command to store files in the storage
+/// Handle put command to store files in storage
 ///
 /// # Arguments
-/// * `root` - The root directory of the storage
-/// * `args` - Command line arguments for the put operation
+/// * `root` - The root directory of storage
+/// * `args` - Command line arguments for put operation
 ///
 /// # Returns
 /// * `Result<(), Box<dyn Error>>` - Ok if successful, Err with error details
-pub fn handle_put(root: &str, args: &command::PutArgs) -> Result<(), Box<dyn Error>> {
+pub async fn handle_put(root: &str, args: &command::PutArgs) -> Result<(), Box<dyn Error>> {
     // Validate input files
     if args.input_files.is_empty() {
         return Err("No files provided for storage".into());
     }
 
-    // Check if all files exist before starting the operation
+    // Check if all files exist before starting operation
     for file in &args.input_files {
         if !Path::new(file).exists() {
             return Err(format!("File not found: {}", file).into());
@@ -77,11 +82,11 @@ pub fn handle_put(root: &str, args: &command::PutArgs) -> Result<(), Box<dyn Err
     }
 
     // Initialize store manager with error handling
-    let store_manager = StoreManager::new(root)
+    let store_manager = StoreManager::new(root).await
         .map_err(|e| format!("Failed to initialize storage manager: {}", e))?;
 
     // Store files with error handling
-    store_manager.put(&args.input_files, args.cover, args.compressed)
+    store_manager.put(&args.input_files, args.cover, args.compressed).await
         .map_err(|e| format!("Failed to store files: {}", e))?;
 
     // Display success message with optional file listing
@@ -101,22 +106,22 @@ pub fn handle_put(root: &str, args: &command::PutArgs) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-/// Handle the get command to retrieve files from the storage
+/// Handle get command to retrieve files from storage
 ///
 /// # Arguments
-/// * `root` - The root directory of the storage
-/// * `args` - Command line arguments for the get operation
+/// * `root` - The root directory of storage
+/// * `args` - Command line arguments for get operation
 ///
 /// # Returns
 /// * `Result<(), Box<dyn Error>>` - Ok if successful, Err with error details
-pub fn handle_get(root: &str, args: &command::GetArgs) -> Result<(), Box<dyn Error>> {
+pub async fn handle_get(root: &str, args: &command::GetArgs) -> Result<(), Box<dyn Error>> {
     // Validate input files
     if args.input_files.is_empty() {
         return Err("No files specified for retrieval".into());
     }
 
     // Initialize store manager with error handling
-    let store_manager = StoreManager::new(root)
+    let store_manager = StoreManager::new(root).await
         .map_err(|e| format!("Failed to initialize storage manager: {}", e))?;
 
     // Validate and prepare destination directory
@@ -126,19 +131,19 @@ pub fn handle_get(root: &str, args: &command::GetArgs) -> Result<(), Box<dyn Err
     // Handle single file retrieval with enhanced logic
     if args.input_files.len() == 1 {
         let file_pattern = format!("{}*", args.input_files[0]);
-        let links = store_manager.list(&file_pattern, 0, false, true)
+        let links = store_manager.list(&file_pattern, 0, false, true).await
             .map_err(|e| format!("Failed to search for files: {}", e))?;
 
         match links.len() {
             0 => return Err("No files found matching the specified pattern".into()),
             1 => {
                 if links[0].name == args.input_files[0] {
-                    store_manager.get_and_save(&args.input_files, &dest_path)
+                    store_manager.get_and_save(&args.input_files, &dest_path).await
                         .map_err(|e| format!("Failed to retrieve file: {}", e))?;
                 } else {
                     return Err("Exact file match not found".into());
                 }
-            },
+            }
             _ => {
                 eprintln!("Multiple files found matching pattern:");
                 for link in &links {
@@ -149,7 +154,7 @@ pub fn handle_get(root: &str, args: &command::GetArgs) -> Result<(), Box<dyn Err
         }
     } else {
         // Handle multiple file retrieval
-        store_manager.get_and_save(&args.input_files, &dest_path)
+        store_manager.get_and_save(&args.input_files, &dest_path).await
             .map_err(|e| format!("Failed to retrieve files: {}", e))?;
     }
 
@@ -157,15 +162,15 @@ pub fn handle_get(root: &str, args: &command::GetArgs) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-/// Handle the delete command to remove files from the storage
+/// Handle delete command to remove files from storage
 ///
 /// # Arguments
-/// * `root` - The root directory of the storage
-/// * `args` - Command line arguments for the delete operation
+/// * `root` - The root directory of storage
+/// * `args` - Command line arguments for delete operation
 ///
 /// # Returns
 /// * `Result<(), Box<dyn Error>>` - Ok if successful, Err with error details
-pub fn handle_delete(root: &str, args: &command::DeleteArgs) -> Result<(), Box<dyn Error>> {
+pub async fn handle_delete(root: &str, args: &command::DeleteArgs) -> Result<(), Box<dyn Error>> {
     // Get deletion pattern with validation
     let pattern = args.input_files.clone().unwrap_or_else(|| String::from(""));
     if pattern.is_empty() {
@@ -173,21 +178,21 @@ pub fn handle_delete(root: &str, args: &command::DeleteArgs) -> Result<(), Box<d
     }
 
     // Initialize store manager with error handling
-    let store_manager = StoreManager::new(root)
+    let store_manager = StoreManager::new(root).await
         .map_err(|e| format!("Failed to initialize storage manager: {}", e))?;
 
     // Perform deletion with error handling
-    store_manager.delete(&pattern, true)
+    store_manager.delete(&pattern, true).await
         .map_err(|e| format!("Failed to delete files: {}", e))?;
 
     println!("Files deleted successfully");
     Ok(())
 }
 
-/// Handle the tidy command to organize files and remove duplicates
+/// Handle tidy command to organize files and remove duplicates
 ///
 /// # Arguments
-/// * `args` - Command line arguments for the tidy operation
+/// * `args` - Command line arguments for tidy operation
 ///
 /// # Returns
 /// * `Result<(), Box<dyn Error>>` - Ok if successful, Err with error details
@@ -201,7 +206,8 @@ pub fn handle_tidy(args: &command::TidyArgs) -> Result<(), Box<dyn Error>> {
     let mut tidy_manager = TidyManager::new();
 
     // Perform tidy operation with error handling
-    tidy_manager.tidy(&args.target_dir, args.keep_new)
+    tidy_manager
+        .tidy(&args.target_dir, args.keep_new)
         .map_err(|e| format!("Failed to tidy directory: {}", e))?;
 
     println!("Directory tidied successfully");

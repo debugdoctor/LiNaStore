@@ -2,7 +2,7 @@ use std::{path::Path, time::Duration};
 
 use crate::{
     conveyer::ConveyQueue,
-    dtos::{self, Behavior, Package},
+    dtos::{Behavior, Package},
     shutdown::Shutdown,
 };
 use http_body_util::Full;
@@ -61,14 +61,8 @@ async fn handle_http(
     package.behavior = Behavior::GetFile;
 
     let name_bytes = path_vec[0].as_bytes();
-    if name_bytes.len() > dtos::NAME_SIZE {
-        return Ok(Response::builder()
-            .status(hyper::StatusCode::BAD_REQUEST)
-            .body(Full::new(Bytes::from("File identifier too long: max 256 bytes")))?);
-    }
-    let mut name_buf = [0u8; dtos::NAME_SIZE];
-    name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
-    package.content.identifier = name_buf;
+    // Set identifier directly as Vec<u8>
+    package.content.identifier = name_bytes.to_vec();
     package.behavior = Behavior::GetFile;
 
     // Register waiter before sending to queue
@@ -86,6 +80,7 @@ async fn handle_http(
     // Send to queue
     if let Err(e) = con_queue.produce_order(package) {
         event!(Level::ERROR, "Failed to produce order: {}", e);
+        con_queue.unregister_waiter(uni_id);
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
             .body(Full::new(Bytes::from("Failed to process request")))?);
@@ -114,17 +109,21 @@ async fn handle_http(
                 .body(Full::new(Bytes::from(pkg.content.data)))?)
         }
         Ok(Err(_)) => {
-            event!(Level::ERROR, "[waitress {}] Channel closed unexpectedly", &log_id);
+            event!(
+                Level::ERROR,
+                "[waitress {}] Channel closed unexpectedly",
+                &log_id
+            );
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
             Ok(Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::from("Channel closed unexpectedly")))?)
         }
         Err(_) => {
-            event!(
-                Level::ERROR,
-                "[waitress {}] Timeout exceeded",
-                &log_id
-            );
+            event!(Level::ERROR, "[waitress {}] Timeout exceeded", &log_id);
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
             Ok(Response::builder()
                 .status(hyper::StatusCode::REQUEST_TIMEOUT)
                 .body(Full::new(Bytes::from("Request timeout")))?)
@@ -147,28 +146,31 @@ pub async fn run_http_server(addr: &str) {
     let shutdown_status = Shutdown::get_instance();
 
     loop {
-        if shutdown_status.is_shutdown() {
-            break;
+        tokio::select! {
+            _ = shutdown_status.wait() => {
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(req) => req,
+                    Err(_) => {
+                        event!(Level::ERROR, "Failed to accept connection");
+                        continue;
+                    }
+                };
+
+                let io = TokioIo::new(stream);
+
+                tokio::task::spawn(async move {
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(io, service_fn(handle_http))
+                        .await
+                    {
+                        event!(Level::ERROR, "Error serving connection: {:?}", err);
+                    }
+                });
+            }
         }
-
-        let (stream, _) = match listener.accept().await {
-            Ok(req) => req,
-            Err(_) => {
-                event!(Level::ERROR, "Failed to accept connection");
-                continue;
-            }
-        };
-
-        let io = TokioIo::new(stream);
-
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(handle_http))
-                .await
-            {
-                event!(Level::ERROR, "Error serving connection: {:?}", err);
-            }
-        });
     }
 }
 

@@ -1,20 +1,31 @@
-use clap::{Parser, Subcommand, ArgAction};
+use clap::{ArgAction, Parser, Subcommand};
 
 /// Arguments for the list command
 ///
 /// This command lists files stored in LiNaStore with various filtering options
 #[derive(Parser, Clone)]
 pub struct ListArgs {
-    #[arg(short = 'n', long = "num", value_name = "NUMBER", default_value_t = 50,
-        help = "Number of items to list (0 for unlimited, default: 50)")]
+    #[arg(
+        short = 'n',
+        long = "num",
+        value_name = "NUMBER",
+        default_value_t = 50,
+        help = "Number of items to list (0 for unlimited, default: 50)"
+    )]
     pub n: u64,
 
-    #[arg(short = 'e', long = "ext", value_name = "EXTENSION",
-        help = "Filter by file extension (e.g., 'txt', 'jpg')")]
+    #[arg(
+        short = 'e',
+        long = "ext",
+        value_name = "EXTENSION",
+        help = "Filter by file extension (e.g., 'txt', 'jpg')"
+    )]
     pub isext: Option<String>,
 
-    #[arg(value_name = "Pattern",
-        help = "Search pattern (supports wildcards like '*.txt')")]
+    #[arg(
+        value_name = "Pattern",
+        help = "Search pattern (supports wildcards like '*.txt')"
+    )]
     pub input_files: Option<String>,
 }
 
@@ -44,8 +55,10 @@ pub struct PutArgs {
     )]
     pub cover: bool,
 
-    #[arg(value_name = "FILES",
-        help = "Files to store (can specify multiple files)")]
+    #[arg(
+        value_name = "FILES",
+        help = "Files to store (can specify multiple files)"
+    )]
     pub input_files: Vec<String>,
 }
 
@@ -62,43 +75,38 @@ pub struct GetArgs {
         help = "Destination directory (default: current directory)"
     )]
     pub dest: String,
-    
-    #[arg(value_name = "FILES",
-        help = "Files to retrieve (can specify multiple files)")]
+
+    #[arg(
+        value_name = "FILES",
+        help = "Files to retrieve (can specify multiple files)"
+    )]
     pub input_files: Vec<String>,
 }
-
 
 /// Arguments for the delete command
 ///
 /// This command deletes files from LiNaStore
 #[derive(Parser, Clone)]
 pub struct DeleteArgs {
-    #[arg(value_name = "PATTERN",
-        help = "Pattern of files to delete (supports wildcards, use with caution)")]
+    #[arg(
+        value_name = "PATTERN",
+        help = "Pattern of files to delete (supports wildcards, use with caution)"
+    )]
     pub input_files: Option<String>,
 }
 
 #[derive(Subcommand, Clone)]
 pub enum StoreArgs {
-    #[command(
-        about = "List files in linastore"
-    )]
+    #[command(about = "List files in linastore")]
     List(ListArgs),
 
-    #[command(
-        about = "Store files into linastore"
-    )]
+    #[command(about = "Store files into linastore")]
     Put(PutArgs),
-    
-    #[command(
-        about = "Retrieve files from linastore"
-    )]
+
+    #[command(about = "Retrieve files from linastore")]
     Get(GetArgs),
 
-    #[command(
-        about = "Delete files from linastore"
-    )]
+    #[command(about = "Delete files from linastore")]
     Delete(DeleteArgs),
 }
 
@@ -124,25 +132,17 @@ pub struct TidyArgs {
 
 #[derive(Subcommand, Clone)]
 pub enum FileArgs {
-    #[command(
-        about = "Linastore file system tools", 
-    )]
+    #[command(about = "Linastore file system tools")]
     Tidy(TidyArgs),
 }
 
 // Update Commands enum
 #[derive(Subcommand, Clone)]
 pub enum Commands {
-    #[command(
-        subcommand,
-        about = "Linastore storage operations", 
-    )]
+    #[command(subcommand, about = "Linastore storage operations")]
     Storage(StoreArgs),
 
-    #[command(
-        subcommand,
-        about = "Linastore file system operations", 
-    )]
+    #[command(subcommand, about = "Linastore file system operations")]
     File(FileArgs),
 }
 

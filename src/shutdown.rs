@@ -1,13 +1,15 @@
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
-    OnceLock,
 };
+
+use tokio::sync::Notify;
 
 static SHUTDOWN: OnceLock<Arc<Shutdown>> = OnceLock::new();
 
 pub struct Shutdown {
     is_shutdown: AtomicBool,
+    notify: Notify,
 }
 
 impl Shutdown {
@@ -16,6 +18,7 @@ impl Shutdown {
             .get_or_init(|| {
                 Arc::new(Shutdown {
                     is_shutdown: AtomicBool::new(false),
+                    notify: Notify::new(),
                 })
             })
             .clone()
@@ -28,6 +31,18 @@ impl Shutdown {
 
     /// Triggers the shutdown signal
     pub fn shutdown(&self) {
-        self.is_shutdown.store(true, Ordering::SeqCst);
+        let already_shutdown = self.is_shutdown.swap(true, Ordering::SeqCst);
+        if !already_shutdown {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Waits until shutdown is triggered
+    pub async fn wait(&self) {
+        let notified = self.notify.notified();
+        if self.is_shutdown() {
+            return;
+        }
+        notified.await;
     }
 }

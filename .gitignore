@@ -27,5 +27,12 @@ logs/
 
 # Custom
 linadata/
-*.sql
+data/
 *.db
+
+*.o
+
+# Allow migration SQL files
+!src/db/migrations/sqlite/*.sql
+!src/db/migrations/mysql/*.sql
+!src/db/migrations/postgres/*.sql

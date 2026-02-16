@@ -16,12 +16,11 @@ pub async fn front() {
     let http_port = envars.http_port.clone();
     let advanced_port = envars.advanced_port.clone();
 
-    let ip_clone = ip.clone();
+    let http_addr = format!("{}:{}", ip, http_port);
+    let advanced_addr = format!("{}:{}", ip, advanced_port);
 
-    let _ = tokio::task::spawn(async move {
-        let _ = run_http_server(&format!("{}:{}", ip, http_port)).await;
-    });
-    let _ = tokio::task::spawn(async move {
-        let _ = run_advanced_server(&format!("{}:{}", ip_clone, advanced_port)).await;
-    });
+    let _ = tokio::join!(
+        async { run_http_server(&http_addr).await },
+        async { run_advanced_server(&advanced_addr).await },
+    );
 }
