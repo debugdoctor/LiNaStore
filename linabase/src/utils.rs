@@ -192,7 +192,7 @@ impl BlockManager {
         }
     }
 
-    pub fn compress_all(&self, input: &Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn compress_all(&self, input: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         // Determine thread count based on input size
         let thread_count = self.determine_thread_count(input.len());
 
@@ -233,7 +233,7 @@ impl BlockManager {
         };
 
         let total_len: usize = compressed_chunks.iter().map(|c| c.len()).sum();
-        let mut result = Vec::with_capacity(total_len);
+        let mut result: Vec<u8> = Vec::with_capacity(total_len);
         // SAFETY: we set the length to the total output size and then
         // fully initialize it by copying each chunk into the buffer.
         unsafe {
@@ -263,7 +263,7 @@ impl BlockManager {
 
     pub fn decompress_all(
         &self,
-        input: &Vec<u8>,
+        input: &[u8],
         original_size: usize,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
         let mut i = 0;
@@ -310,7 +310,7 @@ impl BlockManager {
         });
 
         let total_len: usize = decompressed_chunks.iter().map(|c| c.len()).sum();
-        let mut result = Vec::with_capacity(total_len.max(original_size));
+        let mut result: Vec<u8> = Vec::with_capacity(total_len.max(original_size));
         // SAFETY: we set the length to the total output size and then
         // fully initialize it by copying each chunk into the buffer.
         unsafe {

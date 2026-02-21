@@ -39,16 +39,16 @@ def run_scenario(
     client = LiNaStoreClient(host, port, timeout=timeout)
 
     if auth_required:
-        token, expires_at = client.handshake(username, password)
+        token, expires_at = client.lina_handshake(username, password)
         print(f"[{label}] handshake ok, token expires_at={expires_at}")
 
     file_name = f"{label}-{uuid.uuid4().hex}"
     payload = os.urandom(data_size)
 
-    client.upload_file(file_name, io.BytesIO(payload))
+    client.lina_upload_file(file_name, io.BytesIO(payload))
     print(f"[{label}] upload ok: {file_name} ({len(payload)} bytes)")
 
-    downloaded = client.download_file(file_name)
+    downloaded = client.lina_download_file(file_name)
     if downloaded != payload:
         raise AssertionError(
             f"Downloaded data mismatch for {file_name}: "
@@ -56,7 +56,7 @@ def run_scenario(
         )
     print(f"[{label}] download ok: {file_name}")
 
-    client.delete_file(file_name)
+    client.lina_delete_file(file_name)
     print(f"[{label}] delete ok: {file_name}")
 
 

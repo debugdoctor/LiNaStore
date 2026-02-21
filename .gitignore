@@ -33,6 +33,7 @@ data/
 .linaserver/
 *.o
 __pycache__/
+.tmp/
 
 # Allow migration SQL files
 !src/db/migrations/sqlite/*.sql

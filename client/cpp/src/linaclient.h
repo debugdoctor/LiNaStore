@@ -38,19 +38,19 @@ public:
     LiNaClient(std::string address, int port, bool auto_refresh = true, uint32_t refresh_buffer = 300);
     ~LiNaClient();
 
-    bool uploadFile(std::string name, std::vector<char> data, uint8_t flags);
-    std::vector<char> downloadFile(std::string name);
-    bool deleteFile(std::string name);
-    HandshakeResult handshake(std::string username, std::string password, bool cache_credentials = true);
+    bool linaUploadFile(std::string name, std::vector<char> data, uint8_t flags);
+    std::vector<char> linaDownloadFile(std::string name);
+    bool linaDeleteFile(std::string name);
+    HandshakeResult linaHandshake(std::string username, std::string password, bool cache_credentials = true);
 
     void check_sendv(const std::vector<std::pair<const void*, size_t>>& buffers, const char* context);
     void check_recv(char* buf, size_t len, const char* context);
 
     // Token management functions
-    bool isTokenExpired() const;
-    bool refreshTokenIfNeeded();
-    void cacheCredentials(std::string username, std::string password);
-    void clearCachedCredentials();
+    bool linaIsTokenExpired() const;
+    bool linaRefreshTokenIfNeeded();
+    void linaCacheCredentials(std::string username, std::string password);
+    void linaClearCachedCredentials();
     struct TokenInfo {
         bool has_token;
         bool is_expired;
@@ -58,7 +58,7 @@ public:
         uint64_t expires_in;
         bool has_cached_credentials;
     };
-    TokenInfo getTokenInfo() const;
+    TokenInfo linaGetTokenInfo() const;
 
     enum LiNaFlags {
         LINA_DELETE = 0xC0,

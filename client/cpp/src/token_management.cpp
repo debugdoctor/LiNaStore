@@ -4,7 +4,7 @@
 
 // Token management functions
 
-bool LiNaClient::isTokenExpired() const {
+bool LiNaClient::linaIsTokenExpired() const {
     if (token_expires_at == 0) {
         return true;  // No token, treat as expired
     }
@@ -20,7 +20,7 @@ bool LiNaClient::isTokenExpired() const {
     return false;
 }
 
-bool LiNaClient::refreshTokenIfNeeded() {
+bool LiNaClient::linaRefreshTokenIfNeeded() {
     if (!auto_refresh) {
         return true;  // Auto-refresh disabled
     }
@@ -30,10 +30,10 @@ bool LiNaClient::refreshTokenIfNeeded() {
         return true;
     }
     
-    if (isTokenExpired()) {
+    if (linaIsTokenExpired()) {
         if (!cached_username.empty() && !cached_password.empty()) {
             // Use cached credentials to refresh
-            HandshakeResult res = handshake(cached_username, cached_password, false);
+            HandshakeResult res = linaHandshake(cached_username, cached_password, false);
             if (!res.status) {
                 throw LiNaClientException("Failed to refresh token: " + res.message);
             }
@@ -46,22 +46,22 @@ bool LiNaClient::refreshTokenIfNeeded() {
     return true;  // Token is still valid
 }
 
-void LiNaClient::cacheCredentials(std::string username, std::string password) {
+void LiNaClient::linaCacheCredentials(std::string username, std::string password) {
     cached_username = username;
     cached_password = password;
 }
 
-void LiNaClient::clearCachedCredentials() {
+void LiNaClient::linaClearCachedCredentials() {
     // Clear password from memory for security
     cached_password.clear();
     cached_password.shrink_to_fit();
     cached_username.clear();
 }
 
-LiNaClient::TokenInfo LiNaClient::getTokenInfo() const {
+LiNaClient::TokenInfo LiNaClient::linaGetTokenInfo() const {
     TokenInfo info;
     info.has_token = !session_token.empty();
-    info.is_expired = isTokenExpired();
+    info.is_expired = linaIsTokenExpired();
     info.expires_at = token_expires_at;
     
     if (token_expires_at > 0) {

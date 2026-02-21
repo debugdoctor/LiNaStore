@@ -249,7 +249,7 @@ bool _disconnect(LiNaClient *client)
     return result == 0;
 }
 
-LiNaResult uploadFile(LiNaClient *client, char *name, char *data, size_t data_len, uint8_t flags)
+LiNaResult lina_upload_file(LiNaClient *client, char *name, char *data, size_t data_len, uint8_t flags)
 {
     LiNaResult res = { .status = false };
     char *msg = (char *)malloc(MAX_MSG_LEN);
@@ -414,7 +414,7 @@ cleanup:
     return res;
 }
 
-LiNaResult downloadFile(LiNaClient* client, char* name)
+LiNaResult lina_download_file(LiNaClient* client, char* name)
 {
     LiNaResult res = { .status = false };
     char *msg = (char *)malloc(MAX_MSG_LEN);
@@ -590,7 +590,7 @@ cleanup:
     return res;
 }
 
-LiNaResult deleteFile(LiNaClient *client, char *name)
+LiNaResult lina_delete_file(LiNaClient *client, char *name)
 {
     LiNaResult res = { .status = false };
     char *msg = (char *)malloc(MAX_MSG_LEN);
@@ -726,7 +726,7 @@ cleanup:
     return res;
 }
 
-HandshakeResult handshake(LiNaClient *client, char *username, char *password, bool should_cache_credentials)
+HandshakeResult lina_handshake(LiNaClient *client, char *username, char *password, bool should_cache_credentials)
 {
     HandshakeResult res = { .status = false, .token = NULL, .expires_at = 0, .message = NULL };
     
@@ -992,7 +992,7 @@ cleanup:
     return res;
 }
 
-void freeHandshakeResult(HandshakeResult* result)
+void lina_free_handshake_result(HandshakeResult* result)
 {
     if (result) {
         if (result->token) {
@@ -1008,7 +1008,7 @@ void freeHandshakeResult(HandshakeResult* result)
     }
 }
 
-void freeResult(LiNaResult* result)
+void lina_free_result(LiNaResult* result)
 {
     if (result) {
         if (result->payload.data) {
@@ -1021,7 +1021,7 @@ void freeResult(LiNaResult* result)
 }
 
 // Client initialization and cleanup
-LiNaClient* init_client(const char* address, int port, bool auto_refresh, uint32_t refresh_buffer)
+LiNaClient* lina_client_init(const char* address, int port, bool auto_refresh, uint32_t refresh_buffer)
 {
     LiNaClient* client = (LiNaClient*)malloc(sizeof(LiNaClient));
     if (!client) {
@@ -1078,7 +1078,7 @@ LiNaClient* init_client(const char* address, int port, bool auto_refresh, uint32
     return client;
 }
 
-void cleanup_client(LiNaClient* client)
+void lina_client_cleanup(LiNaClient* client)
 {
     if (client) {
         if (client->session_token) {
@@ -1163,17 +1163,17 @@ bool refresh_token_if_needed(LiNaClient* client, char* error_msg, size_t msg_len
     if (is_token_expired(client)) {
         if (client->cached_username && client->cached_password) {
             // Use cached credentials to refresh
-            HandshakeResult res = handshake(client, client->cached_username,
-                                          client->cached_password, false);
+            HandshakeResult res = lina_handshake(client, client->cached_username,
+                                             client->cached_password, false);
             if (!res.status) {
                 if (error_msg && msg_len > 0) {
                     snprintf(error_msg, msg_len, "Failed to refresh token: %s",
                              res.message ? res.message : "Unknown error");
                 }
-                freeHandshakeResult(&res);
+                lina_free_handshake_result(&res);
                 return false;
             }
-            freeHandshakeResult(&res);
+            lina_free_handshake_result(&res);
             return true;
         } else {
             if (error_msg && msg_len > 0) {

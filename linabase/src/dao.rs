@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use sqlx::{Pool, Sqlite, Row};
+use sqlx::sqlite::SqliteConnectOptions;
+use std::str::FromStr;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -67,8 +69,12 @@ impl Dao {
         // Create database connection URL
         let db_url = format!("sqlite://{}", path.as_ref().display());
 
-        // Create connection pool
-        let pool = sqlx::SqlitePool::connect(&db_url)
+        // Create connection pool (ensure the database file exists)
+        let options = SqliteConnectOptions::from_str(&db_url)
+            .context("Failed to parse SQLite connection URL")?
+            .create_if_missing(true);
+
+        let pool = sqlx::SqlitePool::connect_with(options)
             .await
             .context("Failed to connect to database")?;
 

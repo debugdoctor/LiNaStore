@@ -16,7 +16,6 @@ use tempfile::TempDir;
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn pick_unused_port() -> io::Result<u16> {
@@ -36,65 +35,12 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-fn crc32_lina(ilen: u8, identifier: &[u8], dlen: u32, data: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&[ilen]);
-    hasher.update(identifier);
-    hasher.update(&dlen.to_le_bytes());
-    hasher.update(data);
-    hasher.finalize()
-}
-
-fn read_lina_response(stream: &mut std::net::TcpStream) -> io::Result<(u8, Vec<u8>, Vec<u8>)> {
-    // status(1) + ilen(1)
-    let mut fixed = [0u8; 2];
-    stream.read_exact(&mut fixed)?;
-    let status = fixed[0];
-    let ilen = fixed[1] as usize;
-
-    let mut identifier = vec![0u8; ilen];
-    if ilen > 0 {
-        stream.read_exact(&mut identifier)?;
-    }
-
-    let mut dlen_bytes = [0u8; 4];
-    stream.read_exact(&mut dlen_bytes)?;
-    let dlen = u32::from_le_bytes(dlen_bytes) as usize;
-
-    let mut checksum_bytes = [0u8; 4];
-    stream.read_exact(&mut checksum_bytes)?;
-    let checksum = u32::from_le_bytes(checksum_bytes);
-
-    let mut data = vec![0u8; dlen];
-    if dlen > 0 {
-        stream.read_exact(&mut data)?;
-    }
-
-    let computed = crc32_lina(fixed[1], &identifier, dlen as u32, &data);
-    if computed != checksum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid response checksum",
-        ));
-    }
-
-    Ok((status, identifier, data))
-}
-
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .connect_timeout(CLIENT_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .build()
         .expect("Failed to build HTTP client")
-}
-
-fn connect_lina(port: u16) -> io::Result<TcpStream> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let stream = TcpStream::connect_timeout(&addr, CLIENT_CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
-    Ok(stream)
 }
 
 // Get the project directory
@@ -140,7 +86,14 @@ impl TestEnvironment {
     fn new() -> io::Result<Self> {
         ensure_binaries();
 
-        let temp_dir = TempDir::new()?;
+        // Use project-local temp directory if TMPDIR is not set or /tmp is not writable
+        let temp_dir = if std::env::var("TMPDIR").is_err() {
+            let project_tmp = project_dir().join(".tmp");
+            fs::create_dir_all(&project_tmp)?;
+            tempfile::tempdir_in(&project_tmp)?
+        } else {
+            TempDir::new()?
+        };
         let storage_dir = temp_dir.path().join("storage");
         let test_files_dir = temp_dir.path().join("test_files");
         let db_path = temp_dir.path().join("db").join("linastore.db");
@@ -184,6 +137,7 @@ impl TestEnvironment {
             let lina_port = pick_unused_port()?;
 
             let mut child = Command::new(linastore_server_binary())
+                .args(["start", "--foreground"])
                 .env("LINASTORE_HTTP_PORT", http_port.to_string())
                 .env("LINASTORE_ADVANCED_PORT", lina_port.to_string())
                 .env("LINASTORE_AUTH_REQUIRED", "") // Disable authentication for tests

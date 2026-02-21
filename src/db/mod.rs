@@ -3,7 +3,7 @@
 //! This module handles database connections and migrations for LiNaStore.
 //! It supports multiple database backends: SQLite, MySQL, and PostgreSQL.
 
-use anyhow::{Context, Result};
+use crate::error::{Context, Result, err_msg};
 use sqlx::{migrate::Migrator, Pool};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -11,11 +11,19 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{Level, event};
 
-const MIGRATIONS_SQLITE_DIR: &str = "./src/db/migrations/sqlite";
+fn migrations_sqlite_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations/sqlite")
+}
+
 #[cfg(feature = "mysql")]
-const MIGRATIONS_MYSQL_DIR: &str = "./src/db/migrations/mysql";
+fn migrations_mysql_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations/mysql")
+}
+
 #[cfg(feature = "postgres")]
-const MIGRATIONS_POSTGRES_DIR: &str = "./src/db/migrations/postgres";
+fn migrations_postgres_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations/postgres")
+}
 
 /// Database type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +112,8 @@ impl DbConnection {
 
                 #[cfg(not(feature = "mysql"))]
                 {
-                    Err(anyhow::anyhow!(
-                        "MySQL support requires enabling the Cargo feature `mysql`"
+                    Err(err_msg(
+                        "MySQL support requires enabling the Cargo feature `mysql`",
                     ))
                 }
             }
@@ -127,8 +135,8 @@ impl DbConnection {
 
                 #[cfg(not(feature = "postgres"))]
                 {
-                    Err(anyhow::anyhow!(
-                        "PostgreSQL support requires enabling the Cargo feature `postgres`"
+                    Err(err_msg(
+                        "PostgreSQL support requires enabling the Cargo feature `postgres`",
                     ))
                 }
             }
@@ -349,7 +357,12 @@ fn ensure_sqlite_parent_dir(db_url: &str) -> Result<()> {
         return Ok(());
     }
 
-    let Some(rest) = db_url.strip_prefix("sqlite://") else {
+    // Handle sqlite://path, sqlite:/path, and sqlite:path formats
+    let rest = if let Some(path) = db_url.strip_prefix("sqlite://") {
+        path
+    } else if let Some(path) = db_url.strip_prefix("sqlite:") {
+        path
+    } else {
         return Ok(());
     };
 
@@ -378,21 +391,21 @@ fn ensure_sqlite_parent_dir(db_url: &str) -> Result<()> {
 }
 
 async fn migrator_sqlite() -> Result<Migrator> {
-    Migrator::new(std::path::Path::new(MIGRATIONS_SQLITE_DIR))
+    Migrator::new(migrations_sqlite_dir())
         .await
         .context("Failed to create migrator")
 }
 
 #[cfg(feature = "mysql")]
 async fn migrator_mysql() -> Result<Migrator> {
-    Migrator::new(std::path::Path::new(MIGRATIONS_MYSQL_DIR))
+    Migrator::new(migrations_mysql_dir())
         .await
         .context("Failed to create migrator")
 }
 
 #[cfg(feature = "postgres")]
 async fn migrator_postgres() -> Result<Migrator> {
-    Migrator::new(std::path::Path::new(MIGRATIONS_POSTGRES_DIR))
+    Migrator::new(migrations_postgres_dir())
         .await
         .context("Failed to create migrator")
 }
@@ -403,7 +416,7 @@ fn list_migration_versions(dir: &Path) -> Result<Vec<String>> {
         .with_context(|| format!("Failed to read migration directory: {:?}", dir))?;
 
     for entry in entries {
-        let entry = entry.with_context(|| "Failed to read migration directory entry")?;
+        let entry = entry.with_context(|| "Failed to read migration directory entry".to_string())?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
@@ -425,10 +438,43 @@ fn is_missing_mig_records_table(err: &sqlx::Error) -> bool {
         || (msg.contains("mig_records") && msg.contains("doesn't exist"))
 }
 
-async fn fetch_mig_versions<DB>(pool: &Pool<DB>) -> Result<Vec<String>>
-where
-    DB: sqlx::Database,
-{
+async fn fetch_mig_versions_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>("SELECT version FROM mig_records")
+        .fetch_all(pool)
+        .await;
+
+    match rows {
+        Ok(list) => Ok(list),
+        Err(e) => {
+            if is_missing_mig_records_table(&e) {
+                Ok(Vec::new())
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+async fn fetch_mig_versions_mysql(pool: &Pool<sqlx::MySql>) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>("SELECT version FROM mig_records")
+        .fetch_all(pool)
+        .await;
+
+    match rows {
+        Ok(list) => Ok(list),
+        Err(e) => {
+            if is_missing_mig_records_table(&e) {
+                Ok(Vec::new())
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn fetch_mig_versions_postgres(pool: &Pool<sqlx::Postgres>) -> Result<Vec<String>> {
     let rows = sqlx::query_scalar::<_, String>("SELECT version FROM mig_records")
         .fetch_all(pool)
         .await;
@@ -453,7 +499,7 @@ async fn all_mig_records_present_sqlite(
         return Ok(false);
     }
 
-    let existing = fetch_mig_versions(pool).await?;
+    let existing = fetch_mig_versions_sqlite(pool).await?;
     if existing.is_empty() {
         return Ok(false);
     }
@@ -470,7 +516,7 @@ async fn all_mig_records_present_mysql(
         return Ok(false);
     }
 
-    let existing = fetch_mig_versions(pool).await?;
+    let existing = fetch_mig_versions_mysql(pool).await?;
     if existing.is_empty() {
         return Ok(false);
     }
@@ -487,7 +533,7 @@ async fn all_mig_records_present_postgres(
         return Ok(false);
     }
 
-    let existing = fetch_mig_versions(pool).await?;
+    let existing = fetch_mig_versions_postgres(pool).await?;
     if existing.is_empty() {
         return Ok(false);
     }
@@ -497,7 +543,7 @@ async fn all_mig_records_present_postgres(
 
 async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (SQLite)");
-    let versions = list_migration_versions(Path::new(MIGRATIONS_SQLITE_DIR))?;
+    let versions = list_migration_versions(&migrations_sqlite_dir())?;
     if all_mig_records_present_sqlite(pool, &versions).await? {
         event!(
             Level::INFO,
@@ -517,7 +563,7 @@ async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
 #[cfg(feature = "mysql")]
 async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (MySQL)");
-    let versions = list_migration_versions(Path::new(MIGRATIONS_MYSQL_DIR))?;
+    let versions = list_migration_versions(&migrations_mysql_dir())?;
     if all_mig_records_present_mysql(pool, &versions).await? {
         event!(
             Level::INFO,
@@ -537,7 +583,7 @@ async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
 #[cfg(feature = "postgres")]
 async fn run_migrations_postgres(pool: &Pool<sqlx::Postgres>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (PostgreSQL)");
-    let versions = list_migration_versions(Path::new(MIGRATIONS_POSTGRES_DIR))?;
+    let versions = list_migration_versions(&migrations_postgres_dir())?;
     if all_mig_records_present_postgres(pool, &versions).await? {
         event!(
             Level::INFO,
