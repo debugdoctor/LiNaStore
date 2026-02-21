@@ -176,7 +176,7 @@ public class LiNaStoreClient {
         if (isTokenExpired()) {
             if (cachedUsername != null && cachedPassword != null) {
                 // Use cached credentials to refresh
-                HandshakeResult res = handshake(cachedUsername, new String(cachedPassword), false);
+                HandshakeResult res = linaHandshake(cachedUsername, new String(cachedPassword), false);
                 if (!res.getToken().isEmpty()) {
                     // Token refreshed successfully
                 }
@@ -192,7 +192,7 @@ public class LiNaStoreClient {
      * @param username The username to cache
      * @param password The password to cache
      */
-    public void cacheCredentials(String username, String password) {
+    public void linaCacheCredentials(String username, String password) {
         this.cachedUsername = username;
         this.cachedPassword = password.toCharArray();
     }
@@ -200,7 +200,7 @@ public class LiNaStoreClient {
     /**
      * Clears cached credentials for security.
      */
-    public void clearCachedCredentials() {
+    public void linaClearCachedCredentials() {
         if (cachedPassword != null) {
             java.util.Arrays.fill(cachedPassword, '\0');
         }
@@ -213,7 +213,7 @@ public class LiNaStoreClient {
      *
      * @return TokenInfo containing token status
      */
-    public TokenInfo getTokenInfo() {
+    public TokenInfo linaGetTokenInfo() {
         TokenInfo info = new TokenInfo();
         info.hasToken = sessionToken != null && !sessionToken.isEmpty();
         info.isExpired = isTokenExpired();
@@ -250,7 +250,7 @@ public class LiNaStoreClient {
      * @param flags    Optional flags to control upload behavior.
      * @throws IOException If upload fails due to network or protocol issues.
      */
-    public boolean uploadFile(String fileName, byte[] data, int flags) throws LiNaStoreException {
+    public boolean linaUploadFile(String fileName, byte[] data, int flags) throws LiNaStoreException {
         // Refresh token if needed before operation
         refreshTokenIfNeeded();
         
@@ -355,7 +355,7 @@ public class LiNaStoreClient {
      * @return The downloaded data.
      * @throws IOException If download fails due to network or integrity issue.
      */
-    public byte[] downloadFile(String fileName) throws LiNaStoreException {
+    public byte[] linaDownloadFile(String fileName) throws LiNaStoreException {
         // Refresh token if needed before operation
         refreshTokenIfNeeded();
         
@@ -479,10 +479,12 @@ public class LiNaStoreClient {
                 throw new LiNaStoreProtocolException("Incomplete data received: " + totalRead + " < " + dataLength);
             }
 
-            // Verify checksum
+            // Verify checksum (ilen + identifier + dlen + data)
             crc32.reset();
             crc32.update(ilenRecv);
             crc32.update(identifierRecv);
+            byte[] dlenRecv = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(dataLength).array();
+            crc32.update(dlenRecv);
             crc32.update(data);
             long expectedChecksum = crc32.getValue();
             long receivedChecksum = ByteBuffer.wrap(checksumRecv).order(ByteOrder.LITTLE_ENDIAN).getInt() & 0xFFFFFFFFL;
@@ -504,7 +506,7 @@ public class LiNaStoreClient {
      * @param fileName Name of the file to delete.
      * @return True if successful.
      */
-    public boolean deleteFile(String fileName) throws LiNaStoreException {
+    public boolean linaDeleteFile(String fileName) throws LiNaStoreException {
         // Refresh token if needed before operation
         refreshTokenIfNeeded();
         
@@ -607,7 +609,7 @@ public class LiNaStoreClient {
      * @return A HandshakeResult containing the session token and expiration timestamp.
      * @throws LiNaStoreException If authentication fails due to network or protocol issues.
      */
-    public HandshakeResult handshake(String username, String password, boolean cacheCredentials) throws LiNaStoreException {
+    public HandshakeResult linaHandshake(String username, String password, boolean cacheCredentials) throws LiNaStoreException {
         if (username == null || username.isEmpty()) {
             throw new LiNaStoreProtocolException("Username cannot be null or empty");
         }
@@ -617,7 +619,7 @@ public class LiNaStoreClient {
         
         // Cache credentials if requested
         if (cacheCredentials) {
-            cacheCredentials(username, password);
+            linaCacheCredentials(username, password);
         }
         
         try {
@@ -823,8 +825,8 @@ public class LiNaStoreClient {
      * @return A HandshakeResult containing the session token and expiration timestamp.
      * @throws LiNaStoreException If authentication fails due to network or protocol issues.
      */
-    public HandshakeResult handshake(String username, String password) throws LiNaStoreException {
-        return handshake(username, password, true);
+    public HandshakeResult linaHandshake(String username, String password) throws LiNaStoreException {
+        return linaHandshake(username, password, true);
     }
 
     /**
@@ -855,11 +857,11 @@ public class LiNaStoreClient {
      * @param password The password for authentication.
      * @return True if authentication successful.
      * @throws LiNaStoreException If authentication fails due to network or protocol issues.
-     * @deprecated Use {@link #handshake(String, String)} instead for proper username-based authentication.
+     * @deprecated Use {@link #linaHandshake(String, String)} instead for proper username-based authentication.
      */
     @Deprecated
     public boolean authenticate(String password) throws LiNaStoreException {
-        handshake("admin", password, true);
+        linaHandshake("admin", password, true);
         return true;
     }
 
@@ -903,23 +905,23 @@ public class LiNaStoreClient {
 
             // Test handshake authentication
             System.out.println("Testing handshake authentication...");
-            HandshakeResult result = client.handshake(username, password, true);
+            HandshakeResult result = client.linaHandshake(username, password, true);
             System.out.println("Authentication successful!");
             System.out.println("Session token: " + result.getToken());
             System.out.println("Expires at: " + result.getExpiresAt());
             
             // Test upload with authentication
             byte[] testData = "This is a test file with authentication.".getBytes(StandardCharsets.UTF_8);
-            boolean uploadSuccess = client.uploadFile(testFile, testData, LiNaFlags.WRITE.getValue());
+            boolean uploadSuccess = client.linaUploadFile(testFile, testData, LiNaFlags.WRITE.getValue());
             if (uploadSuccess) {
                 System.out.println("Upload with authentication successful.");
                 
                 // Test download with authentication
-                byte[] downloadedData = client.downloadFile(testFile);
+                byte[] downloadedData = client.linaDownloadFile(testFile);
                 System.out.println("Downloaded data: " + new String(downloadedData));
                 
                 // Test delete with authentication
-                boolean deleted = client.deleteFile(testFile);
+                boolean deleted = client.linaDeleteFile(testFile);
                 System.out.println("Delete success: " + deleted);
             } else {
                 System.out.println("Upload failed.");

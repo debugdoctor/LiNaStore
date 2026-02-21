@@ -1,13 +1,14 @@
+use bytes::Bytes;
 use chrono::Utc;
 use uuid::Uuid;
 
 #[derive(Clone, PartialEq)]
 pub struct PayLoad {
     pub ilen: u8,            // Identifier length (variable length identifier)
-    pub identifier: Vec<u8>, // Variable length identifier
+    pub identifier: Bytes,   // Variable length identifier
     pub dlen: u32,           // Data length
     pub checksum: u32,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// Flags Definition
@@ -31,10 +32,10 @@ impl LiNaProtocol {
             status: Status::None,
             payload: PayLoad {
                 ilen: 0,
-                identifier: Vec::new(),
+                identifier: Bytes::new(),
                 dlen: 0,
                 checksum: 0,
-                data: Vec::new(),
+                data: Bytes::new(),
             },
         }
     }
@@ -53,7 +54,7 @@ impl LiNaProtocol {
         hasher.finalize()
     }
 
-    pub fn serialize_protocol_message(&self) -> Vec<u8> {
+    pub fn serialize_protocol_message(&self) -> Bytes {
         let mut payload = Vec::with_capacity(0x1000);
 
         payload.push(self.status.clone() as u8);
@@ -62,7 +63,7 @@ impl LiNaProtocol {
         payload.extend_from_slice(&self.payload.dlen.to_le_bytes());
         payload.extend_from_slice(&self.payload.checksum.to_le_bytes());
         payload.extend_from_slice(&self.payload.data);
-        payload
+        Bytes::from(payload)
     }
 }
 
@@ -93,8 +94,8 @@ impl Package {
             behavior: Behavior::None,
             content: Content {
                 flags: 0x40,
-                identifier: Vec::new(),
-                data: Vec::new(),
+                identifier: Bytes::new(),
+                data: Bytes::new(),
             },
             created_at: Utc::now().timestamp(),
         }
@@ -107,8 +108,8 @@ impl Package {
             behavior: Behavior::None,
             content: Content {
                 flags: 0,
-                identifier: Vec::new(),
-                data: Vec::new(),
+                identifier: Bytes::new(),
+                data: Bytes::new(),
             },
             created_at: Utc::now().timestamp(),
         }
@@ -118,8 +119,8 @@ impl Package {
 #[derive(Clone, PartialEq)]
 pub struct Content {
     pub flags: u8,
-    pub identifier: Vec<u8>, // Variable length identifier
-    pub data: Vec<u8>,
+    pub identifier: Bytes, // Variable length identifier
+    pub data: Bytes,
 }
 
 // Should not excced u8::MAX
@@ -151,10 +152,10 @@ mod tests {
     fn test_payload_new() {
         let payload = PayLoad {
             ilen: 0,
-            identifier: Vec::new(),
+            identifier: Bytes::new(),
             dlen: 0,
             checksum: 0,
-            data: Vec::new(),
+            data: Bytes::new(),
         };
 
         assert_eq!(payload.ilen, 0);
@@ -179,7 +180,7 @@ mod tests {
     #[test]
     fn test_calculate_checksum() {
         let mut protocol = LiNaProtocol::new();
-        protocol.payload.data = vec![1, 2, 3, 4, 5];
+        protocol.payload.data = Bytes::from(vec![1, 2, 3, 4, 5]);
         protocol.payload.dlen = 5;
 
         let checksum = protocol.calculate_checksum();
@@ -189,7 +190,7 @@ mod tests {
     #[test]
     fn test_verify_checksum_valid() {
         let mut protocol = LiNaProtocol::new();
-        protocol.payload.data = vec![1, 2, 3, 4, 5];
+        protocol.payload.data = Bytes::from(vec![1, 2, 3, 4, 5]);
         protocol.payload.dlen = 5;
         protocol.payload.checksum = protocol.calculate_checksum();
 
@@ -199,7 +200,7 @@ mod tests {
     #[test]
     fn test_verify_checksum_invalid() {
         let mut protocol = LiNaProtocol::new();
-        protocol.payload.data = vec![1, 2, 3, 4, 5];
+        protocol.payload.data = Bytes::from(vec![1, 2, 3, 4, 5]);
         protocol.payload.dlen = 5;
         protocol.payload.checksum = 12345; // Invalid checksum
 
@@ -209,9 +210,9 @@ mod tests {
     #[test]
     fn test_serialize_protocol_message() {
         let mut protocol = LiNaProtocol::new();
-        protocol.payload.identifier = b"test".to_vec();
+        protocol.payload.identifier = Bytes::from(&b"test"[..]);
         protocol.payload.ilen = 4;
-        protocol.payload.data = vec![1, 2, 3, 4, 5];
+        protocol.payload.data = Bytes::from(vec![1, 2, 3, 4, 5]);
         protocol.payload.dlen = 5;
         protocol.payload.checksum = protocol.calculate_checksum();
         protocol.status = Status::Success;
@@ -271,8 +272,8 @@ mod tests {
     fn test_content_new() {
         let content = Content {
             flags: 0x01,
-            identifier: vec![42u8],
-            data: vec![1, 2, 3],
+            identifier: Bytes::from(vec![42u8]),
+            data: Bytes::from(vec![1, 2, 3]),
         };
 
         assert_eq!(content.flags, 0x01);
@@ -291,7 +292,7 @@ mod tests {
     fn test_payload_with_large_data() {
         let large_data = vec![42u8; 100000];
         let mut protocol = LiNaProtocol::new();
-        protocol.payload.data = large_data.clone();
+        protocol.payload.data = Bytes::from(large_data.clone());
         protocol.payload.dlen = large_data.len() as u32;
         protocol.payload.checksum = protocol.calculate_checksum();
 
@@ -302,9 +303,9 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_roundtrip() {
         let mut original = LiNaProtocol::new();
-        original.payload.identifier = b"test".to_vec();
+        original.payload.identifier = Bytes::from(&b"test"[..]);
         original.payload.ilen = 4;
-        original.payload.data = vec![10, 20, 30, 40, 50];
+        original.payload.data = Bytes::from(vec![10, 20, 30, 40, 50]);
         original.payload.dlen = 5;
         original.payload.checksum = original.calculate_checksum();
         original.status = Status::Success;
@@ -316,6 +317,6 @@ mod tests {
 
         // The data should be at the end
         let data_start = 1 + 1 + 4 + 4 + 4; // status + ilen + identifier + dlen + checksum
-        assert_eq!(serialized[data_start..], vec![10, 20, 30, 40, 50]);
+        assert_eq!(&serialized[data_start..], &[10, 20, 30, 40, 50][..]);
     }
 }

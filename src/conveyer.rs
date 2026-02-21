@@ -6,14 +6,7 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::dtos::Package;
 
-#[derive(Clone, Copy, Debug)]
-enum OrderQueuePolicy {
-    Reject,
-    DropOldest,
-}
-
 const ORDER_QUEUE_CAPACITY: usize = 32;
-const ORDER_QUEUE_POLICY: OrderQueuePolicy = OrderQueuePolicy::DropOldest;
 const WAITERS_TTL: Duration = Duration::from_secs(20);
 const WAITERS_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -86,23 +79,14 @@ impl ConveyQueue {
                     .map_err(|_| "fail to push to order queue".to_string())?;
 
                 if queue.len() >= ORDER_QUEUE_CAPACITY {
-                    match ORDER_QUEUE_POLICY {
-                        OrderQueuePolicy::Reject => {
-                            return Err(format!(
-                                "order queue full (cap {})",
-                                ORDER_QUEUE_CAPACITY
-                            ));
-                        }
-                        OrderQueuePolicy::DropOldest => {
-                            if let Some(dropped) = queue.pop_front() {
-                                self.unregister_waiter(dropped.uni_id);
-                            }
-                        }
+                    // DropOldest policy: remove the oldest order when queue is full
+                    if let Some(dropped) = queue.pop_front() {
+                        self.unregister_waiter(dropped.uni_id);
                     }
                 }
 
                 queue.push_back(order.clone());
-                Ok(())
+                Ok::<(), String>(())
             },
             3,
         )?;

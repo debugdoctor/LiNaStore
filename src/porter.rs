@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::time::Duration;
 
 use linabase::service::StoreManager;
@@ -151,7 +152,7 @@ async fn process_package(
         Behavior::GetFile => match store_manager.get_binary_data(&identifier).await {
             Ok(data) => {
                 res_pkg.status = Status::Success;
-                res_pkg.content.data = data;
+                res_pkg.content.data = Bytes::from(data);
                 send_response(&res_pkg, conveyers)
             }
             Err(_) => {

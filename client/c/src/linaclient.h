@@ -84,16 +84,16 @@ typedef struct HandshakeResult {
     char* message;
 } HandshakeResult;
 
-LiNaResult uploadFile(LiNaClient* client, char* name, char* data, size_t data_len, uint8_t flags);
-LiNaResult downloadFile(LiNaClient* client, char* name);
-LiNaResult deleteFile(LiNaClient* client, char* name);
-HandshakeResult handshake(LiNaClient* client, char* username, char* password, bool cache_credentials);
-void freeResult(LiNaResult* result);
-void freeHandshakeResult(HandshakeResult* result);
+LiNaResult lina_upload_file(LiNaClient* client, char* name, char* data, size_t data_len, uint8_t flags);
+LiNaResult lina_download_file(LiNaClient* client, char* name);
+LiNaResult lina_delete_file(LiNaClient* client, char* name);
+HandshakeResult lina_handshake(LiNaClient* client, char* username, char* password, bool cache_credentials);
+void lina_free_result(LiNaResult* result);
+void lina_free_handshake_result(HandshakeResult* result);
 
 // Client initialization and cleanup
-LiNaClient* init_client(const char* address, int port, bool auto_refresh, uint32_t refresh_buffer);
-void cleanup_client(LiNaClient* client);
+LiNaClient* lina_client_init(const char* address, int port, bool auto_refresh, uint32_t refresh_buffer);
+void lina_client_cleanup(LiNaClient* client);
 
 // Utility functions
 uint8_t* to_array(uint64_t value, uint8_t length, bool little_endian);

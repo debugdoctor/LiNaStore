@@ -112,11 +112,11 @@ class LiNaStoreClient:
         if self._is_token_expired():
             if self._cached_username and self._cached_password:
                 # Use cached credentials to refresh
-                self.handshake(self._cached_username, self._cached_password)
+                self.lina_handshake(self._cached_username, self._cached_password)
             else:
                 raise LiNaStoreProtocolError(
                     "Token expired and no cached credentials available for refresh. "
-                    "Please call handshake() with username and password again."
+                    "Please call lina_handshake() with username and password again."
                 )
 
     def cache_credentials(self, username: str, password: str) -> None:
@@ -169,7 +169,7 @@ class LiNaStoreClient:
             'has_cached_credentials': bool(self._cached_username and self._cached_password)
         }
 
-    def handshake(self, username: str, password: str, cache_credentials: bool = True) -> tuple[str, int]:
+    def lina_handshake(self, username: str, password: str, cache_credentials: bool = True) -> tuple[str, int]:
         """
         Perform authentication handshake with the server.
         
@@ -333,7 +333,7 @@ class LiNaStoreClient:
         
         return plaintext
 
-    def upload_file(self, file_name: str, reader: io.BufferedReader) -> bool:
+    def lina_upload_file(self, file_name: str, reader: io.BufferedReader) -> bool:
         """
         Upload a file to LiNaStore.
         
@@ -392,7 +392,7 @@ class LiNaStoreClient:
         finally:
             self.disconnect()
 
-    def download_file(self, file_name: str) -> bytes:
+    def lina_download_file(self, file_name: str) -> bytes:
         """
         Download a file from LiNaStore.
         
@@ -475,7 +475,7 @@ class LiNaStoreClient:
         finally:
             self.disconnect()
     
-    def delete_file(self, file_name: str) -> bool:
+    def lina_delete_file(self, file_name: str) -> bool:
         """
         Delete a file from LiNaStore.
         

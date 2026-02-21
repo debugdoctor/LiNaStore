@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use nanoid;
 use std::{
@@ -64,7 +65,7 @@ impl StoreManager {
         Ok(links)
     }
 
-    pub async fn get_binary_data(&self, file_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub async fn get_binary_data(&self, file_name: &str) -> Result<Bytes, Box<dyn Error>> {
         if file_name.is_empty() {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::Other,
@@ -90,10 +91,9 @@ impl StoreManager {
             .join(&source.id);
 
         Ok(if source.compressed {
-            self.bm
-                .decompress_all(&fs::read(&source_path)?, source.size as usize)?
+            Bytes::from(self.bm.decompress_all(&fs::read(&source_path)?, source.size as usize)?)
         } else {
-            fs::read(&source_path)?
+            Bytes::from(fs::read(&source_path)?)
         })
     }
 
@@ -148,7 +148,7 @@ impl StoreManager {
     pub async fn put_binary_data(
         &self,
         file_name: &str,
-        input: &Vec<u8>,
+        input: &Bytes,
         cover: bool,
         compressed: bool,
     ) -> Result<(), Box<dyn Error>> {
@@ -621,11 +621,11 @@ mod tests {
 
     use super::*;
 
-    fn generate_random_binary(size: usize) -> Vec<u8> {
+    fn generate_random_binary(size: usize) -> Bytes {
         let mut rng = rand::rng();
         let mut data = vec![0u8; size];
         rng.fill(&mut data[..]);
-        data
+        Bytes::from(data)
     }
 
     #[tokio::test]
@@ -652,7 +652,7 @@ mod tests {
     async fn test_put_binary_data_new_file() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![1, 2, 3, 4, 5];
+        let data = Bytes::from(vec![1, 2, 3, 4, 5]);
 
         let result = sm.put_binary_data("test.txt", &data, false, false).await;
         assert!(result.is_ok());
@@ -666,7 +666,7 @@ mod tests {
     async fn test_put_binary_data_compressed() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![42u8; 10000]; // Highly compressible data
+        let data = Bytes::from(vec![42u8; 10000]); // Highly compressible data
 
         let result = sm.put_binary_data("compressed.txt", &data, false, true).await;
         assert!(result.is_ok());
@@ -682,8 +682,8 @@ mod tests {
     async fn test_put_binary_data_cover() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data1 = vec![1, 2, 3, 4, 5];
-        let data2 = vec![6, 7, 8, 9, 10];
+        let data1 = Bytes::from(vec![1, 2, 3, 4, 5]);
+        let data2 = Bytes::from(vec![6, 7, 8, 9, 10]);
 
         // Put initial data
         sm.put_binary_data("test.txt", &data1, false, false)
@@ -703,7 +703,7 @@ mod tests {
     async fn test_put_binary_data_empty_filename() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![1, 2, 3, 4, 5];
+        let data = Bytes::from(vec![1, 2, 3, 4, 5]);
 
         let result = sm.put_binary_data("", &data, false, false).await;
         assert!(result.is_err());
@@ -731,8 +731,8 @@ mod tests {
     async fn test_list_all_files() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data1 = vec![1, 2, 3];
-        let data2 = vec![4, 5, 6];
+        let data1 = Bytes::from(vec![1, 2, 3]);
+        let data2 = Bytes::from(vec![4, 5, 6]);
 
         sm.put_binary_data("file1.txt", &data1, false, false)
             .await
@@ -749,7 +749,7 @@ mod tests {
     async fn test_list_by_name() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![1, 2, 3];
+        let data = Bytes::from(vec![1, 2, 3]);
 
         sm.put_binary_data("test_file.txt", &data, false, false)
             .await
@@ -767,9 +767,9 @@ mod tests {
     async fn test_list_by_extension() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data1 = vec![1, 2, 3];
-        let data2 = vec![4, 5, 6];
-        let data3 = vec![7, 8, 9];
+        let data1 = Bytes::from(vec![1, 2, 3]);
+        let data2 = Bytes::from(vec![4, 5, 6]);
+        let data3 = Bytes::from(vec![7, 8, 9]);
 
         sm.put_binary_data("file1.txt", &data1, false, false)
             .await
@@ -798,7 +798,7 @@ mod tests {
     async fn test_list_with_limit() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![1, 2, 3];
+        let data = Bytes::from(vec![1, 2, 3]);
 
         for i in 0..5 {
             let filename = format!("file{}.txt", i);
@@ -815,7 +815,7 @@ mod tests {
     async fn test_delete_file() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![1, 2, 3];
+        let data = Bytes::from(vec![1, 2, 3]);
 
         sm.put_binary_data("test.txt", &data, false, false)
             .await
@@ -853,7 +853,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
         let save_dir = TempDir::new().expect("Failed to create save dir");
-        let data = vec![1, 2, 3, 4, 5];
+        let data = Bytes::from(vec![1, 2, 3, 4, 5]);
 
         sm.put_binary_data("test.txt", &data, false, false)
             .await
@@ -868,7 +868,7 @@ mod tests {
         assert!(saved_path.exists());
 
         let saved_data = std::fs::read(&saved_path).expect("Failed to read saved file");
-        assert_eq!(data, saved_data);
+        assert_eq!(&data[..], &saved_data);
     }
 
     #[tokio::test]
@@ -899,7 +899,7 @@ mod tests {
     async fn test_deduplication_same_content() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
-        let data = vec![1, 2, 3, 4, 5];
+        let data = Bytes::from(vec![1, 2, 3, 4, 5]);
 
         // Put same data with different names
         sm.put_binary_data("file1.txt", &data, false, false)

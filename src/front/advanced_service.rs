@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::{io, net::SocketAddr, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -27,7 +27,7 @@ async fn write_error_response<T: AsyncWriteExt + Unpin>(
     response.status = status;
     response.payload.ilen = response.payload.identifier.len() as u8;
     if let Some(code) = code {
-        response.payload.data = vec![code];
+        response.payload.data = Bytes::from(vec![code]);
         response.payload.dlen = 1;
     } else {
         response.payload.dlen = 0;
@@ -85,13 +85,14 @@ impl LiNaProtocol {
         };
 
         // Read variable-length identifier
-        self.payload.identifier = vec![0u8; self.payload.ilen as usize];
-        match stream.read_exact(&mut self.payload.identifier).await {
+        let mut identifier = vec![0u8; self.payload.ilen as usize];
+        match stream.read_exact(&mut identifier).await {
             Ok(_) => {}
             Err(err) => {
                 return Err(ProtocolReadError::from_io("Failed to read identifier", err));
             }
         };
+        self.payload.identifier = Bytes::from(identifier);
 
         // Read data length (dlen - u32)
         self.payload.dlen = match stream.read_u32_le().await {
@@ -117,19 +118,17 @@ impl LiNaProtocol {
             }
         };
 
-        let mut chunk = BytesMut::with_capacity(0x10000);
+        let mut data_buf = BytesMut::with_capacity(0x10000);
 
         // Read data payload for write operations and operations that might contain session tokens
         if self.payload.dlen > 0 {
             loop {
-                match tokio::time::timeout(READ_TIMEOUT, stream.read_buf(&mut chunk)).await {
+                match tokio::time::timeout(READ_TIMEOUT, stream.read_buf(&mut data_buf)).await {
                     Ok(Ok(n)) => {
                         if n == 0 {
                             return Err(ProtocolReadError::Disconnected);
                         }
-                        self.payload.data.extend_from_slice(&chunk[..n]);
-                        chunk.clear();
-                        if self.payload.data.len() >= self.payload.dlen as usize {
+                        if data_buf.len() >= self.payload.dlen as usize {
                             break;
                         }
                     }
@@ -143,6 +142,7 @@ impl LiNaProtocol {
                     }
                 };
             }
+            self.payload.data = data_buf.freeze();
         }
 
         // Verify checksum for all operations
@@ -221,7 +221,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
                     let mut response = LiNaProtocol::new();
                     response.status = Status::Success;
-                    response.payload.data = response_data;
+                    response.payload.data = Bytes::from(response_data);
                     response.payload.dlen = response.payload.data.len() as u32;
                     response.payload.checksum = response.calculate_checksum();
                     let resp_data = response.serialize_protocol_message();
@@ -273,14 +273,14 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             && !message.payload.data.is_empty()
         {
             // Extract session token and file data without cloning large buffers.
-            let mut data = std::mem::take(&mut message.payload.data);
+            let data = std::mem::take(&mut message.payload.data);
             if let Some(null_pos) = data.iter().position(|&b| b == 0) {
                 // Session token is before null terminator, file data is after.
                 let file_start = null_pos + 1;
                 let file_data = if file_start < data.len() {
-                    data.split_off(file_start)
+                    data.slice(file_start..)
                 } else {
-                    Vec::new()
+                    Bytes::new()
                 };
                 let token = std::str::from_utf8(&data[..null_pos])
                     .ok()
@@ -303,10 +303,10 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                     std::str::from_utf8(&message.payload.data[..token_end])
                         .ok()
                         .map(|s| s.to_string()),
-                    Vec::new(),
+                    Bytes::new(),
                 )
             } else {
-                (None, Vec::new())
+                (None, Bytes::new())
             }
         };
 
@@ -353,7 +353,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
         // Decrypt file data if a session token is provided and this is a write operation.
         // When auth is not required, decryption failure falls back to original data for compatibility.
-        let file_data = if let Some(token) = valid_token {
+        let file_data: Bytes = if let Some(token) = valid_token {
             if !file_data.is_empty() {
                 match decrypt_with_token(&token, &file_data) {
                     Ok(decrypted) => {
@@ -363,7 +363,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                             &log_id,
                             decrypted.len()
                         );
-                        decrypted
+                        Bytes::from(decrypted)
                     }
                     Err(e) => {
                         event!(
@@ -406,7 +406,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
         order_pkg.content = Content {
             flags: message.flags,
-            identifier: message.payload.identifier,
+            identifier: message.payload.identifier.clone(),
             data: file_data,
         };
 
@@ -488,9 +488,9 @@ pub async fn run_advanced_server(addr: &str) {
 
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
-        Err(_) => {
-            event!(Level::ERROR, "Failed to bind to address {}", addr);
-            panic!("Failed to bind to address");
+        Err(err) => {
+            event!(Level::ERROR, "Failed to bind to address {}: {}", addr, err);
+            return;
         }
     };
 

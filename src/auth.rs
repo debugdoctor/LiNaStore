@@ -35,6 +35,7 @@
 //! - When `LINASTORE_AUTH_REQUIRED` is not set, authentication is disabled (open access mode)
 
 use crate::db::DbConnection;
+use crate::error::{err_msg, Result};
 use crate::vars::EnvVar;
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -56,8 +57,8 @@ use uuid::Uuid;
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)` - The decrypted data
-/// * `Err(anyhow::Error)` - Decryption error
-pub fn decrypt_with_token(token: &str, encrypted_data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+/// * `Err(Error)` - Decryption error
+pub fn decrypt_with_token(token: &str, encrypted_data: &[u8]) -> Result<Vec<u8>> {
     // Derive a 256-bit key from the token using SHA-256
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -69,7 +70,7 @@ pub fn decrypt_with_token(token: &str, encrypted_data: &[u8]) -> Result<Vec<u8>,
     // Extract nonce (first 12 bytes) and ciphertext
     const NONCE_SIZE: usize = 12; // 96 bits for AES-GCM
     if encrypted_data.len() < NONCE_SIZE {
-        return Err(anyhow::anyhow!("Encrypted data is too short"));
+        return Err(err_msg("Encrypted data is too short"));
     }
 
     let nonce = Nonce::from_slice(&encrypted_data[..NONCE_SIZE]);
@@ -78,7 +79,7 @@ pub fn decrypt_with_token(token: &str, encrypted_data: &[u8]) -> Result<Vec<u8>,
     // Decrypt the data
     let result = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+        .map_err(|e| err_msg(format!("Decryption failed: {}", e)))?;
 
     Ok(result)
 }
@@ -182,7 +183,7 @@ impl AuthManager {
     }
 
     /// Create a new session and store it in the database
-    pub async fn create_session(&self, user_id: &str) -> Result<Session, anyhow::Error> {
+    pub async fn create_session(&self, user_id: &str) -> Result<Session> {
         let token = Uuid::new_v4().to_string();
         let session = Session::new(
             token,
@@ -206,7 +207,7 @@ impl AuthManager {
                     now,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to insert session: {}", e))?;
+                .map_err(|e| err_msg(format!("Failed to insert session: {}", e)))?;
         }
 
         Ok(session)
@@ -288,7 +289,7 @@ impl AuthManager {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<(String, u64), HandshakeStatus> {
+    ) -> std::result::Result<(String, u64), HandshakeStatus> {
         if !self.is_password_enabled() {
             return Err(HandshakeStatus::AuthDisabled);
         }
@@ -353,7 +354,7 @@ pub fn init_auth_manager(db_conn: Option<Arc<DbConnection>>) -> Arc<AuthManager>
 /// This function checks if password protection is enabled via LINASTORE_AUTH_REQUIRED,
 /// and if so, creates an admin user using LINASTORE_ADMIN_USER and LINASTORE_ADMIN_PASSWORD
 /// environment variables. The admin user is only created if it doesn't already exist.
-pub async fn init_admin_user(db_conn: &Arc<DbConnection>) -> Result<(), anyhow::Error> {
+pub async fn init_admin_user(db_conn: &Arc<DbConnection>) -> Result<()> {
     let env_vars = EnvVar::get_instance();
 
     // Check if password protection is enabled

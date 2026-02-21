@@ -84,19 +84,25 @@ static std::vector<uint8_t> aes256gcm_encrypt_with_token(const std::string &toke
     return out;
 }
 
+// Optimized: write directly to buffer without loop
+inline void write_le32(uint8_t* buf, uint32_t value) {
+    buf[0] = value & 0xFF;
+    buf[1] = (value >> 8) & 0xFF;
+    buf[2] = (value >> 16) & 0xFF;
+    buf[3] = (value >> 24) & 0xFF;
+}
+
 template <typename T>
 std::vector<T> to_vector(uint64_t value, uint8_t length, bool little_endian)
 {
     std::vector<T> result(length);
-    for (uint8_t i = 0; i < length; ++i)
-    {
-        if (little_endian)
-        {
-            result[i] = (value >> (i * 8)) & 0xFF;
+    if (little_endian) {
+        for (uint8_t i = 0; i < length; ++i) {
+            result[i] = static_cast<T>((value >> (i * 8)) & 0xFF);
         }
-        else
-        {
-            result[length - 1 - i] = (value >> (i * 8)) & 0xFF;
+    } else {
+        for (uint8_t i = 0; i < length; ++i) {
+            result[length - 1 - i] = static_cast<T>((value >> (i * 8)) & 0xFF);
         }
     }
     return result;
@@ -227,7 +233,7 @@ LiNaClient::LiNaClient(std::string address, int port, bool auto_refresh, uint32_
 LiNaClient::~LiNaClient()
 {
     disconnect();
-    clearCachedCredentials();
+    linaClearCachedCredentials();
 }
 
 bool LiNaClient::connect()
@@ -278,10 +284,10 @@ bool LiNaClient::disconnect()
     return true; // Already disconnected
 }
 
-bool LiNaClient::uploadFile(std::string name, std::vector<char> data, uint8_t flags)
+bool LiNaClient::linaUploadFile(std::string name, std::vector<char> data, uint8_t flags)
 {
     // Refresh token if needed before operation
-    refreshTokenIfNeeded();
+    linaRefreshTokenIfNeeded();
 
     // Name validation
     if (name.empty())
@@ -300,47 +306,55 @@ bool LiNaClient::uploadFile(std::string name, std::vector<char> data, uint8_t fl
         throw LiNaClientException("File name exceeds maximum length");
     }
 
-    uint8_t ilen = name.length();
-    std::vector<uint8_t> identifier(name.begin(), name.end());
+    uint8_t ilen = static_cast<uint8_t>(name.length());
+    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(name.data());
 
+    // Build payload data
     std::vector<uint8_t> payload_data;
+    std::vector<uint8_t> encrypted_data;
+    
     if (!session_token.empty())
     {
         std::vector<uint8_t> plaintext(data.begin(), data.end());
-        std::vector<uint8_t> encrypted = aes256gcm_encrypt_with_token(session_token, plaintext);
-
-        payload_data.reserve(session_token.size() + 1 + encrypted.size());
+        encrypted_data = aes256gcm_encrypt_with_token(session_token, plaintext);
+        
+        payload_data.reserve(session_token.size() + 1 + encrypted_data.size());
         payload_data.insert(payload_data.end(), session_token.begin(), session_token.end());
         payload_data.push_back(0);
-        payload_data.insert(payload_data.end(), encrypted.begin(), encrypted.end());
+        payload_data.insert(payload_data.end(), encrypted_data.begin(), encrypted_data.end());
     }
     else
     {
         payload_data.assign(data.begin(), data.end());
     }
 
-    uint32_t dlen = payload_data.size();
-    std::vector<uint8_t> dlen_buf = to_vector<uint8_t>(dlen, 4);
+    uint32_t dlen = static_cast<uint32_t>(payload_data.size());
+    uint8_t dlen_buf[4];
+    write_le32(dlen_buf, dlen);
 
     CRC32 crc32 = CRC32();
-    crc32.update(std::vector<uint8_t>{ilen});
-    crc32.update(identifier);
-    crc32.update(dlen_buf);
-    crc32.update(payload_data);
+    crc32.update(&ilen, 1);
+    crc32.update(identifier_ptr, ilen);
+    crc32.update(dlen_buf, 4);
+    crc32.update(payload_data.data(), payload_data.size());
 
-    std::vector<uint8_t> checksum = to_vector<uint8_t>(crc32.finalize(), 4);
+    uint8_t checksum_buf[4];
+    write_le32(checksum_buf, crc32.finalize());
 
     // Connect to LiNa server
     connect();
 
     try
     {
+        // Pre-allocate send buffers (6 buffers needed)
         std::vector<std::pair<const void *, size_t>> send_buffers;
-        send_buffers.push_back({&flags, 1});                            // flags
-        send_buffers.push_back({&ilen, 1});                             // ilen
-        send_buffers.push_back({identifier.data(), identifier.size()}); // identifier
-        send_buffers.push_back({dlen_buf.data(), dlen_buf.size()});     // dlen
-        send_buffers.push_back({checksum.data(), checksum.size()});     // checksum
+        send_buffers.reserve(6);
+        
+        send_buffers.push_back({&flags, 1});                          // flags
+        send_buffers.push_back({&ilen, 1});                           // ilen
+        send_buffers.push_back({identifier_ptr, ilen});               // identifier
+        send_buffers.push_back({dlen_buf, 4});                        // dlen
+        send_buffers.push_back({checksum_buf, 4});                    // checksum
         send_buffers.push_back({payload_data.data(), payload_data.size()}); // data
 
         check_sendv(send_buffers, "file upload data");
@@ -366,10 +380,10 @@ bool LiNaClient::uploadFile(std::string name, std::vector<char> data, uint8_t fl
     }
 }
 
-std::vector<char> LiNaClient::downloadFile(std::string name)
+std::vector<char> LiNaClient::linaDownloadFile(std::string name)
 {
     // Refresh token if needed before operation
-    refreshTokenIfNeeded();
+    linaRefreshTokenIfNeeded();
 
     if (name.empty())
     {
@@ -381,8 +395,8 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
         throw LiNaClientException("File name exceeds maximum length");
     }
 
-    uint8_t ilen = name.length();
-    std::vector<uint8_t> identifier(name.begin(), name.end());
+    uint8_t ilen = static_cast<uint8_t>(name.length());
+    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(name.data());
 
     std::vector<uint8_t> payload_data;
     if (!session_token.empty())
@@ -390,16 +404,18 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
         payload_data.assign(session_token.begin(), session_token.end());
     }
 
-    uint32_t dlen = payload_data.size();
-    std::vector<uint8_t> dlen_buf = to_vector<uint8_t>(dlen, 4);
+    uint32_t dlen = static_cast<uint32_t>(payload_data.size());
+    uint8_t dlen_buf[4];
+    write_le32(dlen_buf, dlen);
 
     CRC32 crc32_req = CRC32();
-    crc32_req.update(std::vector<uint8_t>{ilen});
-    crc32_req.update(identifier);
-    crc32_req.update(dlen_buf);
-    crc32_req.update(payload_data);
+    crc32_req.update(&ilen, 1);
+    crc32_req.update(identifier_ptr, ilen);
+    crc32_req.update(dlen_buf, 4);
+    crc32_req.update(payload_data.data(), payload_data.size());
 
-    std::vector<uint8_t> checksum = to_vector<uint8_t>(crc32_req.finalize(), 4);
+    uint8_t checksum_buf[4];
+    write_le32(checksum_buf, crc32_req.finalize());
 
     connect();
 
@@ -407,11 +423,12 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
     {
         uint8_t flags = LINA_READ;
         std::vector<std::pair<const void *, size_t>> send_buffers;
-        send_buffers.push_back({&flags, 1});                            // flags
-        send_buffers.push_back({&ilen, 1});                             // ilen
-        send_buffers.push_back({identifier.data(), identifier.size()}); // identifier
-        send_buffers.push_back({dlen_buf.data(), dlen_buf.size()});     // dlen
-        send_buffers.push_back({checksum.data(), checksum.size()});     // checksum
+        send_buffers.reserve(6);
+        send_buffers.push_back({&flags, 1});                      // flags
+        send_buffers.push_back({&ilen, 1});                       // ilen
+        send_buffers.push_back({identifier_ptr, ilen});           // identifier
+        send_buffers.push_back({dlen_buf, 4});                    // dlen
+        send_buffers.push_back({checksum_buf, 4});                // checksum
         if (!payload_data.empty())
         {
             send_buffers.push_back({payload_data.data(), payload_data.size()}); // data (token)
@@ -435,12 +452,12 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
         uint16_t p = 1; // Skip the flag byte
         uint8_t ilen_recv = header_buf[p];
         p += 1;
-        std::vector<uint8_t> identifier_recv(header_buf.begin() + p, header_buf.begin() + p + ilen_recv);
+        const uint8_t* identifier_recv_ptr = reinterpret_cast<const uint8_t*>(header_buf.data() + p);
         p += ilen_recv;
-        std::vector<uint8_t> dlen_recv_buf(header_buf.begin() + p, header_buf.begin() + p + 4);
-        uint32_t dlen_recv = to_long(dlen_recv_buf, 4);
+        const uint8_t* dlen_recv_ptr = reinterpret_cast<const uint8_t*>(header_buf.data() + p);
+        uint32_t dlen_recv = to_long(std::vector<uint8_t>(dlen_recv_ptr, dlen_recv_ptr + 4), 4);
         p += 4;
-        std::vector<uint8_t> checksum_recv(header_buf.begin() + p, header_buf.begin() + p + 4);
+        const uint8_t* checksum_recv_ptr = reinterpret_cast<const uint8_t*>(header_buf.data() + p);
 
         if (dlen_recv > 0)
         {
@@ -451,13 +468,12 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
             disconnect();
 
             CRC32 crc32_resp = CRC32();
-            crc32_resp.update(std::vector<uint8_t>{ilen_recv});
-            crc32_resp.update(identifier_recv);
-            crc32_resp.update(dlen_recv_buf);
-            std::vector<uint8_t> data_u8(data_recv.begin(), data_recv.end());
-            crc32_resp.update(data_u8);
+            crc32_resp.update(&ilen_recv, 1);
+            crc32_resp.update(identifier_recv_ptr, ilen_recv);
+            crc32_resp.update(dlen_recv_ptr, 4);
+            crc32_resp.update(reinterpret_cast<const uint8_t*>(data_recv.data()), data_recv.size());
 
-            if (crc32_resp.finalize() != to_long(checksum_recv, 4))
+            if (crc32_resp.finalize() != to_long(std::vector<uint8_t>(checksum_recv_ptr, checksum_recv_ptr + 4), 4))
             {
                 std::ostringstream oss;
                 oss << "CRC32 checksum mismatch for file: " << name;
@@ -479,10 +495,10 @@ std::vector<char> LiNaClient::downloadFile(std::string name)
     }
 }
 
-bool LiNaClient::deleteFile(std::string name)
+bool LiNaClient::linaDeleteFile(std::string name)
 {
     // Refresh token if needed before operation
-    refreshTokenIfNeeded();
+    linaRefreshTokenIfNeeded();
 
     if (name.empty())
     {
@@ -496,8 +512,8 @@ bool LiNaClient::deleteFile(std::string name)
         throw LiNaClientException("File name exceeds maximum length");
     }
 
-    uint8_t ilen = name.length();
-    std::vector<uint8_t> identifier(name.begin(), name.end());
+    uint8_t ilen = static_cast<uint8_t>(name.length());
+    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(name.data());
 
     std::vector<uint8_t> payload_data;
     if (!session_token.empty())
@@ -505,27 +521,30 @@ bool LiNaClient::deleteFile(std::string name)
         payload_data.assign(session_token.begin(), session_token.end());
     }
 
-    uint32_t dlen = payload_data.size();
-    std::vector<uint8_t> dlen_buf = to_vector<uint8_t>(dlen, 4);
+    uint32_t dlen = static_cast<uint32_t>(payload_data.size());
+    uint8_t dlen_buf[4];
+    write_le32(dlen_buf, dlen);
 
     CRC32 crc32 = CRC32();
-    crc32.update(std::vector<uint8_t>{ilen});
-    crc32.update(identifier);
-    crc32.update(dlen_buf);
-    crc32.update(payload_data);
+    crc32.update(&ilen, 1);
+    crc32.update(identifier_ptr, ilen);
+    crc32.update(dlen_buf, 4);
+    crc32.update(payload_data.data(), payload_data.size());
 
-    std::vector<uint8_t> checksum = to_vector<uint8_t>(crc32.finalize(), 4);
+    uint8_t checksum_buf[4];
+    write_le32(checksum_buf, crc32.finalize());
 
     connect();
 
     try
     {
         std::vector<std::pair<const void *, size_t>> send_buffers;
-        send_buffers.push_back({&flags, 1});                            // flags
-        send_buffers.push_back({&ilen, 1});                             // ilen
-        send_buffers.push_back({identifier.data(), identifier.size()}); // identifier
-        send_buffers.push_back({dlen_buf.data(), dlen_buf.size()});     // dlen
-        send_buffers.push_back({checksum.data(), checksum.size()});     // checksum
+        send_buffers.reserve(6);
+        send_buffers.push_back({&flags, 1});                      // flags
+        send_buffers.push_back({&ilen, 1});                       // ilen
+        send_buffers.push_back({identifier_ptr, ilen});           // identifier
+        send_buffers.push_back({dlen_buf, 4});                    // dlen
+        send_buffers.push_back({checksum_buf, 4});                // checksum
         if (!payload_data.empty())
         {
             send_buffers.push_back({payload_data.data(), payload_data.size()}); // data (token)
@@ -555,14 +574,14 @@ bool LiNaClient::deleteFile(std::string name)
     }
 }
 
-HandshakeResult LiNaClient::handshake(std::string username, std::string password, bool cache_credentials)
+HandshakeResult LiNaClient::linaHandshake(std::string username, std::string password, bool cache_credentials)
 {
     HandshakeResult result = {.status = false, .token = "", .expires_at = 0, .message = ""};
 
     // Cache credentials if requested
     if (cache_credentials)
     {
-        this->cacheCredentials(username, password);
+        this->linaCacheCredentials(username, password);
     }
 
     // Validate inputs
@@ -588,33 +607,36 @@ HandshakeResult LiNaClient::handshake(std::string username, std::string password
     try
     {
         uint8_t flags = LINA_AUTH;
-        uint8_t ilen = username.length();
-        std::vector<uint8_t> identifier(username.begin(), username.end());
+        uint8_t ilen = static_cast<uint8_t>(username.length());
+        const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(username.data());
 
         // Build data: password + '\0' (null-terminated)
         std::vector<uint8_t> password_data(password.begin(), password.end());
         password_data.push_back(0); // Null terminator
-        uint32_t dlen = password_data.size();
-        std::vector<uint8_t> dlen_buf = to_vector<uint8_t>(dlen, 4);
+        uint32_t dlen = static_cast<uint32_t>(password_data.size());
+        uint8_t dlen_buf[4];
+        write_le32(dlen_buf, dlen);
 
         // Calculate CRC32 checksum
         CRC32 crc32 = CRC32();
-        crc32.update(std::vector<uint8_t>{ilen});
-        crc32.update(identifier);
-        crc32.update(dlen_buf);
-        crc32.update(password_data);
-        std::vector<uint8_t> checksum = to_vector<uint8_t>(crc32.finalize(), 4);
+        crc32.update(&ilen, 1);
+        crc32.update(identifier_ptr, ilen);
+        crc32.update(dlen_buf, 4);
+        crc32.update(password_data.data(), password_data.size());
+        uint8_t checksum_buf[4];
+        write_le32(checksum_buf, crc32.finalize());
 
         // Connect to LiNa server
         connect();
 
         // Send handshake request
         std::vector<std::pair<const void *, size_t>> send_buffers;
-        send_buffers.push_back({&flags, 1});                                  // flags
-        send_buffers.push_back({&ilen, 1});                                   // ilen
-        send_buffers.push_back({identifier.data(), identifier.size()});       // identifier (username)
-        send_buffers.push_back({dlen_buf.data(), dlen_buf.size()});           // dlen
-        send_buffers.push_back({checksum.data(), checksum.size()});           // checksum
+        send_buffers.reserve(6);
+        send_buffers.push_back({&flags, 1});                            // flags
+        send_buffers.push_back({&ilen, 1});                             // ilen
+        send_buffers.push_back({identifier_ptr, ilen});                 // identifier (username)
+        send_buffers.push_back({dlen_buf, 4});                          // dlen
+        send_buffers.push_back({checksum_buf, 4});                      // checksum
         send_buffers.push_back({password_data.data(), password_data.size()}); // data (password\0)
 
         check_sendv(send_buffers, "handshake request");
@@ -627,8 +649,11 @@ HandshakeResult LiNaClient::handshake(std::string username, std::string password
         // Parse response header: status(1) + ilen(1) + dlen(4) + checksum(4)
         uint8_t status = header_buf[0];
         // uint8_t ilen_recv = header_buf[1];
-        std::vector<uint8_t> dlen_recv_buf(header_buf.begin() + 2, header_buf.begin() + 6);
-        uint32_t dlen_recv = to_long(dlen_recv_buf, 4);
+        const uint8_t* dlen_recv_ptr = reinterpret_cast<const uint8_t*>(header_buf.data() + 2);
+        uint32_t dlen_recv = static_cast<uint32_t>(dlen_recv_ptr[0]) |
+                             (static_cast<uint32_t>(dlen_recv_ptr[1]) << 8) |
+                             (static_cast<uint32_t>(dlen_recv_ptr[2]) << 16) |
+                             (static_cast<uint32_t>(dlen_recv_ptr[3]) << 24);
         // Skip checksum (bytes 6-9)
 
         // Check for error status

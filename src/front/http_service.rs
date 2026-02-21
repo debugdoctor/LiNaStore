@@ -6,7 +6,8 @@ use crate::{
     shutdown::Shutdown,
 };
 use http_body_util::Full;
-use hyper::{Method, Request, Response, body::Bytes, server::conn::http1, service::service_fn};
+use hyper::{Method, Request, Response, body::Bytes as HyperBytes, server::conn::http1, service::service_fn};
+use bytes::Bytes;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tracing::{Level, event, instrument};
@@ -40,18 +41,24 @@ async fn handle_http(
     if req.method() != &Method::GET {
         return Ok(Response::builder()
             .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
-            .body(Full::new(Bytes::from("Method Not Allowed")))?);
+            .body(Full::new(HyperBytes::from("Method Not Allowed")))?);
     }
 
     let log_id = Uuid::new_v4().to_string();
 
     let uri = req.uri().to_string();
-    let path_vec: Vec<&str> = uri.strip_prefix("/").unwrap_or(&uri).split('/').collect();
+    let path = uri.strip_prefix('/').unwrap_or(&uri);
+    if path.is_empty() {
+        return Ok(Response::builder()
+            .status(hyper::StatusCode::OK)
+            .body(Full::new(HyperBytes::from("LiNastore is running")))?);
+    }
+    let path_vec: Vec<&str> = path.split('/').collect();
     if path_vec.len() != 1 {
         event!(Level::ERROR, "Invalid URL: {}", uri);
         return Ok(Response::builder()
             .status(hyper::StatusCode::BAD_REQUEST)
-            .body(Full::new(Bytes::from("Invalid URL")))?);
+            .body(Full::new(HyperBytes::from("Invalid URL")))?);
     }
 
     // Create package for the queue
@@ -61,8 +68,8 @@ async fn handle_http(
     package.behavior = Behavior::GetFile;
 
     let name_bytes = path_vec[0].as_bytes();
-    // Set identifier directly as Vec<u8>
-    package.content.identifier = name_bytes.to_vec();
+    // Set identifier directly as Bytes
+    package.content.identifier = Bytes::copy_from_slice(name_bytes);
     package.behavior = Behavior::GetFile;
 
     // Register waiter before sending to queue
@@ -73,7 +80,7 @@ async fn handle_http(
             event!(Level::ERROR, "Failed to register waiter for request");
             return Ok(Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("Failed to process request")))?);
+                .body(Full::new(HyperBytes::from("Failed to process request")))?);
         }
     };
 
@@ -83,7 +90,7 @@ async fn handle_http(
         con_queue.unregister_waiter(uni_id);
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(Bytes::from("Failed to process request")))?);
+            .body(Full::new(HyperBytes::from("Failed to process request")))?);
     }
 
     // Wait for response via channel with timeout
@@ -139,7 +146,7 @@ pub async fn run_http_server(addr: &str) {
         Ok(listener) => listener,
         Err(_) => {
             event!(Level::ERROR, "Failed to bind to address {}", addr);
-            panic!("Failed to bind to address");
+            return;
         }
     };
 
