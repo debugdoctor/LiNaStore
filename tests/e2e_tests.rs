@@ -3,12 +3,14 @@
 
 use serial_test::serial;
 
+use bytes::Bytes;
+use crc32fast::Hasher as Crc32Hasher;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -17,6 +19,8 @@ const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const STRESS_RETRY_LIMIT: usize = 3;
+const STRESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 fn pick_unused_port() -> io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -41,6 +45,124 @@ fn http_client() -> reqwest::blocking::Client {
         .timeout(HTTP_REQUEST_TIMEOUT)
         .build()
         .expect("Failed to build HTTP client")
+}
+
+fn lina_checksum(identifier: &[u8], data: &[u8]) -> u32 {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&[identifier.len() as u8]);
+    hasher.update(identifier);
+    hasher.update(&(data.len() as u32).to_le_bytes());
+    hasher.update(data);
+    hasher.finalize()
+}
+
+fn build_lina_request(flags: u8, identifier: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 1 + identifier.len() + 4 + 4 + data.len());
+    payload.push(flags);
+    payload.push(identifier.len() as u8);
+    payload.extend_from_slice(identifier);
+    payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&lina_checksum(identifier, data).to_le_bytes());
+    payload.extend_from_slice(data);
+    payload
+}
+
+fn send_advanced_request(
+    addr: SocketAddr,
+    flags: u8,
+    identifier: &[u8],
+    data: &[u8],
+) -> io::Result<(u8, Bytes)> {
+    let mut stream = TcpStream::connect_timeout(&addr, CLIENT_CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(HTTP_REQUEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_REQUEST_TIMEOUT))?;
+
+    let request = build_lina_request(flags, identifier, data);
+    stream.write_all(&request)?;
+
+    let mut status = [0u8; 1];
+    stream.read_exact(&mut status)?;
+
+    let mut ilen = [0u8; 1];
+    stream.read_exact(&mut ilen)?;
+    let mut identifier_buf = vec![0u8; ilen[0] as usize];
+    stream.read_exact(&mut identifier_buf)?;
+
+    let mut dlen_buf = [0u8; 4];
+    stream.read_exact(&mut dlen_buf)?;
+    let dlen = u32::from_le_bytes(dlen_buf) as usize;
+
+    let mut checksum_buf = [0u8; 4];
+    stream.read_exact(&mut checksum_buf)?;
+    let expected_checksum = u32::from_le_bytes(checksum_buf);
+
+    let mut data_buf = vec![0u8; dlen];
+    stream.read_exact(&mut data_buf)?;
+
+    let actual_checksum = lina_checksum(&identifier_buf, &data_buf);
+    if actual_checksum != expected_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Checksum mismatch: expected {}, got {}",
+                expected_checksum, actual_checksum
+            ),
+        ));
+    }
+
+    Ok((status[0], Bytes::from(data_buf)))
+}
+
+fn send_advanced_request_with_retry(
+    addr: SocketAddr,
+    flags: u8,
+    identifier: &[u8],
+    data: &[u8],
+) -> io::Result<(u8, Bytes)> {
+    let mut last_error: Option<io::Error> = None;
+
+    for attempt in 0..STRESS_RETRY_LIMIT {
+        match send_advanced_request(addr, flags, identifier, data) {
+            Ok((127, _)) if attempt + 1 < STRESS_RETRY_LIMIT => {
+                thread::sleep(STRESS_RETRY_DELAY);
+            }
+            Ok(result) => return Ok(result),
+            Err(err) if attempt + 1 < STRESS_RETRY_LIMIT => {
+                last_error = Some(err);
+                thread::sleep(STRESS_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::other("advanced request retry exhausted")))
+}
+
+fn http_get_with_retry(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<bytes::Bytes, String> {
+    let mut last_error = None;
+
+    for attempt in 0..STRESS_RETRY_LIMIT {
+        match client.get(url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                return resp.bytes().map_err(|err| err.to_string());
+            }
+            Ok(resp) if resp.status().is_server_error() && attempt + 1 < STRESS_RETRY_LIMIT => {
+                last_error = Some(format!("server error {}", resp.status()));
+                thread::sleep(STRESS_RETRY_DELAY);
+            }
+            Ok(resp) => return Err(format!("unexpected status {}", resp.status())),
+            Err(err) if attempt + 1 < STRESS_RETRY_LIMIT => {
+                last_error = Some(err.to_string());
+                thread::sleep(STRESS_RETRY_DELAY);
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "HTTP retry exhausted".to_string()))
 }
 
 // Get the project directory
@@ -862,7 +984,6 @@ fn test_full_workflow() {
 
 // Performance Tests
 #[test]
-#[ignore] // Run manually for performance testing
 fn test_bulk_operations() {
     let env = TestEnvironment::new().expect("Failed to create test environment");
 
@@ -899,4 +1020,158 @@ fn test_bulk_operations() {
 
     let list_duration = start.elapsed();
     println!("Time to list 100 files: {:?}", list_duration);
+}
+
+#[test]
+#[serial]
+fn test_http_concurrent_get_stress() {
+    let mut env = TestEnvironment::new().expect("Failed to create test environment");
+    let source_file = env
+        .create_test_file("stress-read.txt", &vec![b'x'; 8 * 1024])
+        .expect("Failed to create stress source file");
+
+    let put_output = Command::new(linastore_binary())
+        .args(["storage", "put", source_file.to_str().unwrap()])
+        .current_dir(&env.storage_dir)
+        .output()
+        .expect("Failed to preload stress file");
+    assert!(
+        put_output.status.success(),
+        "Failed to preload stress file: {:?}",
+        put_output
+    );
+
+    env.start_server().expect("Failed to start server");
+
+    const THREADS: usize = 4;
+    const REQUESTS_PER_THREAD: usize = 8;
+    let start_gate = Arc::new(std::sync::Barrier::new(THREADS));
+    let total_start = std::time::Instant::now();
+
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let barrier = Arc::clone(&start_gate);
+        let client = http_client();
+        let http_port = env.http_port;
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let mut successes = 0usize;
+            let mut failures = Vec::new();
+
+            for _ in 0..REQUESTS_PER_THREAD {
+                let url = format!("http://127.0.0.1:{}/stress-read.txt", http_port);
+                match http_get_with_retry(&client, &url) {
+                    Ok(body) if body.len() == 8 * 1024 => {
+                        successes += 1;
+                    }
+                    Ok(body) => failures.push(format!("unexpected body size {}", body.len())),
+                    Err(err) => failures.push(err),
+                }
+            }
+
+            (successes, failures)
+        }));
+    }
+
+    let mut total_successes = 0usize;
+    let mut failures = Vec::new();
+    for handle in handles {
+        let (successes, mut thread_failures) = handle.join().expect("Stress worker panicked");
+        total_successes += successes;
+        failures.append(&mut thread_failures);
+    }
+
+    let elapsed = total_start.elapsed();
+    let expected = THREADS * REQUESTS_PER_THREAD;
+    let success_rate = total_successes as f64 / expected as f64;
+    println!(
+        "HTTP stress completed: {} / {} successful GETs in {:?} ({:.2} req/s, {:.1}% success)",
+        total_successes,
+        expected,
+        elapsed,
+        total_successes as f64 / elapsed.as_secs_f64(),
+        success_rate * 100.0
+    );
+
+    assert!(
+        success_rate >= 0.75,
+        "HTTP stress success rate too low: {:.1}% with failures {:?}",
+        success_rate * 100.0,
+        failures
+    );
+}
+
+#[test]
+#[serial]
+fn test_advanced_concurrent_put_stress() {
+    let mut env = TestEnvironment::new().expect("Failed to create test environment");
+    env.start_server().expect("Failed to start server");
+
+    const THREADS: usize = 8;
+    const REQUESTS_PER_THREAD: usize = 25;
+    let start_gate = Arc::new(std::sync::Barrier::new(THREADS));
+    let addr = SocketAddr::from(([127, 0, 0, 1], env.lina_port));
+    let total_start = std::time::Instant::now();
+
+    let mut handles = Vec::with_capacity(THREADS);
+    for thread_idx in 0..THREADS {
+        let barrier = Arc::clone(&start_gate);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let mut successes = 0usize;
+            let mut failures = Vec::new();
+
+            for req_idx in 0..REQUESTS_PER_THREAD {
+                let file_name = format!("stress-put-{}-{}.bin", thread_idx, req_idx);
+                let body = vec![(thread_idx + req_idx) as u8; 32 * 1024];
+                match send_advanced_request_with_retry(addr, 0x80, file_name.as_bytes(), &body) {
+                    Ok((0, _)) => successes += 1,
+                    Ok((status, _)) => failures.push(format!(
+                        "{} returned non-success status {}",
+                        file_name, status
+                    )),
+                    Err(err) => failures.push(format!("{} failed: {}", file_name, err)),
+                }
+            }
+
+            (successes, failures)
+        }));
+    }
+
+    let mut total_successes = 0usize;
+    let mut failures = Vec::new();
+    for handle in handles {
+        let (successes, mut thread_failures) = handle.join().expect("Stress worker panicked");
+        total_successes += successes;
+        failures.append(&mut thread_failures);
+    }
+
+    let elapsed = total_start.elapsed();
+    let expected = THREADS * REQUESTS_PER_THREAD;
+    println!(
+        "Advanced stress completed: {} successful PUTs in {:?} ({:.2} req/s)",
+        total_successes,
+        elapsed,
+        total_successes as f64 / elapsed.as_secs_f64()
+    );
+
+    assert!(
+        failures.is_empty(),
+        "Advanced stress encountered failures: {:?}",
+        failures
+    );
+    assert_eq!(total_successes, expected, "Some stress PUT requests failed");
+
+    let list_output = Command::new(linastore_binary())
+        .args(["storage", "list", "--num", expected.to_string().as_str()])
+        .current_dir(&env.storage_dir)
+        .output()
+        .expect("Failed to list stored stress files");
+    assert!(list_output.status.success(), "Failed to list stress results");
+
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    assert!(
+        stdout.contains("stress-put-0-0.bin"),
+        "Expected stored stress files to be listed"
+    );
 }

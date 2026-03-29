@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use sqlx::{Pool, Sqlite, Row};
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use std::str::FromStr;
 use std::path::Path;
 use uuid::Uuid;
@@ -58,6 +58,7 @@ pub struct Dao {
     pool: Pool<Sqlite>,
 }
 
+// Initialization and schema management.
 impl Dao {
     pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         // Directory creation
@@ -72,7 +73,10 @@ impl Dao {
         // Create connection pool (ensure the database file exists)
         let options = SqliteConnectOptions::from_str(&db_url)
             .context("Failed to parse SQLite connection URL")?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = sqlx::SqlitePool::connect_with(options)
             .await
@@ -93,8 +97,10 @@ impl Dao {
             .context("Failed to initialize database schema")?;
         Ok(())
     }
+}
 
-    // Link operations
+// Link CRUD operations.
+impl Dao {
     pub async fn insert_link(
         &self,
         name: &str,
@@ -102,10 +108,20 @@ impl Dao {
         source_id: &str,
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
+        self.insert_link_with_id(&id, name, ext, source_id).await
+    }
+
+    pub async fn insert_link_with_id(
+        &self,
+        id: &str,
+        name: &str,
+        ext: &str,
+        source_id: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO link (id, name, ext, source_id) VALUES (?1, ?2, ?3, ?4)",
         )
-        .bind(&id)
+        .bind(id)
         .bind(name)
         .bind(ext)
         .bind(source_id)
@@ -198,8 +214,10 @@ impl Dao {
             .context("Failed to delete link")?;
         Ok(())
     }
+}
 
-    // Source operations
+// Source CRUD operations.
+impl Dao {
     pub async fn insert_source(
         &self,
         id: &str,

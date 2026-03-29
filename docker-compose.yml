@@ -7,6 +7,9 @@ services:
       - .env
     environment:
       - RUST_LOG=info
+      # Enable auth with a value in .env.
+      # - LINASTORE_AUTH_REQUIRED=1
+      # - LINASTORE_ADMIN_PASSWORD=${LINASTORE_ADMIN_PASSWORD}
     volumes:
       - ./linadata:/app/linadata
       # Mount local directory for development (uncomment for development)

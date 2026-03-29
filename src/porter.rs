@@ -1,7 +1,8 @@
 use bytes::Bytes;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use linabase::service::StoreManager;
+use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::{Level, event, instrument};
 
 use crate::{
@@ -12,6 +13,14 @@ use crate::{
 
 // Error logging interval to avoid log flooding
 const ERROR_LOG_INTERVAL: u32 = 100;
+const MAX_PORTER_CONCURRENCY: usize = 8;
+
+fn porter_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, MAX_PORTER_CONCURRENCY)
+}
 
 #[instrument(skip_all)]
 pub async fn porter(root: &str) {
@@ -21,59 +30,36 @@ pub async fn porter(root: &str) {
     );
 
     let store_manager = match StoreManager::new(root).await {
-        Ok(store_manager) => store_manager,
+        Ok(store_manager) => Arc::new(store_manager),
         Err(e) => panic!("{}", e.to_string()),
     };
 
     let mut error_count = 0u32;
+    let concurrency_limit = porter_concurrency();
+    let in_flight_limit = Arc::new(Semaphore::new(concurrency_limit));
+    let mut workers = JoinSet::new();
+    let mut shutting_down = false;
 
     let shutdown_status = Shutdown::get_instance();
     let conveyers = ConveyQueue::get_instance();
     let mut order_notifier = conveyers.subscribe_orders();
 
     loop {
-        tokio::select! {
-            _ = shutdown_status.wait() => {
-                break;
-            }
-            changed = order_notifier.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-            }
-        }
-
-        if shutdown_status.is_shutdown() {
-            break;
-        }
-
-        // Process all available orders
-        loop {
+        while !shutting_down && workers.len() < concurrency_limit {
             match conveyers.consume_order() {
                 Ok(Some(pkg)) => {
-                    // Process single package
-                    match process_package(&pkg, &store_manager, &conveyers).await {
-                        Ok(_) => {
-                            // Successfully processed
-                        }
-                        Err(e) => {
-                            error_count += 1;
-                            // Limit error log frequency to avoid flooding
-                            if error_count % ERROR_LOG_INTERVAL == 0 {
-                                event!(
-                                    Level::ERROR,
-                                    "[porter] Failed to process package ({} errors): {}",
-                                    error_count,
-                                    e
-                                );
-                            }
-                        }
-                    }
+                    let Ok(permit) = in_flight_limit.clone().acquire_owned().await else {
+                        shutting_down = true;
+                        break;
+                    };
+                    let store_manager = Arc::clone(&store_manager);
+                    let conveyers = Arc::clone(&conveyers);
+                    workers.spawn(async move {
+                        let _permit = permit;
+                        process_package(&pkg, store_manager.as_ref(), &conveyers).await
+                    });
                 }
-                Ok(None) => {
-                    // No more orders, wait for next notification
-                    break;
-                }
+                Ok(None) => break,
                 Err(e) => {
                     error_count += 1;
                     if error_count % ERROR_LOG_INTERVAL == 0 {
@@ -84,11 +70,56 @@ pub async fn porter(root: &str) {
                             e
                         );
                     }
-                    // Brief wait on error to avoid frequent retries
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     break;
                 }
             }
+        }
+
+        if shutting_down && workers.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            _ = shutdown_status.wait(), if !shutting_down => {
+                shutting_down = true;
+            }
+            changed = order_notifier.changed(), if !shutting_down && workers.len() < concurrency_limit => {
+                if changed.is_err() {
+                    shutting_down = true;
+                }
+            }
+            Some(result) = workers.join_next(), if !workers.is_empty() => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error_count += 1;
+                        if error_count % ERROR_LOG_INTERVAL == 0 {
+                            event!(
+                                Level::ERROR,
+                                "[porter] Failed to process package ({} errors): {}",
+                                error_count,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error_count += 1;
+                        if error_count % ERROR_LOG_INTERVAL == 0 {
+                            event!(
+                                Level::ERROR,
+                                "[porter] Worker join error ({} errors): {}",
+                                error_count,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if shutdown_status.is_shutdown() {
+            shutting_down = true;
         }
     }
 }

@@ -153,7 +153,12 @@ impl AuthManager {
 
         let password_hash = if auth_required {
             let mut hasher = Sha256::new();
-            hasher.update(env.admin_password.as_bytes());
+            hasher.update(
+                env.admin_password
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
             Some(hex::encode(hasher.finalize()))
         } else {
             None
@@ -352,8 +357,8 @@ pub fn init_auth_manager(db_conn: Option<Arc<DbConnection>>) -> Arc<AuthManager>
 /// Initialize the admin user in the database if password protection is enabled
 ///
 /// This function checks if password protection is enabled via LINASTORE_AUTH_REQUIRED,
-/// and if so, creates an admin user using LINASTORE_ADMIN_USER and LINASTORE_ADMIN_PASSWORD
-/// environment variables. The admin user is only created if it doesn't already exist.
+/// and if so, creates an admin user using LINASTORE_ADMIN_USER and
+/// LINASTORE_ADMIN_PASSWORD. The admin user is only created if it doesn't already exist.
 pub async fn init_admin_user(db_conn: &Arc<DbConnection>) -> Result<()> {
     let env_vars = EnvVar::get_instance();
 
@@ -365,7 +370,10 @@ pub async fn init_admin_user(db_conn: &Arc<DbConnection>) -> Result<()> {
 
     // Get admin username and password from EnvVar
     let admin_username = &env_vars.admin_username;
-    let admin_password = &env_vars.admin_password;
+    let admin_password = env_vars
+        .admin_password
+        .as_deref()
+        .ok_or_else(|| err_msg("Missing admin password while authentication is enabled"))?;
 
     // Check if admin user already exists
     match db_conn.auth_get_user_id_by_username(admin_username).await {

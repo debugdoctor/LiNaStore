@@ -1,5 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
+use crate::error::{Result, err_msg};
 use tracing::{event, instrument};
 
 pub struct EnvVar {
@@ -9,13 +10,19 @@ pub struct EnvVar {
     pub max_payload_size: usize,
     pub auth_required: bool,
     pub admin_username: String,
-    pub admin_password: String,
+    pub admin_password: Option<String>,
     pub db_url: String,
 }
 
 static ENV: OnceLock<Arc<EnvVar>> = OnceLock::new();
 
 impl EnvVar {
+    fn read_admin_password_from_env() -> Option<String> {
+        std::env::var("LINASTORE_ADMIN_PASSWORD")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
     #[instrument(name = "EnvVar", skip_all)]
     fn initialize() -> Self {
         let ip_address = std::env::var("LINASTORE_IP").unwrap_or_else(|_| {
@@ -70,10 +77,7 @@ impl EnvVar {
                     .ok()
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "admin".to_string());
-                let admin_password = std::env::var("LINASTORE_ADMIN_PASSWORD")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| "admin123".to_string());
+                let admin_password = Self::read_admin_password_from_env();
                 (admin_username, admin_password)
             }
             false => {
@@ -81,7 +85,7 @@ impl EnvVar {
                     tracing::Level::INFO,
                     "Password protection is disabled - advanced service is open"
                 );
-                (String::new(), String::new())
+                (String::new(), None)
             }
         };
 
@@ -101,5 +105,15 @@ impl EnvVar {
 
     pub fn get_instance() -> Arc<EnvVar> {
         ENV.get_or_init(|| Arc::new(EnvVar::initialize())).clone()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.auth_required && self.admin_password.is_none() {
+            return Err(err_msg(
+                "Authentication is enabled, but no admin password was provided. Set LINASTORE_ADMIN_PASSWORD.",
+            ));
+        }
+
+        Ok(())
     }
 }
