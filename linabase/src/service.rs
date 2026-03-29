@@ -7,12 +7,17 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     result::Result,
+    sync::Arc,
 };
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::utils::BlockManager;
 
 use super::dao::{Dao, Link, Source};
 use super::utils;
+
+type BoxError = Box<dyn Error + Send + Sync>;
 
 const NANOID_MAP: [char; 62] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
@@ -21,26 +26,39 @@ const NANOID_MAP: [char; 62] = [
     'V', 'W', 'X', 'Y', 'Z',
 ];
 
+fn boxed_io_error(kind: io::ErrorKind, message: impl Into<String>) -> BoxError {
+    Box::new(io::Error::new(kind, message.into()))
+}
+
+fn dao_to_io_error(err: anyhow::Error) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
 #[derive(Debug)]
 pub struct StoreManager {
     root: PathBuf,
     dao: Dao,
     bm: BlockManager,
+    operation_lock: Arc<RwLock<()>>,
 }
 
 pub struct TidyManager {
     map_cache: HashMap<String, Vec<(PathBuf, String)>>,
 }
 
+// Constructor and query-oriented APIs.
 impl StoreManager {
-    pub async fn new<P: AsRef<Path>>(root: P) -> Result<Self, Box<dyn Error>> {
+    pub async fn new<P: AsRef<Path>>(root: P) -> Result<Self, BoxError> {
         let root_path = root.as_ref().to_path_buf(); // Convert to owning type
         fs::create_dir_all(root_path.join("linadata"))?;
 
         Ok(StoreManager {
             root: root_path.clone(), // Store owned path
-            dao: Dao::new(root_path.join("linadata").join("meta.db")).await?,
+            dao: Dao::new(root_path.join("linadata").join("meta.db"))
+                .await
+                .map_err(dao_to_io_error)?,
             bm: BlockManager::new(),
+            operation_lock: Arc::new(RwLock::new(())),
         })
     }
 
@@ -50,78 +68,36 @@ impl StoreManager {
         n: u64,
         isext: bool,
         use_regex: bool,
-    ) -> Result<Vec<Link>, Box<dyn Error>> {
-        let links = if isext {
-            self.dao.get_links_by_ext(pattern).await?
-        } else if (pattern == "" || pattern == "*") && use_regex {
-            self.dao.get_n_links(n).await?
-        } else if pattern.contains('*') && use_regex {
-            let sql_pattern = pattern.replace('*', "%");
-            self.dao.get_links_by_name(&sql_pattern, true).await?
-        } else {
-            self.dao.get_links_by_name(pattern, false).await?
-        };
-
-        Ok(links)
+    ) -> Result<Vec<Link>, BoxError> {
+        let _read_guard = self.operation_lock.read().await;
+        self.list_locked(pattern, n, isext, use_regex).await
     }
+}
 
-    pub async fn get_binary_data(&self, file_name: &str) -> Result<Bytes, Box<dyn Error>> {
+// Read and write storage APIs.
+impl StoreManager {
+    pub async fn get_binary_data(&self, file_name: &str) -> Result<Bytes, BoxError> {
         if file_name.is_empty() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "No filename provided",
-            )));
+            return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
         }
-        let links = self.dao.get_links_by_name(file_name, false).await?;
-        let link = links
-            .get(0)
-            .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;
 
-        let source = self
-            .dao
-            .get_source_by_id(&link.source_id)
-            .await?
-            .ok_or_else(|| Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found")))?;
+        let (compressed, source_size, file_bytes) = {
+            let _read_guard = self.operation_lock.read().await;
+            let links = self
+                .dao
+                .get_links_by_name(file_name, false)
+                .await
+                .map_err(dao_to_io_error)?;
+            let link = links
+                .get(0)
+                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
 
-        let source_path = self
-            .root
-            .join("linadata")
-            .join(&source.id[0..4])
-            .join(&source.id[4..6])
-            .join(&source.id);
-
-        Ok(if source.compressed {
-            Bytes::from(self.bm.decompress_all(&fs::read(&source_path)?, source.size as usize)?)
-        } else {
-            Bytes::from(fs::read(&source_path)?)
-        })
-    }
-
-    pub async fn get_and_save<P: AsRef<Path>>(
-        &self,
-        files: &Vec<String>,
-        dest: P,
-    ) -> Result<(), Box<dyn Error>> {
-        if files.is_empty() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "No files requested",
-            )));
-        }
-        // Create destination directory once
-        fs::create_dir_all(dest.as_ref())?;
-
-        for file in files {
-            let file_name = file;
-            let links = self.dao.get_links_by_name(file_name, false).await?;
-
-            let link = links.get(0).ok_or_else(|| {
-                Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
-            })?;
-
-            let source = self.dao.get_source_by_id(&link.source_id).await?.ok_or_else(|| {
-                Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
-            })?;
+            let source = self
+                .dao
+                .get_source_by_id(&link.source_id)
+                .await
+                .map_err(dao_to_io_error)?
+                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
 
             let source_path = self
                 .root
@@ -130,16 +106,40 @@ impl StoreManager {
                 .join(&source.id[4..6])
                 .join(&source.id);
 
-            let dest_path = dest.as_ref().to_path_buf().join(&link.name);
+            let file_bytes = fs::read(&source_path)?;
+            (source.compressed, source.size as usize, file_bytes)
+        };
 
-            if source.compressed {
-                let data = self
-                    .bm
-                    .decompress_all(&fs::read(&source_path)?, source.size as usize)?;
-                fs::write(&dest_path, data)?;
-            } else {
-                fs::copy(&source_path, &dest_path)?;
+        Ok(if compressed {
+            Bytes::from(self.bm.decompress_all(&file_bytes, source_size)?)
+        } else {
+            Bytes::from(file_bytes)
+        })
+    }
+
+    pub async fn get_and_save<P: AsRef<Path>>(
+        &self,
+        files: &Vec<String>,
+        dest: P,
+    ) -> Result<(), BoxError> {
+        if files.is_empty() {
+            return Err(boxed_io_error(io::ErrorKind::Other, "No files requested"));
+        }
+        let dest_root = dest.as_ref().to_path_buf();
+        fs::create_dir_all(&dest_root)?;
+
+        for file in files {
+            let data = self.get_binary_data(file).await?;
+            let file_name = Path::new(file)
+                .file_name()
+                .ok_or_else(|| {
+                    boxed_io_error(io::ErrorKind::InvalidInput, "Invalid file name for save target")
+                })?;
+            let dest_path = dest_root.join(file_name);
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
             }
+            fs::write(&dest_path, data)?;
         }
 
         Ok(())
@@ -151,112 +151,32 @@ impl StoreManager {
         input: &Bytes,
         cover: bool,
         compressed: bool,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), BoxError> {
         if file_name.is_empty() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "No filename provided",
-            )));
+            return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
         }
 
-        let links = self.dao.get_links_by_name(file_name, false).await?;
-        let data_path = self.root.join("linadata");
+        let new_hash256 = utils::get_hash256_from_binary(input);
+        let new_size = input.len() as u64;
+        let new_storage_bytes = self.encode_source_data(input, compressed)?;
+        let ext = Path::new(&file_name)
+            .extension()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("")
+            .to_string();
 
-        if links.len() > 0 {
-            let link = links.get(0).ok_or_else(|| {
-                Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
-            })?;
-
-            let hash256 = utils::get_hash256_from_binary(input);
-            let source = self.dao.get_source_by_id(&link.source_id).await?.ok_or_else(|| {
-                Box::new(io::Error::new(io::ErrorKind::NotFound, "Source not found"))
-            })?;
-
-            let new_size = input.len() as u64;
-
-            if cover {
-                // Update hash256 and source compression and size
-                self.dao.update_source(
-                    &link.source_id,
-                    &hash256,
-                    compressed,
-                    new_size,
-                    source.count,
-                ).await?;
-                let target_file = data_path
-                    .join(&link.source_id[..4])
-                    .join(&link.source_id[4..6])
-                    .join(&link.source_id);
-
-                if compressed {
-                    let data = self.bm.compress_all(input)?;
-                    fs::write(target_file, data)?;
-                } else {
-                    fs::write(target_file, input)?;
-                }
-            } else {
-                if hash256 == source.hash256 && source.compressed == compressed {
-                    return Ok(());
-                }
-
-                // 1. Source Release
-                let source_count = source
-                    .count
-                    .checked_sub(1)
-                    .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
-
-                self.release_source(&link, &source, source_count).await?;
-
-                // 2. Insert new source
-                let id = Self::file_name_gen();
-                self.dao
-                    .insert_source(&id, &hash256, compressed, new_size).await?;
-                self.dao.update_link_source_id(&link.id, &id).await?;
-                let target_file = data_path.join(&id[..4]).join(&id[4..6]).join(&id);
-                let _ = fs::write(target_file, input)?;
-            }
-        } else {
-            // Check hash256
-            let hash256 = utils::get_hash256_from_binary(input);
-            let ext = Path::new(&file_name)
-                .extension()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or("")
-                .to_string();
-
-            // If hash256 exists, count + 1
-            if let Some(source) = self.dao.get_source_by_hash256(&hash256).await? {
-                self.dao.insert_link(file_name, &ext, &source.id).await?;
-                // Update source count
-                return Ok(self.dao.update_source(
-                    &source.id,
-                    &source.hash256,
-                    source.compressed,
-                    source.size,
-                    source.count + 1,
-                ).await?);
-            }
-
-            let id = Self::file_name_gen();
-            let size = input.len() as u64;
-            // Create source directory
-            let source_dir = data_path.join(&id[..4]).join(&id[4..6]);
-            fs::create_dir_all(&source_dir)?;
-
-            self.dao.insert_source(&id, &hash256, compressed, size).await?;
-            self.dao.insert_link(file_name, &ext, &id).await?;
-
-            let target_file = source_dir.join(&id);
-
-            if compressed {
-                let data = self.bm.compress_all(input)?;
-                fs::write(target_file, data)?;
-            } else {
-                fs::write(target_file, input)?;
-            }
-        }
-        Ok(())
+        let _write_guard = self.operation_lock.write().await;
+        self.put_binary_data_locked(
+            file_name,
+            cover,
+            compressed,
+            &new_hash256,
+            new_size,
+            &new_storage_bytes,
+            &ext,
+        )
+            .await
     }
 
     pub async fn put(
@@ -264,12 +184,9 @@ impl StoreManager {
         files: &Vec<String>,
         cover: bool,
         compressed: bool,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), BoxError> {
         if files.is_empty() {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "No files requested",
-            )));
+            return Err(boxed_io_error(io::ErrorKind::Other, "No files requested"));
         }
 
         for file in files {
@@ -284,154 +201,244 @@ impl StoreManager {
             let file_name = file_path
                 .file_name()
                 .ok_or_else(|| {
-                    Box::new(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid file path format",
-                    ))
+                    boxed_io_error(io::ErrorKind::InvalidInput, "Invalid file path format")
                 })?
                 .to_str()
                 .ok_or_else(|| {
-                    Box::new(io::Error::new(
+                    boxed_io_error(
                         io::ErrorKind::InvalidInput,
                         "File name contains invalid UTF-8 characters",
-                    ))
+                    )
                 })?;
+            let input = Bytes::from(fs::read(file_path)?);
+            self.put_binary_data(file_name, &input, cover, compressed).await?;
+        }
+        Ok(())
+    }
 
-            let links = self.dao.get_links_by_name(file_name, false).await?;
-            let data_path = self.root.join("linadata");
+    pub async fn delete(&self, pattern: &str, use_regx: bool) -> Result<(), BoxError> {
+        if pattern == "" {
+            return Err(boxed_io_error(io::ErrorKind::Other, "No files requested"));
+        }
 
-            if links.len() > 0 {
-                let link = links.get(0).ok_or_else(|| {
-                    Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
-                })?;
+        {
+            let _write_guard = self.operation_lock.write().await;
+            let links = self.list_locked(pattern, 0, false, use_regx).await?;
+            for link in links {
+                let source = self
+                    .dao
+                    .get_source_by_id(&link.source_id)
+                    .await
+                    .map_err(dao_to_io_error)?
+                    .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
 
-                let hash256 = utils::get_hash256_from_file(file_path)?;
-                let source = self.dao.get_source_by_id(&link.source_id).await?.ok_or_else(|| {
-                    Box::new(io::Error::new(io::ErrorKind::NotFound, "Source not found"))
-                })?;
+                let source_count = source
+                    .count
+                    .checked_sub(1)
+                    .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
 
-                let new_size: u64;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    new_size = fs::metadata(&file)?.size();
+                self.dao.delete_link_by_id(&link.id).await?;
+                if let Err(err) = self.release_source(&link, &source, source_count).await {
+                    let ext = Path::new(&link.name)
+                        .extension()
+                        .unwrap_or_default()
+                        .to_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = self
+                        .dao
+                        .insert_link_with_id(&link.id, &link.name, &ext, &link.source_id)
+                        .await
+                        .map_err(dao_to_io_error);
+                    return Err(err);
                 }
+            }
+        }
 
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    new_size = fs::metadata(&file)?.file_size();
-                }
+        Ok(())
+    }
+}
 
-                if cover {
-                    // Update hash256 and source compression and size
-                    self.dao.update_source(
+// Source lifecycle and consistency helpers.
+impl StoreManager {
+    async fn list_locked(
+        &self,
+        pattern: &str,
+        n: u64,
+        isext: bool,
+        use_regex: bool,
+    ) -> Result<Vec<Link>, BoxError> {
+        let links = if isext {
+            self.dao.get_links_by_ext(pattern).await.map_err(dao_to_io_error)?
+        } else if (pattern == "" || pattern == "*") && use_regex {
+            self.dao.get_n_links(n).await.map_err(dao_to_io_error)?
+        } else if pattern.contains('*') && use_regex {
+            let sql_pattern = pattern.replace('*', "%");
+            self.dao
+                .get_links_by_name(&sql_pattern, true)
+                .await
+                .map_err(dao_to_io_error)?
+        } else {
+            self.dao
+                .get_links_by_name(pattern, false)
+                .await
+                .map_err(dao_to_io_error)?
+        };
+
+        Ok(links)
+    }
+
+    async fn put_binary_data_locked(
+        &self,
+        file_name: &str,
+        cover: bool,
+        compressed: bool,
+        new_hash256: &str,
+        new_size: u64,
+        new_storage_bytes: &[u8],
+        ext: &str,
+    ) -> Result<(), BoxError> {
+        let links = self
+            .dao
+            .get_links_by_name(file_name, false)
+            .await
+            .map_err(dao_to_io_error)?;
+
+        if links.len() > 0 {
+            let link = links
+                .get(0)
+                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
+
+            let source = self
+                .dao
+                .get_source_by_id(&link.source_id)
+                .await
+                .map_err(dao_to_io_error)?
+                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "Source not found"))?;
+
+            if cover {
+                let source_path = self.source_path(&link.source_id);
+                let previous_storage_bytes = fs::read(&source_path)?;
+
+                self.persist_source_bytes(&link.source_id, new_storage_bytes)?;
+                if let Err(err) = self
+                    .dao
+                    .update_source(
                         &link.source_id,
-                        &hash256,
+                        new_hash256,
                         compressed,
                         new_size,
                         source.count,
-                    ).await?;
-                    let target_file = data_path
-                        .join(&link.source_id[..4])
-                        .join(&link.source_id[4..6])
-                        .join(&link.source_id);
-
-                    if compressed {
-                        let input = fs::read(file_path)?;
-                        let data = self.bm.compress_all(&input)?;
-                        fs::write(target_file, data)?;
-                    } else {
-                        fs::copy(&file, target_file)?;
-                    }
-                } else {
-                    if hash256 == source.hash256 && source.compressed == compressed {
-                        return Ok(());
-                    }
-
-                    // 1. Source Release
-                    let source_count = source
-                        .count
-                        .checked_sub(1)
-                        .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
-
-                    self.release_source(&link, &source, source_count).await?;
-
-                    // 2. Insert new source
-                    let id = Self::file_name_gen();
-                    self.dao
-                        .insert_source(&id, &hash256, compressed, new_size).await?;
-                    self.dao.update_link_source_id(&link.id, &id).await?;
-                    let target_file = data_path.join(&id[..4]).join(&id[4..6]).join(&id);
-                    fs::copy(&file, target_file)?;
+                    )
+                    .await
+                {
+                    let _ = self.persist_source_bytes(&link.source_id, &previous_storage_bytes);
+                    return Err(Box::new(dao_to_io_error(err)));
                 }
             } else {
-                // Check hash256
-                let hash256 = utils::get_hash256_from_file(file_path)?;
-                let ext = Path::new(&file)
-                    .extension()
-                    .unwrap_or_default()
-                    .to_str()
-                    .unwrap_or("")
-                    .to_string();
+                if new_hash256 == source.hash256 && source.compressed == compressed {
+                    return Ok(());
+                }
 
-                // If hash256 exists, count + 1
-                if let Some(source) = self.dao.get_source_by_hash256(&hash256).await? {
-                    self.dao.insert_link(file_name, &ext, &source.id).await?;
-                    // Update source count
-                    return Ok(self.dao.update_source(
+                let new_source_id = Self::file_name_gen();
+                self.persist_source_bytes(&new_source_id, new_storage_bytes)?;
+
+                if let Err(err) = self
+                    .dao
+                    .insert_source(&new_source_id, new_hash256, compressed, new_size)
+                    .await
+                {
+                    let _ = self.remove_source_file_if_exists(&new_source_id);
+                    return Err(Box::new(dao_to_io_error(err)));
+                }
+
+                if let Err(err) = self.dao.update_link_source_id(&link.id, &new_source_id).await {
+                    let _ = self
+                        .dao
+                        .delete_source_by_id(&new_source_id)
+                        .await
+                        .map_err(dao_to_io_error);
+                    let _ = self.remove_source_file_if_exists(&new_source_id);
+                    return Err(Box::new(dao_to_io_error(err)));
+                }
+
+                let source_count = source
+                    .count
+                    .checked_sub(1)
+                    .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
+
+                if let Err(err) = self.release_source(link, &source, source_count).await {
+                    let _ = self
+                        .dao
+                        .update_link_source_id(&link.id, &source.id)
+                        .await
+                        .map_err(dao_to_io_error);
+                    let _ = self
+                        .dao
+                        .delete_source_by_id(&new_source_id)
+                        .await
+                        .map_err(dao_to_io_error);
+                    let _ = self.remove_source_file_if_exists(&new_source_id);
+                    return Err(Box::new(io::Error::other(err.to_string())));
+                }
+            }
+        } else {
+            if let Some(source) = self
+                .dao
+                .get_source_by_hash256(new_hash256)
+                .await
+                .map_err(dao_to_io_error)?
+            {
+                let link_id = Uuid::new_v4().to_string();
+                self.dao
+                    .insert_link_with_id(&link_id, file_name, ext, &source.id)
+                    .await
+                    .map_err(dao_to_io_error)?;
+
+                if let Err(err) = self
+                    .dao
+                    .update_source(
                         &source.id,
                         &source.hash256,
                         source.compressed,
                         source.size,
                         source.count + 1,
-                    ).await?);
+                    )
+                    .await
+                {
+                    let _ = self.dao.delete_link_by_id(&link_id).await.map_err(dao_to_io_error);
+                    return Err(Box::new(dao_to_io_error(err)));
                 }
 
-                let id = Self::file_name_gen();
-                let size = fs::metadata(&file)?.len();
-                // Create source directory
-                let source_dir = data_path.join(&id[..4]).join(&id[4..6]);
-                fs::create_dir_all(&source_dir)?;
-
-                self.dao.insert_source(&id, &hash256, compressed, size).await?;
-                self.dao.insert_link(file_name, &ext, &id).await?;
-
-                if compressed {
-                    let input = fs::read(file_path)?;
-                    let data = self.bm.compress_all(&input)?;
-                    fs::write(source_dir.join(&id), data)?;
-                } else {
-                    fs::copy(file, source_dir.join(&id))?;
-                }
+                return Ok(());
             }
-        }
-        Ok(())
-    }
 
-    pub async fn delete(&self, pattern: &str, use_regx: bool) -> Result<(), Box<dyn Error>> {
-        if pattern == "" {
-            return Err(Box::new(io::Error::new(
-                io::ErrorKind::Other,
-                "No files requested",
-            )));
-        }
+            let source_id = Self::file_name_gen();
+            let link_id = Uuid::new_v4().to_string();
 
-        let links = self.list(pattern, 0, false, use_regx).await?;
-        for link in links {
-            let source = self.dao.get_source_by_id(&link.source_id).await?.ok_or_else(|| {
-                Box::new(io::Error::new(io::ErrorKind::NotFound, "File not found"))
-            })?;
+            self.persist_source_bytes(&source_id, new_storage_bytes)?;
 
-            self.dao.delete_link_by_id(&link.id).await?;
-            let source_count = source
-                .count
-                .checked_sub(1)
-                .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
+            if let Err(err) = self
+                .dao
+                .insert_source(&source_id, new_hash256, compressed, new_size)
+                .await
+            {
+                let _ = self.remove_source_file_if_exists(&source_id);
+                return Err(Box::new(dao_to_io_error(err)));
+            }
 
-            if source_count == 0 {
-                self.release_source(&link, &source, source_count).await?;
+            if let Err(err) = self
+                .dao
+                .insert_link_with_id(&link_id, file_name, ext, &source_id)
+                .await
+            {
+                let _ = self
+                    .dao
+                    .delete_source_by_id(&source_id)
+                    .await
+                    .map_err(dao_to_io_error);
+                let _ = self.remove_source_file_if_exists(&source_id);
+                return Err(Box::new(dao_to_io_error(err)));
             }
         }
 
@@ -443,30 +450,51 @@ impl StoreManager {
         link: &Link,
         source: &Source,
         source_count: u64,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), BoxError> {
         // Delete source if count is 0
         if source_count > 0 {
-            self.dao.update_source(
-                &source.id,
-                &source.hash256,
-                source.compressed,
-                source.size,
-                source_count as u64,
-            ).await?;
+            self.dao
+                .update_source(
+                    &source.id,
+                    &source.hash256,
+                    source.compressed,
+                    source.size,
+                    source_count as u64,
+                )
+                .await
+                .map_err(dao_to_io_error)?;
         } else {
-            let source_path = self
-                .root
-                .join("linadata")
-                .join(&link.source_id[..4])
-                .join(&link.source_id[4..6])
-                .join(&link.source_id);
+            let source_path = self.source_path(&link.source_id);
+            let source_dir = self.source_dir(&link.source_id);
+            let tombstone_path = source_dir.join(format!("{}.deleting", link.source_id));
 
-            self.dao.delete_source_by_id(&source.id).await?;
-            fs::remove_file(source_path)?;
+            fs::rename(&source_path, &tombstone_path)?;
+
+            if let Err(err) = self.dao.delete_source_by_id(&source.id).await {
+                let _ = fs::rename(&tombstone_path, &source_path);
+                return Err(Box::new(dao_to_io_error(err)));
+            }
+
+            if let Err(err) = fs::remove_file(&tombstone_path) {
+                let _ = self
+                    .dao
+                    .insert_source(
+                        &source.id,
+                        &source.hash256,
+                        source.compressed,
+                        source.size,
+                    )
+                    .await;
+                let _ = fs::rename(&tombstone_path, &source_path);
+                return Err(Box::new(err));
+            }
         }
         Ok(())
     }
+}
 
+// Filesystem and identifier helpers.
+impl StoreManager {
     fn file_name_gen() -> String {
         let utc_time = Utc::now();
         let utc_time_formated = utc_time.format("%Y%m%d%H%M%S").to_string();
@@ -474,6 +502,51 @@ impl StoreManager {
         let nano_id = nanoid::nanoid!(8, &NANOID_MAP);
 
         format!("{}{}", utc_time_formated, nano_id)
+    }
+
+    fn source_dir(&self, source_id: &str) -> PathBuf {
+        self.root
+            .join("linadata")
+            .join(&source_id[..4])
+            .join(&source_id[4..6])
+    }
+
+    fn source_path(&self, source_id: &str) -> PathBuf {
+        self.source_dir(source_id).join(source_id)
+    }
+
+    fn encode_source_data(
+        &self,
+        input: &Bytes,
+        compressed: bool,
+    ) -> Result<Vec<u8>, BoxError> {
+        if compressed {
+            Ok(self.bm.compress_all(input)?)
+        } else {
+            Ok(input.to_vec())
+        }
+    }
+
+    fn persist_source_bytes(&self, source_id: &str, bytes: &[u8]) -> Result<(), BoxError> {
+        let source_dir = self.source_dir(source_id);
+        fs::create_dir_all(&source_dir)?;
+
+        let target_path = source_dir.join(source_id);
+        let tmp_path = source_dir.join(format!("{}.tmp-{}", source_id, Uuid::new_v4()));
+
+        fs::write(&tmp_path, bytes)?;
+        fs::rename(&tmp_path, &target_path)?;
+
+        Ok(())
+    }
+
+    fn remove_source_file_if_exists(&self, source_id: &str) -> Result<(), BoxError> {
+        let source_path = self.source_path(source_id);
+        match fs::remove_file(source_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(Box::new(err)),
+        }
     }
 }
 
@@ -488,7 +561,7 @@ impl TidyManager {
         &mut self,
         target_path: P,
         keep_new: bool,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), BoxError> {
         let paths = utils::path_walk(target_path)?;
 
         for path in paths {
@@ -617,6 +690,7 @@ impl TidyManager {
 #[cfg(test)]
 mod tests {
     use rand::Rng;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     use super::*;
@@ -840,6 +914,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_deduplicated_file_decrements_source_count() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
+        let data = Bytes::from(vec![9, 8, 7, 6]);
+
+        sm.put_binary_data("file1.txt", &data, false, false)
+            .await
+            .expect("Failed to put first file");
+        sm.put_binary_data("file2.txt", &data, false, false)
+            .await
+            .expect("Failed to put second file");
+
+        let links_before = sm
+            .dao
+            .get_links_by_name("file1.txt", false)
+            .await
+            .expect("Failed to get file1 links");
+        let source_id = links_before[0].source_id.clone();
+
+        let source_before = sm
+            .dao
+            .get_source_by_id(&source_id)
+            .await
+            .expect("Failed to get source before delete")
+            .expect("Expected source before delete");
+        assert_eq!(source_before.count, 2);
+
+        sm.delete("file1.txt", false)
+            .await
+            .expect("Failed to delete file1");
+
+        let source_after = sm
+            .dao
+            .get_source_by_id(&source_id)
+            .await
+            .expect("Failed to get source after delete")
+            .expect("Expected source after delete");
+        assert_eq!(source_after.count, 1);
+
+        let remaining_data = sm
+            .get_binary_data("file2.txt")
+            .await
+            .expect("Failed to read remaining deduplicated file");
+        assert_eq!(remaining_data, data);
+    }
+
+    #[tokio::test]
     async fn test_delete_empty_pattern() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
@@ -914,6 +1035,53 @@ mod tests {
         let data2 = sm.get_binary_data("file2.txt").await.expect("Failed to get data");
         assert_eq!(data1, data2);
         assert_eq!(data1, data);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_puts_preserve_dedup_count() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = Arc::new(
+            StoreManager::new(temp_dir.path())
+                .await
+                .expect("Failed to create StoreManager"),
+        );
+        let data = Bytes::from(vec![1, 3, 5, 7, 9]);
+
+        let sm1 = Arc::clone(&sm);
+        let sm2 = Arc::clone(&sm);
+        let data1 = data.clone();
+        let data2 = data.clone();
+
+        let (res1, res2) = tokio::join!(
+            async move { sm1.put_binary_data("concurrent1.txt", &data1, false, false).await },
+            async move { sm2.put_binary_data("concurrent2.txt", &data2, false, false).await },
+        );
+
+        assert!(res1.is_ok(), "first concurrent write failed: {:?}", res1.err());
+        assert!(res2.is_ok(), "second concurrent write failed: {:?}", res2.err());
+
+        let link1 = sm
+            .dao
+            .get_links_by_name("concurrent1.txt", false)
+            .await
+            .expect("Failed to query concurrent1 link");
+        let link2 = sm
+            .dao
+            .get_links_by_name("concurrent2.txt", false)
+            .await
+            .expect("Failed to query concurrent2 link");
+
+        assert_eq!(link1.len(), 1);
+        assert_eq!(link2.len(), 1);
+        assert_eq!(link1[0].source_id, link2[0].source_id);
+
+        let source = sm
+            .dao
+            .get_source_by_id(&link1[0].source_id)
+            .await
+            .expect("Failed to query shared source")
+            .expect("Shared source should exist");
+        assert_eq!(source.count, 2);
     }
 
     #[tokio::test]

@@ -126,6 +126,7 @@ pub async fn run_server(log_dir: Option<String>, daemon: bool) -> Result<()> {
 
     // Initialize database
     let env_vars = crate::vars::EnvVar::get_instance();
+    env_vars.validate()?;
     let db_conn = Arc::new(crate::db::get_db_connection(&env_vars.db_url).await?);
     event!(tracing::Level::INFO, "Database initialized");
 

@@ -1,8 +1,7 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::oneshot;
 
 use crate::dtos::Package;
 
@@ -16,9 +15,9 @@ struct WaiterEntry {
 }
 
 pub struct ConveyQueue {
-    order_queue: Arc<RwLock<VecDeque<Package>>>,
+    order_queue: Arc<Mutex<VecDeque<Package>>>,
     // Maps uni_id to a channel sender for transaction-based responses
-    waiters: Arc<RwLock<HashMap<[u8; 16], WaiterEntry>>>,
+    waiters: Arc<Mutex<HashMap<[u8; 16], WaiterEntry>>>,
     // Channel for notifying when new orders are available
     order_notifier: tokio::sync::watch::Sender<usize>,
 }
@@ -37,8 +36,8 @@ impl ConveyQueue {
             .get_or_init(|| {
                 let (order_notifier, _) = tokio::sync::watch::channel(0usize);
                 let instance = Arc::new(ConveyQueue {
-                    order_queue: Arc::new(RwLock::new(VecDeque::new())),
-                    waiters: Arc::new(RwLock::new(HashMap::new())),
+                    order_queue: Arc::new(Mutex::new(VecDeque::new())),
+                    waiters: Arc::new(Mutex::new(HashMap::new())),
                     order_notifier,
                 });
                 Self::start_waiter_cleanup_task(&instance);
@@ -47,54 +46,26 @@ impl ConveyQueue {
             .clone()
     }
 
-    // Helper function to retry with exponential backoff
-    fn deal_with_retry<F, T, E>(mut f: F, max_retries: usize) -> Result<T, E>
-    where
-        F: FnMut() -> Result<T, E>,
-    {
-        let mut retries = 0;
-        let mut delay = Duration::from_millis(1);
+    pub fn produce_order(&self, order: Package) -> Result<(), String> {
+        let queue_len = {
+            let mut queue = self
+                .order_queue
+                .lock()
+                .map_err(|_| "Failed to lock order queue".to_string())?;
 
-        loop {
-            match f() {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(e);
-                    }
-                    thread::sleep(delay);
-                    delay = Duration::from_millis(delay.as_millis() as u64 * 2);
-                    retries += 1;
+            if queue.len() >= ORDER_QUEUE_CAPACITY {
+                // DropOldest policy: remove the oldest order when queue is full.
+                if let Some(dropped) = queue.pop_front() {
+                    self.unregister_waiter(dropped.uni_id);
                 }
             }
-        }
-    }
 
-    pub fn produce_order(&self, order: Package) -> Result<(), String> {
-        Self::deal_with_retry(
-            || {
-                let mut queue = self
-                    .order_queue
-                    .try_write()
-                    .map_err(|_| "fail to push to order queue".to_string())?;
-
-                if queue.len() >= ORDER_QUEUE_CAPACITY {
-                    // DropOldest policy: remove the oldest order when queue is full
-                    if let Some(dropped) = queue.pop_front() {
-                        self.unregister_waiter(dropped.uni_id);
-                    }
-                }
-
-                queue.push_back(order.clone());
-                Ok::<(), String>(())
-            },
-            3,
-        )?;
+            queue.push_back(order);
+            queue.len()
+        };
 
         // Notify that a new order is available
-        let _ = self
-            .order_notifier
-            .send(self.order_queue.try_read().map(|q| q.len()).unwrap_or(0));
+        let _ = self.order_notifier.send(queue_len);
 
         Ok(())
     }
@@ -105,32 +76,30 @@ impl ConveyQueue {
     }
 
     pub fn consume_order(&self) -> Result<Option<Package>, String> {
-        Self::deal_with_retry(
-            || {
-                let mut guard = self
-                    .order_queue
-                    .try_write()
-                    .map_err(|e| format!("Failed to acquire queue lock: {:?}", e))?;
+        let mut guard = self
+            .order_queue
+            .lock()
+            .map_err(|_| "Failed to lock order queue".to_string())?;
 
-                if guard.is_empty() {
-                    return Ok(None);
-                }
-                Ok(guard.pop_front())
-            },
-            3,
-        )
+        if guard.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(guard.pop_front())
     }
 
     pub fn produce_service(&self, order: Package) -> Result<(), String> {
         let uni_id = order.uni_id;
 
         // Send through registered channel if exists
-        if let Ok(mut waiters) = self.waiters.try_write() {
-            if let Some(entry) = waiters.remove(&uni_id) {
-                // Send through channel, ignore error if receiver is dropped
-                let _ = entry.sender.send(order);
-                return Ok(());
-            }
+        let mut waiters = self
+            .waiters
+            .lock()
+            .map_err(|_| "Failed to lock waiter registry".to_string())?;
+        if let Some(entry) = waiters.remove(&uni_id) {
+            // Send through channel, ignore error if receiver is dropped
+            let _ = entry.sender.send(order);
+            return Ok(());
         }
 
         Err("No waiter registered for this response".to_string())
@@ -141,32 +110,30 @@ impl ConveyQueue {
     /// If a waiter already exists for this uni_id, returns None.
     pub fn register_waiter(&self, uni_id: [u8; 16]) -> Option<oneshot::Receiver<Package>> {
         let (sender, receiver) = oneshot::channel();
+        let mut waiters = self.waiters.lock().ok()?;
 
-        if let Ok(mut waiters) = self.waiters.try_write() {
-            if waiters.contains_key(&uni_id) {
-                return None;
-            }
-            waiters.insert(
-                uni_id,
-                WaiterEntry {
-                    sender,
-                    created_at: Instant::now(),
-                },
-            );
-            Some(receiver)
-        } else {
-            None
+        if waiters.contains_key(&uni_id) {
+            return None;
         }
+
+        waiters.insert(
+            uni_id,
+            WaiterEntry {
+                sender,
+                created_at: Instant::now(),
+            },
+        );
+        Some(receiver)
     }
 
     pub fn unregister_waiter(&self, uni_id: [u8; 16]) {
-        if let Ok(mut waiters) = self.waiters.try_write() {
+        if let Ok(mut waiters) = self.waiters.lock() {
             waiters.remove(&uni_id);
         }
     }
 
     pub fn remove_order(&self, uni_id: [u8; 16]) -> bool {
-        if let Ok(mut guard) = self.order_queue.try_write() {
+        if let Ok(mut guard) = self.order_queue.lock() {
             let before = guard.len();
             guard.retain(|pkg| pkg.uni_id != uni_id);
             return guard.len() != before;
@@ -198,7 +165,10 @@ impl ConveyQueue {
         let mut expired: Vec<[u8; 16]> = Vec::new();
 
         {
-            let mut waiters = self.waiters.write().await;
+            let mut waiters = match self.waiters.lock() {
+                Ok(waiters) => waiters,
+                Err(_) => return,
+            };
             waiters.retain(|uni_id, entry| {
                 let is_expired = now.duration_since(entry.created_at) > WAITERS_TTL;
                 if is_expired {

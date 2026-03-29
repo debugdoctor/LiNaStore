@@ -191,7 +191,9 @@ client.uploadFile("myfile.txt", data, LiNaClient::LINA_WRITE);
 To enable authentication on the server:
 
 1. Set `LINASTORE_AUTH_REQUIRED=1` environment variable
-2. Set `LINASTORE_ADMIN_PASSWORD` environment variable to the admin password
+2. Set `LINASTORE_ADMIN_PASSWORD` to provide the admin password
 3. The server will create an admin user automatically on startup
 
-**Note**: When authentication is disabled (no password set), the server operates in open access mode and no authentication is required.
+`LINASTORE_ADMIN_USER` is optional and defaults to `admin`.
+
+**Note**: When authentication is disabled, the server operates in open access mode and no authentication is required. When authentication is enabled, the server now refuses to start unless a password is provided explicitly.

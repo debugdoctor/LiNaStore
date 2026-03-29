@@ -15,11 +15,13 @@ use std::{
     ptr,
 };
 
+type BoxError = Box<dyn Error + Send + Sync>;
+
 const BLOCK_SIZE: usize = 8;
 const GROUP_SIZE: usize = BLOCK_SIZE * 8;
 const BUFFER_SIZE: usize = 0x80000;
 
-pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, Box<dyn Error>> {
+pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, BoxError> {
     let mut hasher = Hasher::new();
     let mut file = fs::File::open(file_path)?;
     let file_size = file.metadata()?.len();
@@ -51,7 +53,7 @@ pub fn get_hash256_from_binary(input: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-pub fn path_walk<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+pub fn path_walk<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>, BoxError> {
     let path = Path::new(path.as_ref());
     let mut result: Vec<PathBuf> = Vec::new();
 
@@ -192,7 +194,7 @@ impl BlockManager {
         }
     }
 
-    pub fn compress_all(&self, input: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn compress_all(&self, input: &[u8]) -> Result<Vec<u8>, BoxError> {
         // Determine thread count based on input size
         let thread_count = self.determine_thread_count(input.len());
 
@@ -265,7 +267,7 @@ impl BlockManager {
         &self,
         input: &[u8],
         original_size: usize,
-    ) -> Result<Vec<u8>, Box<dyn Error>> {
+    ) -> Result<Vec<u8>, BoxError> {
         let mut i = 0;
         let mut chunks_with_flag = Vec::with_capacity(0x400000);
 
