@@ -1,6 +1,6 @@
 [package]
 name = "linastore-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -24,6 +24,8 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 aes-gcm = "0.10.3"
 argon2 = { version = "0.5", features = ["std"] }
 libc = "0.2.182"
+
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", default-features = false, features = ["process", "fs"] }
 
 [features]

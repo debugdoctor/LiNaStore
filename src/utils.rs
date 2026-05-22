@@ -1,14 +1,18 @@
 use crate::error::{Context, Result, err_msg};
-use nix::fcntl::{open, OFlag};
+#[cfg(unix)]
+use nix::fcntl::{OFlag, open};
+#[cfg(unix)]
 use nix::sys::stat::Mode;
-use nix::unistd::{close, fork, setsid, ForkResult};
+#[cfg(unix)]
+use nix::unistd::{ForkResult, close, fork, setsid};
+#[cfg(unix)]
 use std::os::fd::IntoRawFd;
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{event, Level};
+use tracing::{Level, event};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::shutdown::Shutdown;
@@ -61,7 +65,8 @@ fn init_logging(log_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run the main server
+/// Daemonize the current process. Unix-only; on other platforms this returns an error.
+#[cfg(unix)]
 fn daemonize() -> Result<()> {
     match unsafe { fork().context("Failed to fork process")? } {
         ForkResult::Parent { .. } => {
@@ -84,6 +89,13 @@ fn daemonize() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn daemonize() -> Result<()> {
+    Err(err_msg(
+        "Daemon mode is not supported on this platform; run with --foreground",
+    ))
 }
 
 pub async fn run_server(log_dir: Option<String>, daemon: bool) -> Result<()> {
@@ -240,19 +252,8 @@ pub fn handle_stop(force: bool) -> Result<()> {
         pid
     );
 
-    // Send SIGTERM for graceful shutdown
-    let kill_result =
-        unsafe { libc::kill(pid, if force { libc::SIGKILL } else { libc::SIGTERM }) };
-
-    if kill_result != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            eprintln!("Server process not found (may have already stopped)");
-            fs::remove_file(&pid_file).ok();
-            return Ok(());
-        }
-        return Err(err_msg(format!("Failed to stop server: {}", err)));
-    }
+    // Signal the server process to terminate.
+    stop_process(pid, force, &pid_file)?;
 
     // Remove PID file
     fs::remove_file(&pid_file).ok();
@@ -263,6 +264,51 @@ pub fn handle_stop(force: bool) -> Result<()> {
         println!("LiNaStore server stopped gracefully");
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_process(pid: i32, force: bool, pid_file: &Path) -> Result<()> {
+    let kill_result =
+        unsafe { libc::kill(pid, if force { libc::SIGKILL } else { libc::SIGTERM }) };
+
+    if kill_result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            eprintln!("Server process not found (may have already stopped)");
+            fs::remove_file(pid_file).ok();
+            return Ok(());
+        }
+        return Err(err_msg(format!("Failed to stop server: {}", err)));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn stop_process(pid: i32, force: bool, pid_file: &Path) -> Result<()> {
+    // On Windows we don't have POSIX signals. `taskkill` without /F asks the
+    // process to close politely (WM_CLOSE for GUI apps / CTRL_BREAK semantics
+    // for consoles); with /F it is terminated unconditionally.
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.arg("/PID").arg(pid.to_string());
+    if force {
+        cmd.arg("/F");
+    }
+    let output = cmd.output().context("Failed to invoke taskkill")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // taskkill exit code 128 == process not found
+        if output.status.code() == Some(128) {
+            eprintln!("Server process not found (may have already stopped)");
+            fs::remove_file(pid_file).ok();
+            return Ok(());
+        }
+        return Err(err_msg(format!(
+            "Failed to stop server (taskkill exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        )));
+    }
     Ok(())
 }
 
