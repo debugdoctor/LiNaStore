@@ -2,14 +2,16 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use nanoid;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
-    fs, io,
+    fs as stdfs, io,
     path::{Path, PathBuf},
     result::Result,
     sync::Arc,
 };
+use tokio::fs;
 use tokio::sync::RwLock;
+use tokio::task;
 use uuid::Uuid;
 
 use crate::utils::BlockManager;
@@ -38,7 +40,7 @@ fn dao_to_io_error(err: anyhow::Error) -> io::Error {
 pub struct StoreManager {
     root: PathBuf,
     dao: Dao,
-    bm: BlockManager,
+    bm: Arc<BlockManager>,
     operation_lock: Arc<RwLock<()>>,
 }
 
@@ -50,16 +52,27 @@ pub struct TidyManager {
 impl StoreManager {
     pub async fn new<P: AsRef<Path>>(root: P) -> Result<Self, BoxError> {
         let root_path = root.as_ref().to_path_buf(); // Convert to owning type
-        fs::create_dir_all(root_path.join("linadata"))?;
+        fs::create_dir_all(root_path.join("linadata")).await?;
 
-        Ok(StoreManager {
+        let manager = StoreManager {
             root: root_path.clone(), // Store owned path
             dao: Dao::new(root_path.join("linadata").join("meta.db"))
                 .await
                 .map_err(dao_to_io_error)?,
-            bm: BlockManager::new(),
+            bm: Arc::new(BlockManager::new()),
             operation_lock: Arc::new(RwLock::new(())),
-        })
+        };
+
+        // Reconcile filesystem with DB on startup: drop orphan source files,
+        // leftover tombstones, and write-in-progress temp files.
+        if let Err(err) = manager.reconcile_orphans().await {
+            return Err(boxed_io_error(
+                io::ErrorKind::Other,
+                format!("Startup reconciliation failed: {}", err),
+            ));
+        }
+
+        Ok(manager)
     }
 
     pub async fn list(
@@ -99,22 +112,22 @@ impl StoreManager {
                 .map_err(dao_to_io_error)?
                 .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
 
-            let source_path = self
-                .root
-                .join("linadata")
-                .join(&source.id[0..4])
-                .join(&source.id[4..6])
-                .join(&source.id);
-
-            let file_bytes = fs::read(&source_path)?;
+            let source_path = self.source_path(&source.id);
+            let file_bytes = fs::read(&source_path).await?;
             (source.compressed, source.size as usize, file_bytes)
         };
 
-        Ok(if compressed {
-            Bytes::from(self.bm.decompress_all(&file_bytes, source_size)?)
+        if compressed {
+            let bm = Arc::clone(&self.bm);
+            let decoded = task::spawn_blocking(move || {
+                bm.decompress_all(&file_bytes, source_size)
+            })
+            .await
+            .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("decompress task join error: {}", e)))??;
+            Ok(Bytes::from(decoded))
         } else {
-            Bytes::from(file_bytes)
-        })
+            Ok(Bytes::from(file_bytes))
+        }
     }
 
     pub async fn get_and_save<P: AsRef<Path>>(
@@ -126,7 +139,7 @@ impl StoreManager {
             return Err(boxed_io_error(io::ErrorKind::Other, "No files requested"));
         }
         let dest_root = dest.as_ref().to_path_buf();
-        fs::create_dir_all(&dest_root)?;
+        fs::create_dir_all(&dest_root).await?;
 
         for file in files {
             let data = self.get_binary_data(file).await?;
@@ -137,9 +150,9 @@ impl StoreManager {
                 })?;
             let dest_path = dest_root.join(file_name);
             if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).await?;
             }
-            fs::write(&dest_path, data)?;
+            fs::write(&dest_path, data).await?;
         }
 
         Ok(())
@@ -156,15 +169,29 @@ impl StoreManager {
             return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
         }
 
-        let new_hash256 = utils::get_hash256_from_binary(input);
         let new_size = input.len() as u64;
-        let new_storage_bytes = self.encode_source_data(input, compressed)?;
         let ext = Path::new(&file_name)
             .extension()
             .unwrap_or_default()
             .to_str()
             .unwrap_or("")
             .to_string();
+
+        // Hash + (optional) compression are CPU-bound; run them off the runtime
+        // so we don't block tokio workers on large payloads.
+        let bm = Arc::clone(&self.bm);
+        let input_for_blocking = input.clone();
+        let (new_hash256, new_storage_bytes) = task::spawn_blocking(move || -> Result<(String, Vec<u8>), BoxError> {
+            let hash = utils::get_hash256_from_binary(&input_for_blocking);
+            let encoded = if compressed {
+                bm.compress_all(&input_for_blocking)?
+            } else {
+                input_for_blocking.to_vec()
+            };
+            Ok((hash, encoded))
+        })
+        .await
+        .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("encode task join error: {}", e)))??;
 
         let _write_guard = self.operation_lock.write().await;
         self.put_binary_data_locked(
@@ -190,13 +217,6 @@ impl StoreManager {
         }
 
         for file in files {
-            if !fs::exists(&file)? {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("File {} not found", &file),
-                )));
-            }
-
             let file_path = Path::new(&file);
             let file_name = file_path
                 .file_name()
@@ -210,7 +230,18 @@ impl StoreManager {
                         "File name contains invalid UTF-8 characters",
                     )
                 })?;
-            let input = Bytes::from(fs::read(file_path)?);
+            // Skip the redundant fs::exists check — fs::read returns NotFound
+            // naturally if the file is missing, avoiding a TOCTOU window.
+            let input = match fs::read(file_path).await {
+                Ok(bytes) => Bytes::from(bytes),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("File {} not found", &file),
+                    )));
+                }
+                Err(err) => return Err(Box::new(err)),
+            };
             self.put_binary_data(file_name, &input, cover, compressed).await?;
         }
         Ok(())
@@ -318,9 +349,9 @@ impl StoreManager {
 
             if cover {
                 let source_path = self.source_path(&link.source_id);
-                let previous_storage_bytes = fs::read(&source_path)?;
+                let previous_storage_bytes = fs::read(&source_path).await?;
 
-                self.persist_source_bytes(&link.source_id, new_storage_bytes)?;
+                self.persist_source_bytes(&link.source_id, new_storage_bytes).await?;
                 if let Err(err) = self
                     .dao
                     .update_source(
@@ -332,7 +363,7 @@ impl StoreManager {
                     )
                     .await
                 {
-                    let _ = self.persist_source_bytes(&link.source_id, &previous_storage_bytes);
+                    let _ = self.persist_source_bytes(&link.source_id, &previous_storage_bytes).await;
                     return Err(Box::new(dao_to_io_error(err)));
                 }
             } else {
@@ -341,14 +372,14 @@ impl StoreManager {
                 }
 
                 let new_source_id = Self::file_name_gen();
-                self.persist_source_bytes(&new_source_id, new_storage_bytes)?;
+                self.persist_source_bytes(&new_source_id, new_storage_bytes).await?;
 
                 if let Err(err) = self
                     .dao
                     .insert_source(&new_source_id, new_hash256, compressed, new_size)
                     .await
                 {
-                    let _ = self.remove_source_file_if_exists(&new_source_id);
+                    let _ = self.remove_source_file_if_exists(&new_source_id).await;
                     return Err(Box::new(dao_to_io_error(err)));
                 }
 
@@ -358,7 +389,7 @@ impl StoreManager {
                         .delete_source_by_id(&new_source_id)
                         .await
                         .map_err(dao_to_io_error);
-                    let _ = self.remove_source_file_if_exists(&new_source_id);
+                    let _ = self.remove_source_file_if_exists(&new_source_id).await;
                     return Err(Box::new(dao_to_io_error(err)));
                 }
 
@@ -378,7 +409,7 @@ impl StoreManager {
                         .delete_source_by_id(&new_source_id)
                         .await
                         .map_err(dao_to_io_error);
-                    let _ = self.remove_source_file_if_exists(&new_source_id);
+                    let _ = self.remove_source_file_if_exists(&new_source_id).await;
                     return Err(Box::new(io::Error::other(err.to_string())));
                 }
             }
@@ -416,14 +447,14 @@ impl StoreManager {
             let source_id = Self::file_name_gen();
             let link_id = Uuid::new_v4().to_string();
 
-            self.persist_source_bytes(&source_id, new_storage_bytes)?;
+            self.persist_source_bytes(&source_id, new_storage_bytes).await?;
 
             if let Err(err) = self
                 .dao
                 .insert_source(&source_id, new_hash256, compressed, new_size)
                 .await
             {
-                let _ = self.remove_source_file_if_exists(&source_id);
+                let _ = self.remove_source_file_if_exists(&source_id).await;
                 return Err(Box::new(dao_to_io_error(err)));
             }
 
@@ -437,7 +468,7 @@ impl StoreManager {
                     .delete_source_by_id(&source_id)
                     .await
                     .map_err(dao_to_io_error);
-                let _ = self.remove_source_file_if_exists(&source_id);
+                let _ = self.remove_source_file_if_exists(&source_id).await;
                 return Err(Box::new(dao_to_io_error(err)));
             }
         }
@@ -468,24 +499,27 @@ impl StoreManager {
             let source_dir = self.source_dir(&link.source_id);
             let tombstone_path = source_dir.join(format!("{}.deleting", link.source_id));
 
-            fs::rename(&source_path, &tombstone_path)?;
+            fs::rename(&source_path, &tombstone_path).await?;
 
             if let Err(err) = self.dao.delete_source_by_id(&source.id).await {
-                let _ = fs::rename(&tombstone_path, &source_path);
+                let _ = fs::rename(&tombstone_path, &source_path).await;
                 return Err(Box::new(dao_to_io_error(err)));
             }
 
-            if let Err(err) = fs::remove_file(&tombstone_path) {
+            if let Err(err) = fs::remove_file(&tombstone_path).await {
+                // Best-effort rollback: restore the file and the source row with
+                // its ORIGINAL count, not a default of 1.
+                let _ = fs::rename(&tombstone_path, &source_path).await;
                 let _ = self
                     .dao
-                    .insert_source(
+                    .insert_source_with_count(
                         &source.id,
                         &source.hash256,
                         source.compressed,
                         source.size,
+                        source.count,
                     )
                     .await;
-                let _ = fs::rename(&tombstone_path, &source_path);
                 return Err(Box::new(err));
             }
         }
@@ -515,38 +549,155 @@ impl StoreManager {
         self.source_dir(source_id).join(source_id)
     }
 
-    fn encode_source_data(
-        &self,
-        input: &Bytes,
-        compressed: bool,
-    ) -> Result<Vec<u8>, BoxError> {
-        if compressed {
-            Ok(self.bm.compress_all(input)?)
-        } else {
-            Ok(input.to_vec())
-        }
-    }
-
-    fn persist_source_bytes(&self, source_id: &str, bytes: &[u8]) -> Result<(), BoxError> {
+    async fn persist_source_bytes(&self, source_id: &str, bytes: &[u8]) -> Result<(), BoxError> {
         let source_dir = self.source_dir(source_id);
-        fs::create_dir_all(&source_dir)?;
+        fs::create_dir_all(&source_dir).await?;
 
         let target_path = source_dir.join(source_id);
         let tmp_path = source_dir.join(format!("{}.tmp-{}", source_id, Uuid::new_v4()));
 
-        fs::write(&tmp_path, bytes)?;
-        fs::rename(&tmp_path, &target_path)?;
+        fs::write(&tmp_path, bytes).await?;
+        if let Err(err) = fs::rename(&tmp_path, &target_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Box::new(err));
+        }
 
         Ok(())
     }
 
-    fn remove_source_file_if_exists(&self, source_id: &str) -> Result<(), BoxError> {
+    async fn remove_source_file_if_exists(&self, source_id: &str) -> Result<(), BoxError> {
         let source_path = self.source_path(source_id);
-        match fs::remove_file(source_path) {
+        match fs::remove_file(source_path).await {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    /// Reconcile the on-disk source store with the DB after a (potentially
+    /// crash-interrupted) restart:
+    /// - delete files left over from in-flight writes (`*.tmp-*`),
+    /// - delete stale tombstones from interrupted deletes (`*.deleting`),
+    /// - delete payload files whose source row no longer exists.
+    /// The DB is treated as the source of truth.
+    async fn reconcile_orphans(&self) -> Result<(), BoxError> {
+        let known_ids: HashSet<String> = self
+            .dao
+            .list_source_ids()
+            .await
+            .map_err(dao_to_io_error)?
+            .into_iter()
+            .collect();
+
+        let linadata_root = self.root.join("linadata");
+        let mut removed_tmp = 0u64;
+        let mut removed_tombstone = 0u64;
+        let mut removed_orphan = 0u64;
+
+        // The expected layout is linadata/<id[0..4]>/<id[4..6]>/<id>. Only
+        // descend two levels so we don't accidentally chew on meta.db / logs.
+        let mut top = match stdfs::read_dir(&linadata_root) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(Box::new(err)),
+        };
+
+        while let Some(top_entry) = top.next() {
+            let top_entry = top_entry?;
+            let top_path = top_entry.path();
+            let top_meta = match top_entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !top_meta.is_dir() {
+                continue;
+            }
+            // Source-id prefix dirs are always 4 chars; skip anything else (e.g. "logs").
+            if top_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.len() != 4)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+
+            let mid = match stdfs::read_dir(&top_path) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for mid_entry in mid {
+                let mid_entry = mid_entry?;
+                let mid_path = mid_entry.path();
+                let mid_meta = match mid_entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !mid_meta.is_dir() {
+                    continue;
+                }
+                if mid_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.len() != 2)
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+
+                let leaves = match stdfs::read_dir(&mid_path) {
+                    Ok(rd) => rd,
+                    Err(_) => continue,
+                };
+                for leaf in leaves {
+                    let leaf = leaf?;
+                    let leaf_path = leaf.path();
+                    let leaf_meta = match leaf.metadata() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if !leaf_meta.is_file() {
+                        continue;
+                    }
+                    let name = match leaf_path.file_name().and_then(|n| n.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+
+                    if name.contains(".tmp-") {
+                        if fs::remove_file(&leaf_path).await.is_ok() {
+                            removed_tmp += 1;
+                        }
+                        continue;
+                    }
+                    if let Some(stem) = name.strip_suffix(".deleting") {
+                        // If the DB still has the source, restore the file;
+                        // otherwise treat the tombstone as garbage.
+                        if known_ids.contains(stem) {
+                            let restored = mid_path.join(stem);
+                            let _ = fs::rename(&leaf_path, &restored).await;
+                        } else if fs::remove_file(&leaf_path).await.is_ok() {
+                            removed_tombstone += 1;
+                        }
+                        continue;
+                    }
+
+                    if !known_ids.contains(&name) {
+                        if fs::remove_file(&leaf_path).await.is_ok() {
+                            removed_orphan += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if removed_tmp | removed_tombstone | removed_orphan > 0 {
+            eprintln!(
+                "[linastore] reconcile: removed_tmp={} removed_tombstone={} removed_orphan={}",
+                removed_tmp, removed_tombstone, removed_orphan
+            );
+        }
+        Ok(())
     }
 }
 
@@ -585,7 +736,7 @@ impl TidyManager {
                     let relative_file_path =
                         self.relative_path_with_same_root(&file_info.0, target_file_info.0);
 
-                    match fs::remove_file(&file_info.0) {
+                    match stdfs::remove_file(&file_info.0) {
                         Ok(_) => {}
                         Err(_) => {
                             eprintln!("Failed to tidy with file: {}", relative_file_path.display());
@@ -616,7 +767,7 @@ impl TidyManager {
             ),
         };
 
-        let created_date = match fs::metadata(path) {
+        let created_date = match stdfs::metadata(path) {
             Ok(metadata) => match metadata.created() {
                 Ok(date) => date,
                 Err(e) => panic!(
@@ -1102,6 +1253,48 @@ mod tests {
     fn test_tidy_manager_new() {
         let tm = TidyManager::new();
         assert!(tm.map_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_orphans_cleans_garbage_and_keeps_known_sources() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("Failed to create StoreManager");
+        let data = Bytes::from(vec![10u8, 20, 30, 40]);
+
+        // Establish a real source via the public API.
+        sm.put_binary_data("kept.bin", &data, false, false).await.expect("put");
+        let links = sm
+            .dao
+            .get_links_by_name("kept.bin", false)
+            .await
+            .expect("links");
+        let kept_id = links[0].source_id.clone();
+        let kept_dir = sm.source_dir(&kept_id);
+
+        // Plant garbage neighbors next to the real file.
+        let orphan_id = "20991231235959aaaaaaaa";
+        let orphan_path = kept_dir.join(orphan_id);
+        let tombstone_path = kept_dir.join(format!("{}.deleting", orphan_id));
+        let tmp_path = kept_dir.join(format!("{}.tmp-deadbeef", kept_id));
+        stdfs::write(&orphan_path, b"orphan").unwrap();
+        stdfs::write(&tombstone_path, b"tombstone").unwrap();
+        stdfs::write(&tmp_path, b"tmp").unwrap();
+
+        // Plant a tombstone for the KEPT source — reconciliation should resurrect it.
+        let kept_path = sm.source_path(&kept_id);
+        let kept_tombstone = kept_dir.join(format!("{}.deleting", kept_id));
+        stdfs::rename(&kept_path, &kept_tombstone).unwrap();
+
+        sm.reconcile_orphans().await.expect("reconcile");
+
+        assert!(!orphan_path.exists(), "orphan source file should be removed");
+        assert!(!tombstone_path.exists(), "orphan tombstone should be removed");
+        assert!(!tmp_path.exists(), "tmp file should be removed");
+        assert!(kept_path.exists(), "tombstone for known source should be restored");
+        assert!(!kept_tombstone.exists(), "restored tombstone should be gone");
+
+        let roundtrip = sm.get_binary_data("kept.bin").await.expect("get");
+        assert_eq!(roundtrip, data);
     }
 
     #[test]

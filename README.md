@@ -26,30 +26,45 @@ The structure of LiNa protocol is as follows:
 
 ```mermaid
 ---
-title: "LiNa Packet ( bit )"
+title: "LiNa Request Packet"
 ---
 packet-beta
-0-1: "FO"
-2-5: "Reserved"
-6: "Cov"
-7: "Com"
-8-47: "Name (less than 255 bytes)"
-48-63: "0 (padding for Name to be 255 bytes)"
-64-95: "Length"
-96-127: "Checksum"
-128-191: "Data ( variable length )"
+0-7:   "Flags (1B)"
+8-15:  "ilen (1B)"
+16-31: "Identifier (variable, ilen bytes)"
+32-63: "dlen (4B, u32 LE)"
+64-95: "Checksum (4B, u32 LE, CRC32)"
+96-127: "Data (variable, dlen bytes)"
 ```
-and the first byte of LiNa packet is called "Flags", the specific meaning of each bit is as follows:
+
+Wire layout (little-endian where applicable):
+
+| Offset                 | Size            | Field        | Notes                                                                 |
+|------------------------|-----------------|--------------|-----------------------------------------------------------------------|
+| `0`                    | 1 byte          | `flags`      | See §2.1–2.4 below                                                    |
+| `1`                    | 1 byte          | `ilen`       | Identifier length (0–255)                                             |
+| `2 .. 2+ilen`          | `ilen` bytes    | `identifier` | Variable length; for file ops this is the file name, for `Auth` the username (no fixed padding) |
+| `2+ilen .. 6+ilen`     | 4 bytes (LE)    | `dlen`       | Data length, capped by `LINASTORE_MAX_PAYLOAD_SIZE`                   |
+| `6+ilen .. 10+ilen`    | 4 bytes (LE)    | `checksum`   | CRC32 of `ilen ‖ identifier ‖ dlen ‖ data`                            |
+| `10+ilen .. 10+ilen+dlen` | `dlen` bytes | `data`       | Operation payload (see §2.5)                                          |
+
+The server response uses the same `ilen`/`dlen`/`checksum` framing but replaces the leading `flags` byte with a `status` byte (see §3).
+
+The first byte of LiNa packet is called "Flags", the specific meaning of each bit is as follows:
 
 **2.1 File Operation Flags (`FO`)**
 
-| Binary | Operation | Description                     |
-|--------|-----------|---------------------------------|
-| `0b00` | None      | No operation requested          |
-| `0b01` | Read      | Request to read a file          |
-| `0b10` | Write     | Request to write/create a file  |
-| `0b11` | Delete    | Request to delete a file        |
-| `0b11` | Auth      | Request authentication handshake    |
+The top 3 bits of the flag byte (`flags & 0b1110_0000`) encode the operation. Decoding is done by exact match against the table below — any unassigned bit pattern is treated as `None`.
+
+| Binary (bit 7..5) | Byte | Operation | Description                          |
+|-------------------|------|-----------|--------------------------------------|
+| `0b000`           | `0x00` | None    | No operation requested               |
+| `0b010`           | `0x40` | Read    | Request to read a file               |
+| `0b011`           | `0x60` | Auth    | Request authentication handshake     |
+| `0b100`           | `0x80` | Write   | Request to write/create a file       |
+| `0b110`           | `0xC0` | Delete  | Request to delete a file             |
+
+> Earlier revisions of this document showed `FO` as a 2-bit field with `Delete` and `Auth` sharing the binary `0b11`. The wire byte values (`0x40`/`0x60`/`0x80`/`0xC0`) have always been distinct on bits 7–5 — clients that use the byte values shown above remain compatible.
 
 **2.2 Cover Flags (`Cov`)**: the incoming data will overwrite the file which has the same data. Be careful to set this flag to `1` if you want keep the original file.
 
@@ -71,6 +86,21 @@ flowchart TD
 ```
 
 **2.3 Compression Flag (`Com`)**: the new file will be compressed if this flag is set to `1`, if you want to compress the file and the file is already in the LiNa Store, plaease set `Cov` to `1` to compress it and overwrite the original file.
+
+**2.4 Reserved bits (bit 4–2)**: currently unused. Clients MUST send these as `0`; servers MUST ignore non-zero values for forward compatibility. Future protocol revisions may use this field for a version tag or additional payload flags (e.g. explicit "encrypted payload" marker).
+
+**2.5 Data field semantics**
+
+| Operation        | `identifier`         | `data`                                                                 |
+|------------------|----------------------|------------------------------------------------------------------------|
+| `Auth` (0x60)    | Username             | Password (null-terminated optional)                                    |
+| `Write` (0x80)   | File name            | `session_token + '\0' + (AES-256-GCM(nonce ‖ ciphertext))` when authenticated; raw file bytes when auth is disabled |
+| `Read` (0x40)    | File name            | `session_token` (null-terminated optional) when authenticated; empty when auth is disabled |
+| `Delete` (0xC0)  | File name            | `session_token` (null-terminated optional) when authenticated; empty when auth is disabled |
+
+The session token is returned by the `Auth` handshake. AES-GCM encryption uses `SHA256(session_token)` as the key and a 12-byte nonce prefix in `data`.
+
+A successful `Auth` response carries `data = status(1 byte) + token + '\0' + expires_at_seconds_ascii`. See §3 for status codes.
 
 ## Authentication
 

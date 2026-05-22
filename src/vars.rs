@@ -3,6 +3,20 @@ use std::sync::{Arc, OnceLock};
 use crate::error::{Result, err_msg};
 use tracing::{event, instrument};
 
+/// Parse a boolean-shaped env var.
+///
+/// Returns `Some(true)` for `1`, `true`, `yes`, `on` (case-insensitive);
+/// `Some(false)` for `0`, `false`, `no`, `off`, or empty; and `None` if the
+/// value can't be classified — so callers can fail-fast instead of silently
+/// defaulting to a surprising state.
+fn parse_truthy(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "" | "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 pub struct EnvVar {
     pub ip_address: String,
     pub advanced_port: String,
@@ -12,6 +26,10 @@ pub struct EnvVar {
     pub admin_username: String,
     pub admin_password: Option<String>,
     pub db_url: String,
+    /// Errors encountered during env parsing. Surfaced by `validate()` so that
+    /// callers (e.g. `run_server`) fail fast on misconfigured inputs instead of
+    /// silently falling back to defaults.
+    init_errors: Vec<String>,
 }
 
 static ENV: OnceLock<Arc<EnvVar>> = OnceLock::new();
@@ -43,21 +61,42 @@ impl EnvVar {
             );
             "8096".to_string()
         });
-        let max_payload_size = std::env::var("LINASTORE_MAX_PAYLOAD_SIZE")
-            .unwrap_or_else(|_| {
+        let mut init_errors: Vec<String> = Vec::new();
+
+        let max_payload_size = match std::env::var("LINASTORE_MAX_PAYLOAD_SIZE") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(v) => v,
+                Err(_) => {
+                    init_errors.push(format!(
+                        "LINASTORE_MAX_PAYLOAD_SIZE is not a valid usize: {:?}",
+                        raw
+                    ));
+                    0x4000000 // placeholder; validate() will reject before use
+                }
+            },
+            Err(_) => {
                 event!(
                     tracing::Level::WARN,
                     "LINASTORE_MAX_PAYLOAD_SIZE not set, using default"
                 );
-                "67108864".to_string()
-            })
-            .parse()
-            .unwrap_or(0x4000000);
+                0x4000000
+            }
+        };
 
-        let auth_required = std::env::var("LINASTORE_AUTH_REQUIRED")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .is_some();
+        let auth_required = match std::env::var("LINASTORE_AUTH_REQUIRED") {
+            Ok(raw) => match parse_truthy(&raw) {
+                Some(v) => v,
+                None => {
+                    init_errors.push(format!(
+                        "LINASTORE_AUTH_REQUIRED has unrecognized value {:?} \
+                         (expected 1/true/yes/on or 0/false/no/off)",
+                        raw
+                    ));
+                    false
+                }
+            },
+            Err(_) => false,
+        };
 
         let db_url = std::env::var("LINASTORE_DB_URL").unwrap_or_else(|_| {
             event!(
@@ -100,6 +139,7 @@ impl EnvVar {
             admin_username,
             admin_password,
             db_url,
+            init_errors,
         }
     }
 
@@ -108,6 +148,19 @@ impl EnvVar {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !self.init_errors.is_empty() {
+            return Err(err_msg(format!(
+                "Invalid LINASTORE_* environment configuration:\n  - {}",
+                self.init_errors.join("\n  - ")
+            )));
+        }
+
+        if self.max_payload_size == 0 {
+            return Err(err_msg(
+                "LINASTORE_MAX_PAYLOAD_SIZE must be greater than 0.",
+            ));
+        }
+
         if self.auth_required && self.admin_password.is_none() {
             return Err(err_msg(
                 "Authentication is enabled, but no admin password was provided. Set LINASTORE_ADMIN_PASSWORD.",
@@ -115,5 +168,31 @@ impl EnvVar {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_truthy;
+
+    #[test]
+    fn parse_truthy_accepts_common_truthy_values() {
+        for raw in ["1", "true", "TRUE", "Yes", "on", " true "] {
+            assert_eq!(parse_truthy(raw), Some(true), "input: {:?}", raw);
+        }
+    }
+
+    #[test]
+    fn parse_truthy_accepts_common_falsy_values() {
+        for raw in ["0", "false", "FALSE", "No", "off", "", "  "] {
+            assert_eq!(parse_truthy(raw), Some(false), "input: {:?}", raw);
+        }
+    }
+
+    #[test]
+    fn parse_truthy_rejects_unknown_values() {
+        for raw in ["enable", "disable", "2", "tru", "noo"] {
+            assert_eq!(parse_truthy(raw), None, "input: {:?}", raw);
+        }
     }
 }
