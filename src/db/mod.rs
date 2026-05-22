@@ -6,23 +6,30 @@
 use crate::error::{Context, Result, err_msg};
 use sqlx::{migrate::Migrator, Pool};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{Level, event};
 
-fn migrations_sqlite_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations/sqlite")
-}
+static MIGRATOR_SQLITE: Migrator = sqlx::migrate!("src/db/migrations/sqlite");
 
 #[cfg(feature = "mysql")]
-fn migrations_mysql_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations/mysql")
-}
+static MIGRATOR_MYSQL: Migrator = sqlx::migrate!("src/db/migrations/mysql");
 
 #[cfg(feature = "postgres")]
-fn migrations_postgres_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations/postgres")
+static MIGRATOR_POSTGRES: Migrator = sqlx::migrate!("src/db/migrations/postgres");
+
+// Reconstructs the migration file stem (e.g. "000001_init_auth") from the
+// embedded Migration metadata, so it matches the `version` strings written
+// into the legacy `mig_records` table by the SQL files themselves. sqlx parses
+// underscores in the description into spaces; we undo that here.
+fn migration_versions(migrator: &Migrator) -> Vec<String> {
+    let mut versions: Vec<String> = migrator
+        .iter()
+        .map(|m| format!("{:06}_{}", m.version, m.description.replace(' ', "_")))
+        .collect();
+    versions.sort();
+    versions
 }
 
 /// Database type enumeration
@@ -385,47 +392,6 @@ fn ensure_sqlite_parent_dir(db_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn migrator_sqlite() -> Result<Migrator> {
-    Migrator::new(migrations_sqlite_dir())
-        .await
-        .context("Failed to create migrator")
-}
-
-#[cfg(feature = "mysql")]
-async fn migrator_mysql() -> Result<Migrator> {
-    Migrator::new(migrations_mysql_dir())
-        .await
-        .context("Failed to create migrator")
-}
-
-#[cfg(feature = "postgres")]
-async fn migrator_postgres() -> Result<Migrator> {
-    Migrator::new(migrations_postgres_dir())
-        .await
-        .context("Failed to create migrator")
-}
-
-fn list_migration_versions(dir: &Path) -> Result<Vec<String>> {
-    let mut versions = Vec::new();
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("Failed to read migration directory: {:?}", dir))?;
-
-    for entry in entries {
-        let entry = entry.with_context(|| "Failed to read migration directory entry".to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        versions.push(stem.to_string());
-    }
-
-    versions.sort();
-    Ok(versions)
-}
-
 fn is_missing_mig_records_table(err: &sqlx::Error) -> bool {
     let msg = err.to_string();
     (msg.contains("mig_records") && msg.contains("does not exist"))
@@ -538,7 +504,7 @@ async fn all_mig_records_present_postgres(
 
 async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (SQLite)");
-    let versions = list_migration_versions(&migrations_sqlite_dir())?;
+    let versions = migration_versions(&MIGRATOR_SQLITE);
     if all_mig_records_present_sqlite(pool, &versions).await? {
         event!(
             Level::INFO,
@@ -546,8 +512,7 @@ async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
         );
         return Ok(());
     }
-    let migrator = migrator_sqlite().await?;
-    migrator
+    MIGRATOR_SQLITE
         .run(pool)
         .await
         .context("Failed to run migrations")?;
@@ -558,7 +523,7 @@ async fn run_migrations_sqlite(pool: &Pool<sqlx::Sqlite>) -> Result<()> {
 #[cfg(feature = "mysql")]
 async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (MySQL)");
-    let versions = list_migration_versions(&migrations_mysql_dir())?;
+    let versions = migration_versions(&MIGRATOR_MYSQL);
     if all_mig_records_present_mysql(pool, &versions).await? {
         event!(
             Level::INFO,
@@ -566,8 +531,7 @@ async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
         );
         return Ok(());
     }
-    let migrator = migrator_mysql().await?;
-    migrator
+    MIGRATOR_MYSQL
         .run(pool)
         .await
         .context("Failed to run migrations")?;
@@ -578,7 +542,7 @@ async fn run_migrations_mysql(pool: &Pool<sqlx::MySql>) -> Result<()> {
 #[cfg(feature = "postgres")]
 async fn run_migrations_postgres(pool: &Pool<sqlx::Postgres>) -> Result<()> {
     event!(Level::INFO, "Running database migrations (PostgreSQL)");
-    let versions = list_migration_versions(&migrations_postgres_dir())?;
+    let versions = migration_versions(&MIGRATOR_POSTGRES);
     if all_mig_records_present_postgres(pool, &versions).await? {
         event!(
             Level::INFO,
@@ -586,8 +550,7 @@ async fn run_migrations_postgres(pool: &Pool<sqlx::Postgres>) -> Result<()> {
         );
         return Ok(());
     }
-    let migrator = migrator_postgres().await?;
-    migrator
+    MIGRATOR_POSTGRES
         .run(pool)
         .await
         .context("Failed to run migrations")?;

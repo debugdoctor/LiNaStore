@@ -45,4 +45,4 @@ EXPOSE 8086 8096
 ENV RUST_LOG=info
 
 # Default command
-CMD ["linastore-server"]
+CMD ["linastore-server", "start", "--foreground"]
