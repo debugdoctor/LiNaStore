@@ -46,18 +46,6 @@ impl LiNaProtocol {
         Op::from_flags(self.flags)
     }
 
-    /// Whether the Cover option bit is set.
-    #[inline]
-    pub fn is_cover(&self) -> bool {
-        (self.flags & FlagType::Cover as u8) != 0
-    }
-
-    /// Whether the Compress option bit is set.
-    #[inline]
-    pub fn is_compress(&self) -> bool {
-        (self.flags & FlagType::Compress as u8) != 0
-    }
-
     pub fn verify(&self) -> bool {
         self.payload.checksum == self.calculate_checksum()
     }
@@ -86,6 +74,7 @@ impl LiNaProtocol {
     }
 }
 
+#[allow(dead_code)]
 pub enum FlagType {
     Delete = 0xC0,
     Write = 0x80,
@@ -375,17 +364,13 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_op_and_option_helpers() {
+    fn test_protocol_op_with_option_bits() {
         let mut p = LiNaProtocol::new();
         p.flags = FlagType::Write as u8 | FlagType::Cover as u8;
         assert_eq!(p.op(), Op::Write);
-        assert!(p.is_cover());
-        assert!(!p.is_compress());
 
         p.flags = FlagType::Read as u8 | FlagType::Compress as u8;
         assert_eq!(p.op(), Op::Read);
-        assert!(!p.is_cover());
-        assert!(p.is_compress());
     }
 
     #[test]

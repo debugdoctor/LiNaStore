@@ -133,13 +133,6 @@ impl Session {
         }
     }
 
-    pub fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now > self.expires_at_timestamp
-    }
 }
 
 /// Hash a password using Argon2id and return its PHC-encoded string form.
@@ -656,17 +649,6 @@ mod tests {
 
         assert_eq!(session.token, token);
         assert_eq!(session.user_id, user_id);
-        assert!(!session.is_expired());
-    }
-
-    #[test]
-    fn test_session_is_expired_not_expired() {
-        let token = "test_token".to_string();
-        let user_id = "test_user".to_string();
-        let expires_at = Instant::now() + Duration::from_secs(3600);
-
-        let session = Session::new(token, user_id, expires_at);
-        assert!(!session.is_expired());
     }
 
     #[test]

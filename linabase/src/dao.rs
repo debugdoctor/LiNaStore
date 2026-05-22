@@ -3,7 +3,6 @@ use sqlx::{Pool, Sqlite, Row};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use std::str::FromStr;
 use std::path::Path;
-use uuid::Uuid;
 
 const SQL_INIT: &str = r#"
 CREATE TABLE IF NOT EXISTS link (
@@ -102,16 +101,6 @@ impl Dao {
 
 // Link CRUD operations.
 impl Dao {
-    pub async fn insert_link(
-        &self,
-        name: &str,
-        ext: &str,
-        source_id: &str,
-    ) -> Result<()> {
-        let id = Uuid::new_v4().to_string();
-        self.insert_link_with_id(&id, name, ext, source_id).await
-    }
-
     pub async fn insert_link_with_id(
         &self,
         id: &str,
@@ -351,6 +340,7 @@ impl Dao {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_dao_new() {
