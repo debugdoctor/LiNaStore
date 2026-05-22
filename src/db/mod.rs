@@ -143,11 +143,6 @@ impl DbConnection {
         }
     }
 
-    /// Get the database type
-    pub fn db_type(&self) -> DbType {
-        self.db_type
-    }
-
     pub async fn auth_get_user_id_by_username(&self, username: &str) -> Result<Option<String>> {
         match self.pool.as_ref() {
             DbPool::Sqlite(pool) => {

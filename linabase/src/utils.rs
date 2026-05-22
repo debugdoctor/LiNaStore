@@ -17,8 +17,6 @@ use std::{
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-const BLOCK_SIZE: usize = 8;
-const GROUP_SIZE: usize = BLOCK_SIZE * 8;
 const BUFFER_SIZE: usize = 0x80000;
 
 pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, BoxError> {
@@ -138,45 +136,6 @@ impl BlockManager {
 
         BlockManager {
             chunk_size: 0x10000 - 0x400, // 63KiB for optimal compression
-            thread_pool,
-            multi_thread_threshold: 1024 * 1024, // 1MB threshold for multi-threading
-            max_threads,
-        }
-    }
-
-    /// Create a new BlockManager with custom chunk size
-    ///
-    /// # Arguments
-    /// * `chunk_size` - Size of each chunk for compression
-    ///
-    /// # Panics
-    /// Panics if chunk_size is not a multiple of GROUP_SIZE or exceeds maximum
-    pub fn with_capacity(chunk_size: usize) -> Self {
-        if chunk_size % GROUP_SIZE != 0 {
-            panic!("Chunk size must be a multiple of {} bytes", GROUP_SIZE);
-        }
-
-        if chunk_size > 0x10000 - 0x400 {
-            panic!("Chunk size must be less than (not equal to) 64KiB");
-        }
-
-        // Use number of available CPU cores for optimal performance
-        let max_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(4);
-
-        let thread_pool = match ThreadPoolBuilder::new()
-            .num_threads(max_threads)
-            .thread_name(|index| format!("linastore-compress-{}", index))
-            .build()
-        {
-            Ok(pool) => pool,
-            Err(err) => panic!("Failed to create thread pool: {}", err),
-        };
-
-        BlockManager {
-            chunk_size,
             thread_pool,
             multi_thread_threshold: 1024 * 1024, // 1MB threshold for multi-threading
             max_threads,

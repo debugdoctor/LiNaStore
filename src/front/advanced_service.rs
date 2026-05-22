@@ -14,7 +14,7 @@ use crate::{
         get_handshake_rate_limiter,
     },
     conveyer::ConveyQueue,
-    dtos::{Behavior, Content, FlagType, LiNaProtocol, Op, Package, Status},
+    dtos::{Behavior, Content, LiNaProtocol, Op, Package, Status},
     shutdown::Shutdown,
 };
 
