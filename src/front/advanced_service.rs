@@ -11,9 +11,10 @@ use crate::vars;
 use crate::{
     auth::{
         HandshakeStatus, decrypt_with_token, extract_password, extract_username, get_auth_manager,
+        get_handshake_rate_limiter,
     },
     conveyer::ConveyQueue,
-    dtos::{Behavior, Content, FlagType, LiNaProtocol, Package, Status},
+    dtos::{Behavior, Content, FlagType, LiNaProtocol, Op, Package, Status},
     shutdown::Shutdown,
 };
 
@@ -185,8 +186,33 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             }
         }
 
+        // Decode the operation once; downstream branches dispatch on this enum
+        // instead of order-sensitive bitwise checks.
+        let op = message.op();
+
         // Handle authentication handshake request
-        if message.flags & FlagType::Auth as u8 == FlagType::Auth as u8 {
+        if op == Op::Auth {
+            // Per-IP rate limit BEFORE doing any password work, so a flood of
+            // bad handshakes can't burn CPU on Argon2 verifications.
+            let rate_limiter = get_handshake_rate_limiter();
+            let peer_ip = peer_addr.ip();
+            if !rate_limiter.check(peer_ip) {
+                event!(
+                    Level::WARN,
+                    "[waitress {}] Handshake rate-limited for peer {}",
+                    &log_id,
+                    peer_ip
+                );
+                write_error_response(
+                    &mut stream,
+                    &log_id,
+                    Status::Unauthorized,
+                    Some(HandshakeStatus::InvalidPassword.as_u8()),
+                )
+                .await;
+                return;
+            }
+
             // Extract username from identifier field (variable-length, null-terminated)
             let username = extract_username(&message.payload.identifier);
 
@@ -199,6 +225,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                     "[waitress {}] Empty username in authentication handshake",
                     &log_id
                 );
+                rate_limiter.record_failure(peer_ip);
                 write_error_response(
                     &mut stream,
                     &log_id,
@@ -212,6 +239,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             // Handle handshake using auth manager
             match auth_manager.handle_handshake(&username, &password).await {
                 Ok((token, expires_at)) => {
+                    rate_limiter.record_success(peer_ip);
                     // Build response: status(1) + token + '\0' + expires_at (as bytes)
                     let mut response_data = Vec::new();
                     response_data.push(HandshakeStatus::Success.as_u8());
@@ -242,6 +270,11 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                     );
                 }
                 Err(status) => {
+                    // Only count actual credential failures toward the rate
+                    // limit; AuthDisabled / InternalError are server-side.
+                    if matches!(status, HandshakeStatus::InvalidPassword) {
+                        rate_limiter.record_failure(peer_ip);
+                    }
                     event!(
                         Level::WARN,
                         "[waitress {}] Authentication handshake failed for user {}: {:?}",
@@ -268,8 +301,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
         let uni_id = uuid.into_bytes();
 
         // Extract session token from payload data for write operations
-        let (session_token, file_data) = if (message.flags & FlagType::Write as u8)
-            == FlagType::Write as u8
+        let (session_token, file_data) = if op == Op::Write
             && !message.payload.data.is_empty()
         {
             // Extract session token and file data without cloning large buffers.
@@ -394,14 +426,13 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
         // Order generation
         let mut order_pkg = Package::new_with_id(&uuid);
-        order_pkg.behavior = if message.flags & FlagType::Delete as u8 == FlagType::Delete as u8 {
-            Behavior::DeleteFile
-        } else if message.flags & FlagType::Write as u8 == FlagType::Write as u8 {
-            Behavior::PutFile
-        } else if message.flags & FlagType::Read as u8 == FlagType::Read as u8 {
-            Behavior::GetFile
-        } else {
-            Behavior::None
+        order_pkg.behavior = match op {
+            Op::Delete => Behavior::DeleteFile,
+            Op::Write => Behavior::PutFile,
+            Op::Read => Behavior::GetFile,
+            // Auth was handled above and returns early; None means an unknown
+            // / unset op field, dispatched as a no-op for the worker.
+            Op::Auth | Op::None => Behavior::None,
         };
 
         order_pkg.content = Content {

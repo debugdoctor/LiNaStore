@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS link (
     name TEXT NOT NULL,
     ext TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    FOREIGN KEY (source_id) REFERENCES source (id)
+    FOREIGN KEY (source_id) REFERENCES source (id) ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS link_name_idx ON link (name);
@@ -76,6 +76,7 @@ impl Dao {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = sqlx::SqlitePool::connect_with(options)
@@ -225,6 +226,17 @@ impl Dao {
         compressed: bool,
         size: u64,
     ) -> Result<()> {
+        self.insert_source_with_count(id, hash256, compressed, size, 1).await
+    }
+
+    pub async fn insert_source_with_count(
+        &self,
+        id: &str,
+        hash256: &str,
+        compressed: bool,
+        size: u64,
+        count: u64,
+    ) -> Result<()> {
         let now = chrono::Utc::now().naive_local().format("%Y-%m-%d %H:%M:%S").to_string();
         sqlx::query(
             "INSERT INTO source (id, hash256, compressed, size, count, create_at, update_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -233,13 +245,21 @@ impl Dao {
         .bind(hash256)
         .bind(compressed)
         .bind(size as i64)
-        .bind(1)
+        .bind(count as i64)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
         .await
         .context("Failed to insert source")?;
         Ok(())
+    }
+
+    pub async fn list_source_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>("SELECT id FROM source")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list source ids")?;
+        Ok(rows)
     }
 
     pub async fn get_source_by_id(&self, id: &str) -> Result<Option<Source>> {

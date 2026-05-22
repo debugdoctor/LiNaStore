@@ -11,6 +11,11 @@ use crate::{
     shutdown::Shutdown,
 };
 
+#[inline]
+fn flag_set(flags: u8, bit: FlagType) -> bool {
+    (flags & bit as u8) != 0
+}
+
 // Error logging interval to avoid log flooding
 const ERROR_LOG_INTERVAL: u32 = 100;
 const MAX_PORTER_CONCURRENCY: usize = 8;
@@ -161,8 +166,8 @@ async fn process_package(
     match pkg.behavior {
         Behavior::PutFile => {
             let flags = pkg.content.flags;
-            let should_cover = flags & FlagType::Cover as u8 == FlagType::Cover as u8;
-            let should_compress = flags & FlagType::Compress as u8 == FlagType::Compress as u8;
+            let should_cover = flag_set(flags, FlagType::Cover);
+            let should_compress = flag_set(flags, FlagType::Compress);
 
             match store_manager.put_binary_data(
                 &identifier,

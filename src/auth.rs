@@ -41,10 +41,15 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use hex;
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+    Argon2,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::time::{Duration, Instant};
 use tracing::{Level, event};
 use uuid::Uuid;
@@ -137,12 +142,37 @@ impl Session {
     }
 }
 
+/// Hash a password using Argon2id and return its PHC-encoded string form.
+///
+/// The PHC string self-describes its salt and parameters, so it can be stored
+/// verbatim and verified without any external metadata.
+pub fn hash_password_argon2(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| err_msg(format!("Argon2 hash failed: {}", e)))?
+        .to_string();
+    Ok(hash)
+}
+
+/// Verify a password against a PHC-encoded Argon2 hash.
+pub fn verify_password_argon2(password: &str, phc: &str) -> bool {
+    match PasswordHash::new(phc) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Database-backed Auth Manager
 #[derive(Debug, Clone)]
 pub struct AuthManager {
     db_conn: Option<Arc<DbConnection>>,
     auth_required: bool,
-    password_hash: Option<String>,
+    /// Argon2id PHC string of the admin password, computed once at startup.
+    password_phc: Option<String>,
 }
 
 impl AuthManager {
@@ -151,15 +181,17 @@ impl AuthManager {
         let env = EnvVar::get_instance();
         let auth_required = env.auth_required;
 
-        let password_hash = if auth_required {
-            let mut hasher = Sha256::new();
-            hasher.update(
-                env.admin_password
-                    .as_deref()
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            Some(hex::encode(hasher.finalize()))
+        let password_phc = if auth_required {
+            match env.admin_password.as_deref() {
+                Some(pw) if !pw.is_empty() => match hash_password_argon2(pw) {
+                    Ok(phc) => Some(phc),
+                    Err(e) => {
+                        event!(Level::ERROR, "Failed to hash admin password at startup: {}", e);
+                        None
+                    }
+                },
+                _ => None,
+            }
         } else {
             None
         };
@@ -167,7 +199,7 @@ impl AuthManager {
         AuthManager {
             db_conn,
             auth_required,
-            password_hash,
+            password_phc,
         }
     }
 
@@ -176,16 +208,12 @@ impl AuthManager {
     }
 
     pub fn verify_password(&self, password: &str) -> bool {
-        match &self.password_hash {
-            Some(hash) => {
-                let mut hasher = Sha256::new();
-                hasher.update(password.as_bytes());
-                let input_hash = hex::encode(hasher.finalize());
-                input_hash == *hash
-            }
+        match &self.password_phc {
+            Some(phc) => verify_password_argon2(password, phc),
             None => false,
         }
     }
+
 
     /// Create a new session and store it in the database
     pub async fn create_session(&self, user_id: &str) -> Result<Session> {
@@ -312,13 +340,12 @@ impl AuthManager {
                     Ok(Some(id)) => id.to_string(),
                     Ok(None) => {
                         let user_id = Uuid::new_v4().to_string();
+                        // We just verified the password against the in-memory PHC;
+                        // generate a fresh per-row PHC (independent salt) for storage.
+                        let user_phc = hash_password_argon2(password)
+                            .map_err(|_| HandshakeStatus::InternalError)?;
                         db_conn
-                            .auth_insert_user(
-                                &user_id,
-                                username,
-                                self.password_hash.as_ref().unwrap(),
-                                now,
-                            )
+                            .auth_insert_user(&user_id, username, &user_phc, now)
                             .await
                             .map_err(|_| HandshakeStatus::InternalError)?;
                         user_id.to_string()
@@ -343,6 +370,99 @@ impl AuthManager {
             Err(HandshakeStatus::InvalidPassword)
         }
     }
+}
+
+/// Per-IP sliding-window rate limiter for the authentication handshake path.
+///
+/// Tracks recent *failure* timestamps. When the count within the window
+/// crosses `max_failures`, the IP is blocked for the remainder of the window.
+/// Successful authentications clear the IP's record.
+#[derive(Debug)]
+pub struct HandshakeRateLimiter {
+    window: Duration,
+    max_failures: u32,
+    /// Once the map grows past this size, the next `record_failure` does a
+    /// full sweep to drop fully-expired entries. Amortizes cleanup cost so
+    /// long-running servers don't leak entries from one-shot attackers.
+    gc_threshold: usize,
+    state: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+}
+
+impl HandshakeRateLimiter {
+    pub fn new(window: Duration, max_failures: u32) -> Self {
+        Self::with_gc_threshold(window, max_failures, 1024)
+    }
+
+    pub fn with_gc_threshold(window: Duration, max_failures: u32, gc_threshold: usize) -> Self {
+        Self {
+            window,
+            max_failures,
+            gc_threshold,
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return true if the IP is currently allowed to attempt a handshake.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return true, // poisoned: fail-open rather than DoS ourselves
+        };
+        if let Some(entries) = guard.get_mut(&ip) {
+            entries.retain(|t| now.duration_since(*t) < self.window);
+            (entries.len() as u32) < self.max_failures
+        } else {
+            true
+        }
+    }
+
+    pub fn record_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let entries = guard.entry(ip).or_insert_with(Vec::new);
+        entries.retain(|t| now.duration_since(*t) < self.window);
+        entries.push(now);
+
+        // Opportunistic GC: when the map exceeds gc_threshold, sweep all
+        // entries and drop ones whose failures have fully aged out. Cost is
+        // amortized across writes; no background task required.
+        if guard.len() > self.gc_threshold {
+            let window = self.window;
+            guard.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < window);
+                !v.is_empty()
+            });
+        }
+    }
+
+    pub fn record_success(&self, ip: IpAddr) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.remove(&ip);
+        }
+    }
+
+    /// Number of tracked IPs. Exposed for tests / metrics.
+    #[cfg(test)]
+    pub fn tracked_ip_count(&self) -> usize {
+        self.state.lock().map(|g| g.len()).unwrap_or(0)
+    }
+}
+
+static HANDSHAKE_RATE_LIMITER: OnceLock<Arc<HandshakeRateLimiter>> = OnceLock::new();
+
+pub fn get_handshake_rate_limiter() -> Arc<HandshakeRateLimiter> {
+    HANDSHAKE_RATE_LIMITER
+        .get_or_init(|| {
+            // 5 failed attempts per 60-second window per IP. Tuned to be
+            // forgiving for legit clients re-trying, hostile to scripted
+            // brute-force which needs >>5 attempts to be useful.
+            Arc::new(HandshakeRateLimiter::new(Duration::from_secs(60), 5))
+        })
+        .clone()
 }
 
 static AUTH_MANAGER: OnceLock<Arc<AuthManager>> = OnceLock::new();
@@ -381,10 +501,8 @@ pub async fn init_admin_user(db_conn: &Arc<DbConnection>) -> Result<()> {
             event!(Level::INFO, "Admin user '{}' already exists, skipping creation", admin_username);
         }
         Ok(None) => {
-            // Hash the admin password
-            let mut hasher = Sha256::new();
-            hasher.update(admin_password.as_bytes());
-            let password_hash = hex::encode(hasher.finalize());
+            // Hash the admin password with Argon2id (per-row salt embedded in PHC).
+            let password_phc = hash_password_argon2(admin_password)?;
 
             // Generate user ID
             let user_id = Uuid::new_v4().to_string();
@@ -395,7 +513,7 @@ pub async fn init_admin_user(db_conn: &Arc<DbConnection>) -> Result<()> {
 
             // Insert admin user into database
             db_conn
-                .auth_insert_user(&user_id, admin_username, &password_hash, now)
+                .auth_insert_user(&user_id, admin_username, &password_phc, now)
                 .await?;
 
             event!(Level::INFO, "Admin user '{}' created successfully", admin_username);
@@ -590,34 +708,80 @@ mod tests {
     }
 
     #[test]
-    fn test_password_hashing() {
-        let password = "test_password_123";
-
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let hash1 = hex::encode(hasher.finalize());
-
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let hash2 = hex::encode(hasher.finalize());
-
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 64); // SHA256 produces 64 hex characters
+    fn test_argon2_roundtrip() {
+        let password = "correct horse battery staple";
+        let phc = hash_password_argon2(password).expect("hash");
+        assert!(phc.starts_with("$argon2"), "expected PHC string, got: {}", phc);
+        assert!(verify_password_argon2(password, &phc));
+        assert!(!verify_password_argon2("wrong", &phc));
     }
 
     #[test]
-    fn test_password_hashing_different_passwords() {
-        let password1 = "password1";
-        let password2 = "password2";
+    fn test_argon2_unique_salt_per_hash() {
+        // Two PHC strings for the same password must differ because the salt
+        // is randomly generated, but both must still verify.
+        let password = "same-password";
+        let phc1 = hash_password_argon2(password).expect("hash1");
+        let phc2 = hash_password_argon2(password).expect("hash2");
+        assert_ne!(phc1, phc2);
+        assert!(verify_password_argon2(password, &phc1));
+        assert!(verify_password_argon2(password, &phc2));
+    }
 
-        let mut hasher1 = Sha256::new();
-        hasher1.update(password1.as_bytes());
-        let hash1 = hex::encode(hasher1.finalize());
+    #[test]
+    fn test_argon2_rejects_malformed_phc() {
+        assert!(!verify_password_argon2("x", "not-a-phc-string"));
+        assert!(!verify_password_argon2("x", ""));
+    }
 
-        let mut hasher2 = Sha256::new();
-        hasher2.update(password2.as_bytes());
-        let hash2 = hex::encode(hasher2.finalize());
+    #[test]
+    fn test_rate_limiter_opportunistic_gc_drops_expired_entries() {
+        // Tight window + tiny threshold so the GC trigger is reachable in a
+        // unit test without sleeping for the real default window.
+        let limiter = HandshakeRateLimiter::with_gc_threshold(
+            Duration::from_millis(50),
+            5,
+            4, // sweep once we cross 4 tracked IPs
+        );
 
-        assert_ne!(hash1, hash2);
+        // Insert 5 distinct IPs.
+        for octet in 1u8..=5 {
+            let ip: IpAddr = format!("10.0.0.{}", octet).parse().unwrap();
+            limiter.record_failure(ip);
+        }
+        assert_eq!(limiter.tracked_ip_count(), 5);
+
+        // Wait past the window so every recorded failure becomes expired.
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Touching a new IP triggers the threshold-driven sweep, which should
+        // wipe out the 5 stale entries and leave only the freshly-recorded one.
+        let fresh: IpAddr = "10.0.0.99".parse().unwrap();
+        limiter.record_failure(fresh);
+        assert_eq!(
+            limiter.tracked_ip_count(),
+            1,
+            "expected stale entries to be GC'd, leaving only the fresh IP"
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_after_threshold_and_resets_on_success() {
+        let limiter = HandshakeRateLimiter::new(Duration::from_secs(60), 3);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        for _ in 0..3 {
+            assert!(limiter.check(ip));
+            limiter.record_failure(ip);
+        }
+        assert!(!limiter.check(ip), "should be blocked after 3 failures");
+
+        // Different IP is unaffected.
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(limiter.check(other));
+
+        // A success clears the failure record.
+        limiter.record_success(ip);
+        assert!(limiter.check(ip));
     }
 }

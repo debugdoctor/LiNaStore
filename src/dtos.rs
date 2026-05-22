@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -40,6 +40,24 @@ impl LiNaProtocol {
         }
     }
 
+    /// Parsed operation derived from the top 3 bits of `flags`.
+    #[inline]
+    pub fn op(&self) -> Op {
+        Op::from_flags(self.flags)
+    }
+
+    /// Whether the Cover option bit is set.
+    #[inline]
+    pub fn is_cover(&self) -> bool {
+        (self.flags & FlagType::Cover as u8) != 0
+    }
+
+    /// Whether the Compress option bit is set.
+    #[inline]
+    pub fn is_compress(&self) -> bool {
+        (self.flags & FlagType::Compress as u8) != 0
+    }
+
     pub fn verify(&self) -> bool {
         self.payload.checksum == self.calculate_checksum()
     }
@@ -55,15 +73,16 @@ impl LiNaProtocol {
     }
 
     pub fn serialize_protocol_message(&self) -> Bytes {
-        let mut payload = Vec::with_capacity(0x1000);
+        // status(1) + ilen(1) + identifier(ilen) + dlen(4) + checksum(4) + data
+        let cap = 1 + 1 + self.payload.identifier.len() + 4 + 4 + self.payload.data.len();
+        let mut buf = BytesMut::with_capacity(cap);
 
-        payload.push(self.status.clone() as u8);
-        payload.push(self.payload.ilen);
-        payload.extend_from_slice(&self.payload.identifier);
-        payload.extend_from_slice(&self.payload.dlen.to_le_bytes());
-        payload.extend_from_slice(&self.payload.checksum.to_le_bytes());
-        payload.extend_from_slice(&self.payload.data);
-        Bytes::from(payload)
+        buf.extend_from_slice(&[self.status.clone() as u8, self.payload.ilen]);
+        buf.extend_from_slice(&self.payload.identifier);
+        buf.extend_from_slice(&self.payload.dlen.to_le_bytes());
+        buf.extend_from_slice(&self.payload.checksum.to_le_bytes());
+        buf.extend_from_slice(&self.payload.data);
+        buf.freeze()
     }
 }
 
@@ -75,6 +94,39 @@ pub enum FlagType {
     Cover = 0x02,
     Compress = 0x01,
     None = 0x00,
+}
+
+/// Parsed file-operation field — the top 3 bits of `flags`.
+///
+/// The bitmask layout used `Delete=0xC0=0b110_xxxxx`, `Write=0xB80=0b100`,
+/// `Auth=0x60=0b011`, `Read=0x40=0b010`. Decoding via bitwise AND (e.g.
+/// `flags & Read == Read`) is order-sensitive — `Delete & Read == Read` —
+/// so any caller that doesn't check Delete first silently corrupts the
+/// dispatch. This enum is the single source of truth and removes that trap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Op {
+    None,
+    Read,
+    Write,
+    Delete,
+    Auth,
+}
+
+impl Op {
+    /// Bitmask covering the file-operation field (top 3 bits of `flags`).
+    pub const OP_MASK: u8 = 0b1110_0000;
+    const OP_SHIFT: u8 = 5;
+
+    #[inline]
+    pub fn from_flags(flags: u8) -> Op {
+        match (flags & Self::OP_MASK) >> Self::OP_SHIFT {
+            0b010 => Op::Read,
+            0b011 => Op::Auth,
+            0b100 => Op::Write,
+            0b110 => Op::Delete,
+            _ => Op::None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -286,6 +338,54 @@ mod tests {
         assert_eq!(Behavior::GetFile, Behavior::GetFile);
         assert_ne!(Behavior::GetFile, Behavior::PutFile);
         assert_ne!(Behavior::PutFile, Behavior::DeleteFile);
+    }
+
+    #[test]
+    fn test_op_from_flags_basic_values() {
+        assert_eq!(Op::from_flags(FlagType::None as u8), Op::None);
+        assert_eq!(Op::from_flags(FlagType::Read as u8), Op::Read);
+        assert_eq!(Op::from_flags(FlagType::Auth as u8), Op::Auth);
+        assert_eq!(Op::from_flags(FlagType::Write as u8), Op::Write);
+        assert_eq!(Op::from_flags(FlagType::Delete as u8), Op::Delete);
+    }
+
+    #[test]
+    fn test_op_does_not_confuse_delete_with_read() {
+        // Delete = 0xC0 = 0b1100_0000. Old code did `flags & Read == Read`,
+        // and 0xC0 & 0x40 == 0x40, so without ordering Delete was read as Read.
+        // The enum-based parser must classify it as Delete regardless of caller.
+        assert_eq!(Op::from_flags(0xC0), Op::Delete);
+        // Option bits must not perturb the classification.
+        assert_eq!(
+            Op::from_flags(FlagType::Delete as u8 | FlagType::Cover as u8 | FlagType::Compress as u8),
+            Op::Delete,
+        );
+        assert_eq!(
+            Op::from_flags(FlagType::Write as u8 | FlagType::Compress as u8),
+            Op::Write,
+        );
+    }
+
+    #[test]
+    fn test_op_unknown_bit_patterns_fall_back_to_none() {
+        // 0b001 / 0b101 / 0b111 are not assigned in the spec.
+        assert_eq!(Op::from_flags(0b0010_0000), Op::None);
+        assert_eq!(Op::from_flags(0b1010_0000), Op::None);
+        assert_eq!(Op::from_flags(0b1110_0000), Op::None);
+    }
+
+    #[test]
+    fn test_protocol_op_and_option_helpers() {
+        let mut p = LiNaProtocol::new();
+        p.flags = FlagType::Write as u8 | FlagType::Cover as u8;
+        assert_eq!(p.op(), Op::Write);
+        assert!(p.is_cover());
+        assert!(!p.is_compress());
+
+        p.flags = FlagType::Read as u8 | FlagType::Compress as u8;
+        assert_eq!(p.op(), Op::Read);
+        assert!(!p.is_cover());
+        assert!(p.is_compress());
     }
 
     #[test]
