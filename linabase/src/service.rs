@@ -716,7 +716,10 @@ impl TidyManager {
         let paths = utils::path_walk(target_path)?;
 
         for path in paths {
-            self.file_info_collector(&path);
+            if let Err(e) = self.file_info_collector(&path) {
+                eprintln!("[linastore] tidy: skipping {}: {}", path.display(), e);
+                continue;
+            }
         }
 
         for key in self.map_cache.keys() {
@@ -757,31 +760,22 @@ impl TidyManager {
         Ok(())
     }
 
-    fn file_info_collector(&mut self, path: &Path) {
-        let hash_code = match utils::get_hash256_from_file(path) {
-            Ok(hash_code) => hash_code,
-            Err(e) => panic!(
-                "Hash of file {} generate error: {}",
-                path.display(),
-                e.to_string()
-            ),
-        };
+    fn file_info_collector(&mut self, path: &Path) -> Result<(), BoxError> {
+        let hash_code = utils::get_hash256_from_file(path).map_err(|e| {
+            boxed_io_error(
+                io::ErrorKind::Other,
+                format!("Hash of file {} generate error: {}", path.display(), e),
+            )
+        })?;
 
-        let created_date = match stdfs::metadata(path) {
-            Ok(metadata) => match metadata.created() {
-                Ok(date) => date,
-                Err(e) => panic!(
-                    "Get file {} create date error: {}",
-                    path.display(),
-                    e.to_string()
-                ),
-            },
-            Err(e) => panic!(
-                "Get file {} metadata error: {}",
-                path.display(),
-                e.to_string()
-            ),
-        };
+        let created_date = stdfs::metadata(path)
+            .and_then(|metadata| metadata.created())
+            .map_err(|e| {
+                boxed_io_error(
+                    io::ErrorKind::Other,
+                    format!("Get file {} metadata/date error: {}", path.display(), e),
+                )
+            })?;
 
         let formated_created_date = DateTime::<Utc>::from(created_date)
             .format("%Y%m%d%H%M%S")
@@ -791,6 +785,8 @@ impl TidyManager {
             .entry(hash_code)
             .or_insert_with(Vec::new)
             .push((path.to_path_buf(), formated_created_date));
+
+        Ok(())
     }
 
     fn find_extreme_file<'a, F>(
