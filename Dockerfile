@@ -11,13 +11,29 @@ RUN apk add --no-cache \
     zlib-dev \
     build-base
 
-# Set working directory
 WORKDIR /app
 
-# Copy Cargo files for dependency caching
-COPY . .
+# Copy Cargo files for dependency caching (layer optimization)
+COPY Cargo.toml Cargo.lock ./
+COPY linabase/Cargo.toml ./linabase/
 
-# Build dependencies only (this layer will be cached if Cargo files don't change)
+# Create dummy source files to build dependencies only
+RUN mkdir -p src linabase/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > linabase/src/lib.rs \
+    # Build dependencies (this layer is cached if Cargo files don't change)
+    && cargo build --release \
+    # Remove dummy source files
+    && rm -rf src linabase/src
+
+# Copy actual source code
+COPY src/ ./src/
+COPY linabase/src/ ./linabase/src/
+
+# Ensure new source is picked up
+RUN touch src/main.rs linabase/src/lib.rs
+
+# Build the actual binary (dependencies already compiled)
 RUN cargo build --release
 
 
@@ -27,22 +43,25 @@ FROM alpine:3.22
 # Install runtime dependencies
 RUN apk add --no-cache \
     ca-certificates \
-    openssl
+    openssl \
+    sqlite-libs
 
-# Set working directory
+# Create non-root user
+RUN addgroup -S linastore && adduser -S linastore -G linastore
+
 WORKDIR /app
 
 # Copy binary from builder stage
-COPY --from=builder /app/target/release/linastore-server /usr/local/bin/
+COPY --from=builder /app/target/release/linastore /usr/local/bin/
 
 # Switch to non-root user
-USER root
+USER linastore
 
-# Expose default ports (adjust based on your application needs)
+# Expose default ports
 EXPOSE 8086 8096
 
 # Set environment variables
 ENV RUST_LOG=info
 
 # Default command
-CMD ["linastore-server", "start", "--foreground"]
+CMD ["linastore", "start", "--foreground"]

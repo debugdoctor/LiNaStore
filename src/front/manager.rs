@@ -19,8 +19,14 @@ pub async fn front() {
     let http_addr = format!("{}:{}", ip, http_port);
     let advanced_addr = format!("{}:{}", ip, advanced_port);
 
-    let _ = tokio::join!(
-        async { run_http_server(&http_addr).await },
-        async { run_advanced_server(&advanced_addr).await },
+    tokio::join!(
+        async {
+            run_http_server(&http_addr).await;
+            event!(tracing::Level::WARN, "HTTP server exited");
+        },
+        async {
+            run_advanced_server(&advanced_addr).await;
+            event!(tracing::Level::WARN, "Advanced server exited");
+        },
     );
 }

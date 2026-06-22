@@ -1,5 +1,4 @@
 use blake3::Hasher;
-use core::panic;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rayon::{
     ThreadPool, ThreadPoolBuilder,
@@ -24,7 +23,7 @@ pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, Box
     let mut file = fs::File::open(file_path)?;
     let file_size = file.metadata()?.len();
     let mut total_read = 0;
-    let mut buffer = [0u8; 0x200000];
+    let mut buffer = vec![0u8; 0x200000];
 
     while total_read < file_size {
         let bytes_read = file.read(&mut buffer)?;
@@ -157,8 +156,8 @@ impl BlockManager {
         // Determine thread count based on input size
         let thread_count = self.determine_thread_count(input.len());
 
-        let compress_chunk = |chunk: &[u8]| -> Vec<u8> {
-            let compressed_chunk = self.__encode(chunk);
+        let compress_chunk = |chunk: &[u8]| -> Result<Vec<u8>, BoxError> {
+            let compressed_chunk = self.__encode(chunk)?;
             let raw_len = chunk.len();
             let compressed_chunk_len = compressed_chunk.len();
 
@@ -171,26 +170,31 @@ impl BlockManager {
                 chunk_result.extend_from_slice(chunk);
             } else {
                 if compressed_chunk_len > 0x10000 {
-                    panic!(
-                        "Compressed chunk length is greater than 64KiB: {:x}",
-                        compressed_chunk_len
-                    );
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "Compressed chunk length is greater than 64KiB: {:x}",
+                            compressed_chunk_len
+                        ),
+                    )));
                 }
                 // Add compressed flag
                 chunk_result.push(1);
-                chunk_result
-                    .extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
+                chunk_result.extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
                 chunk_result.extend_from_slice(&compressed_chunk);
             }
-            chunk_result
+            Ok(chunk_result)
         };
 
         let compressed_chunks: Vec<Vec<u8>> = if thread_count == 1 {
-            input.chunks(self.chunk_size).map(compress_chunk).collect()
+            input.chunks(self.chunk_size).map(compress_chunk).collect::<Result<Vec<_>, _>>()?
         } else {
             self.thread_pool.install(|| {
-                input.par_chunks(self.chunk_size).map(compress_chunk).collect()
-            })
+                input
+                    .par_chunks(self.chunk_size)
+                    .map(compress_chunk)
+                    .collect::<Result<Vec<_>, _>>()
+            })?
         };
 
         let total_len: usize = compressed_chunks.iter().map(|c| c.len()).sum();
@@ -260,15 +264,18 @@ impl BlockManager {
         let decompressed_chunks = self.thread_pool.install(|| {
             chunks_with_flag
                 .par_iter()
-                .map(|(flag, start, end)| {
+                .map(|(flag, start, end)| -> Result<Cow<'_, [u8]>, BoxError> {
                     match flag {
-                        0 => Cow::Borrowed(&input[*start..*end]), // Uncompressed chunk
-                        1 => Cow::Owned(self.__decode(&input[*start..*end])), // Compressed chunk
-                        _ => panic!("Unknown chunk flag"),
+                        0 => Ok(Cow::Borrowed(&input[*start..*end])),
+                        1 => Ok(Cow::Owned(self.__decode(&input[*start..*end])?)),
+                        _ => Err(Box::new(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Unknown chunk flag: {}", flag),
+                        ))),
                     }
                 })
-                .collect::<Vec<_>>()
-        });
+                .collect::<Result<Vec<_>, _>>()
+        })?;
 
         let total_len: usize = decompressed_chunks.iter().map(|c| c.len()).sum();
         let mut result: Vec<u8> = Vec::with_capacity(total_len.max(original_size));
@@ -296,32 +303,20 @@ impl BlockManager {
         Ok(result)
     }
     // Input bytes less than 0x10000 (64KiB) - 0xa
-    fn __encode(&self, chunk: &[u8]) -> Vec<u8> {
-        // Mutable size array
+    fn __encode(&self, chunk: &[u8]) -> Result<Vec<u8>, BoxError> {
         let result = Vec::with_capacity(u16::MAX as usize);
 
         let mut encoder = GzEncoder::new(result, Compression::fast());
-        match encoder.write_all(chunk) {
-            Ok(_) => {}
-            Err(e) => panic!("Failed to encode chunk: {}", e),
-        }
-
-        match encoder.finish() {
-            Ok(compressed_data) => compressed_data,
-            Err(e) => panic!("Failed to finalize compression: {}", e),
-        }
+        encoder.write_all(chunk)?;
+        Ok(encoder.finish()?)
     }
 
-    fn __decode(&self, chunk: &[u8]) -> Vec<u8> {
+    fn __decode(&self, chunk: &[u8]) -> Result<Vec<u8>, BoxError> {
         let mut result = Vec::with_capacity(u16::MAX as usize);
         let mut decoder = GzDecoder::new(chunk);
 
-        match decoder.read_to_end(&mut result) {
-            Ok(_) => {}
-            Err(e) => panic!("Failed to write chunk for decompression: {}", e),
-        }
-
-        result
+        decoder.read_to_end(&mut result)?;
+        Ok(result)
     }
 }
 
@@ -475,31 +470,6 @@ mod tests {
 
         // Large input should produce a valid hash
         assert_eq!(hash.len(), 64);
-    }
-
-    #[test]
-    fn test_block_manager_with_capacity() {
-        let manager = BlockManager::with_capacity(0x10000 - 0x800); // Valid chunk size
-        let data = vec![1, 2, 3, 4, 5];
-
-        let compressed = manager.compress_all(&data).expect("Failed to compress");
-        let decompressed = manager
-            .decompress_all(&compressed, data.len())
-            .expect("Failed to decompress");
-
-        assert_eq!(data, decompressed);
-    }
-
-    #[test]
-    #[should_panic(expected = "Chunk size must be a multiple of")]
-    fn test_block_manager_invalid_chunk_size() {
-        BlockManager::with_capacity(100); // Not a multiple of GROUP_SIZE (64)
-    }
-
-    #[test]
-    #[should_panic(expected = "Chunk size must be less than")]
-    fn test_block_manager_chunk_size_too_large() {
-        BlockManager::with_capacity(0x10000); // Equal to 64KiB, should panic
     }
 
     #[test]

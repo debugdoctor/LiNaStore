@@ -17,6 +17,24 @@ fn parse_truthy(raw: &str) -> Option<bool> {
     }
 }
 
+fn mask_db_url(url: &str) -> String {
+    // Mask password in URLs like: mysql://user:password@host/db
+    if let Some(at_pos) = url.find('@') {
+        if let Some(colon_pos) = url[..at_pos].rfind(':') {
+            if let Some(protocol_end) = url.find("://") {
+                if colon_pos > protocol_end + 3 {
+                    let mut masked = String::with_capacity(url.len());
+                    masked.push_str(&url[..colon_pos + 1]);
+                    masked.push_str("***");
+                    masked.push_str(&url[at_pos..]);
+                    return masked;
+                }
+            }
+        }
+    }
+    url.to_string()
+}
+
 pub struct EnvVar {
     pub ip_address: String,
     pub advanced_port: String,
@@ -128,7 +146,7 @@ impl EnvVar {
             }
         };
 
-        event!(tracing::Level::INFO, "Database URL: {}", db_url);
+        event!(tracing::Level::INFO, "Database URL: {}", mask_db_url(&db_url));
 
         EnvVar {
             ip_address,

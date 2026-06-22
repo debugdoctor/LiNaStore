@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -211,13 +212,26 @@ int8_t check_sendv(LiNaClient* client, const void* buffers, size_t buffer_count)
 bool _connect(LiNaClient *client)
 {
     if (client->sock != INVALID_SOCKET) {
-        return true; // Already connected
+        return true; /* Already connected */
     }
     
     client->sock = socket(AF_INET, SOCK_STREAM, 0);
     if (client->sock == INVALID_SOCKET) {
         return false;
     }
+    
+    /* Set socket timeouts to avoid indefinite blocking */
+    #ifdef _WIN32
+        DWORD timeout_ms = 5000; /* 5 seconds */
+        setsockopt(client->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+        setsockopt(client->sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+    #else
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(client->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    #endif
     
     int result = connect(client->sock, (struct sockaddr *)&client->server, sizeof(client->server));
     if (result != 0) {
