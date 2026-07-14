@@ -4,6 +4,17 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
+pub async fn handle_mount(root: &str, args: &command::MountArgs) -> Result<(), Box<dyn Error>> {
+    let root = root.to_string();
+    let mp = args.mount_point.clone();
+    println!("Mounting linastore at {}...", mp);
+    tokio::task::spawn_blocking(move || crate::fuse::mount(&root, &mp))
+        .await
+        .map_err(|e| format!("FUSE thread failed: {}", e))?
+        .map_err(|e| format!("FUSE mount failed: {}", e))?;
+    Ok(())
+}
+
 /// Handle list command to display files in storage
 ///
 /// # Arguments

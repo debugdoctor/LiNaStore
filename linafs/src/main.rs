@@ -1,4 +1,5 @@
 mod command;
+mod fuse;
 mod handler;
 
 use clap::Parser;
@@ -40,6 +41,7 @@ async fn main() {
             handler::handle_delete(&current_dir, args).await
         }
         Some(Commands::File(FileArgs::Tidy(args))) => handler::handle_tidy(args),
+        Some(Commands::File(FileArgs::Mount(args))) => handler::handle_mount(&current_dir, args).await,
         None => {
             eprintln!("Error: No command provided. Use --help for usage information.");
             process::exit(1);
