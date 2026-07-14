@@ -35,9 +35,6 @@ data/
 __pycache__/
 .tmp/
 
-# PID file
-linastore/
-
 # Allow migration SQL files
 !src/db/migrations/sqlite/*.sql
 !src/db/migrations/mysql/*.sql

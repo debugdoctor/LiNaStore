@@ -326,6 +326,9 @@ mod tests {
 
     use super::*;
 
+    const BLOCK_SIZE: usize = 8;
+    const GROUP_SIZE: usize = 64;
+
     #[test]
     fn test_encode_consistency() {
         // Create a compressor with matching chunk size

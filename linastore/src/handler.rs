@@ -1,4 +1,4 @@
-use super::command;
+use crate::command;
 use linabase::service::{StoreManager, TidyManager};
 use std::error::Error;
 use std::fs;

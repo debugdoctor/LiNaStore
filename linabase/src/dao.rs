@@ -364,7 +364,7 @@ mod tests {
             .await
             .expect("Failed to insert source");
 
-        let result = dao.insert_link("test_file.txt", "txt", &source_id).await;
+        let result = dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id).await;
         if let Err(e) = &result {
             eprintln!("Error inserting link: {:?}", e);
         }
@@ -382,7 +382,7 @@ mod tests {
         dao.insert_source(&source_id, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link("test_file.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id)
             .await
             .expect("Failed to insert link");
 
@@ -410,10 +410,10 @@ mod tests {
         dao.insert_source(&source_id2, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link("test_file1.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file1.txt", "txt", &source_id1)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("test_file2.txt", "txt", &source_id2)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file2.txt", "txt", &source_id2)
             .await
             .expect("Failed to insert link");
 
@@ -456,13 +456,13 @@ mod tests {
         dao.insert_source(&source_id3, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link("file1.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file1.txt", "txt", &source_id1)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("file2.txt", "txt", &source_id2)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file2.txt", "txt", &source_id2)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("file3.pdf", "pdf", &source_id3)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file3.pdf", "pdf", &source_id3)
             .await
             .expect("Failed to insert link");
 
@@ -492,13 +492,13 @@ mod tests {
         dao.insert_source(&source_id3, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link("file1.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file1.txt", "txt", &source_id1)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("file2.txt", "txt", &source_id2)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file2.txt", "txt", &source_id2)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("file3.txt", "txt", &source_id3)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file3.txt", "txt", &source_id3)
             .await
             .expect("Failed to insert link");
 
@@ -520,7 +520,7 @@ mod tests {
         dao.insert_source(&source_id, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link("test_file.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id)
             .await
             .expect("Failed to insert link");
 
@@ -624,7 +624,7 @@ mod tests {
         dao.insert_source(&source_id2, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link("test_file.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id1)
             .await
             .expect("Failed to insert link");
 
@@ -712,7 +712,7 @@ mod tests {
             .expect("Failed to insert source");
 
         // Insert link referencing the source
-        dao.insert_link("test_file.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id)
             .await
             .expect("Failed to insert link");
 
@@ -744,13 +744,13 @@ mod tests {
             .await
             .expect("Failed to insert source");
 
-        dao.insert_link("link1.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link1.txt", "txt", &source_id)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("link2.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link2.txt", "txt", &source_id)
             .await
             .expect("Failed to insert link");
-        dao.insert_link("link3.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link3.txt", "txt", &source_id)
             .await
             .expect("Failed to insert link");
 

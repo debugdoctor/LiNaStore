@@ -1297,12 +1297,143 @@ mod tests {
     fn test_relative_path_with_same_root() {
         let tm = TidyManager::new();
 
-        // Test same directory
         let result = tm.relative_path_with_same_root("/a/b/c.txt", "/a/b/d.txt");
         assert_eq!(result, PathBuf::from("./d.txt"));
 
-        // Test parent directory
         let result = tm.relative_path_with_same_root("/a/b/c.txt", "/a/d.txt");
         assert_eq!(result, PathBuf::from("../d.txt"));
+    }
+
+    #[test]
+    fn test_tidy_no_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        stdfs::write(dir.join("a.txt"), b"alpha").unwrap();
+        stdfs::write(dir.join("b.txt"), b"beta").unwrap();
+
+        let mut tm = TidyManager::new();
+        tm.tidy(&dir, false).unwrap();
+
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+        assert!(!dir.join("a.txt").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!dir.join("b.txt").symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn test_tidy_with_duplicates_creates_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        stdfs::write(dir.join("a.txt"), b"same content").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        stdfs::write(dir.join("b.txt"), b"same content").unwrap();
+        stdfs::write(dir.join("c.txt"), b"different").unwrap();
+
+        let mut tm = TidyManager::new();
+        tm.tidy(&dir, false).unwrap();
+
+        let a_is_symlink = dir.join("a.txt").symlink_metadata().unwrap().file_type().is_symlink();
+        let b_is_symlink = dir.join("b.txt").symlink_metadata().unwrap().file_type().is_symlink();
+        let c_is_symlink = dir.join("c.txt").symlink_metadata().unwrap().file_type().is_symlink();
+
+        assert!(!c_is_symlink, "unique file should not be a symlink");
+        assert!(!a_is_symlink, "older duplicate should be kept as original");
+        assert!(b_is_symlink, "newer duplicate should become symlink");
+        assert_eq!(stdfs::read(dir.join("a.txt")).unwrap(), b"same content");
+        assert_eq!(stdfs::read(dir.join("b.txt")).unwrap(), b"same content");
+    }
+
+    #[test]
+    fn test_tidy_keep_newer() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        stdfs::write(dir.join("old.txt"), b"same").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        stdfs::write(dir.join("new.txt"), b"same").unwrap();
+
+        let mut tm = TidyManager::new();
+        tm.tidy(&dir, true).unwrap();
+
+        assert!(!dir.join("new.txt").symlink_metadata().unwrap().file_type().is_symlink(),
+                "newer file should be kept as original");
+        assert!(dir.join("old.txt").symlink_metadata().unwrap().file_type().is_symlink(),
+                "older file should become symlink");
+    }
+
+    #[test]
+    fn test_tidy_empty_directory() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let mut tm = TidyManager::new();
+        tm.tidy(&dir, false).unwrap();
+
+        assert!(dir.read_dir().unwrap().next().is_none(), "empty dir should remain empty");
+    }
+
+    #[test]
+    fn test_tidy_multiple_duplicate_groups() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        stdfs::write(dir.join("g1_a.txt"), b"group1").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        stdfs::write(dir.join("g1_b.txt"), b"group1").unwrap();
+        stdfs::write(dir.join("g2_a.txt"), b"group2").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        stdfs::write(dir.join("g2_b.txt"), b"group2").unwrap();
+        stdfs::write(dir.join("g2_c.txt"), b"group2").unwrap();
+
+        let mut tm = TidyManager::new();
+        tm.tidy(&dir, false).unwrap();
+
+        let g1_a_sym = dir.join("g1_a.txt").symlink_metadata().unwrap().file_type().is_symlink();
+        let g1_b_sym = dir.join("g1_b.txt").symlink_metadata().unwrap().file_type().is_symlink();
+        assert_ne!(g1_a_sym, g1_b_sym, "group1: exactly one should be symlink");
+
+        let sym_count = ["g2_a.txt", "g2_b.txt", "g2_c.txt"]
+            .iter()
+            .filter(|f| dir.join(f).symlink_metadata().unwrap().file_type().is_symlink())
+            .count();
+        assert_eq!(sym_count, 2, "group2: two of three should be symlinks");
+
+        assert_eq!(stdfs::read(dir.join("g1_a.txt")).unwrap(), b"group1");
+        assert_eq!(stdfs::read(dir.join("g2_a.txt")).unwrap(), b"group2");
+    }
+
+    #[test]
+    fn test_file_info_collector() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        stdfs::write(dir.join("test.txt"), b"hello").unwrap();
+
+        let mut tm = TidyManager::new();
+        tm.file_info_collector(&dir.join("test.txt")).unwrap();
+
+        assert_eq!(tm.map_cache.len(), 1);
+        let hash = utils::get_hash256_from_file(&dir.join("test.txt")).unwrap();
+        let entries = tm.map_cache.get(&hash).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, dir.join("test.txt"));
+    }
+
+    #[test]
+    fn test_find_extreme_file() {
+        let tm = TidyManager::new();
+        let files = vec![
+            (PathBuf::from("/a/old.txt"), "20200101000000".to_string()),
+            (PathBuf::from("/a/mid.txt"), "20220101000000".to_string()),
+            (PathBuf::from("/a/new.txt"), "20240101000000".to_string()),
+        ];
+
+        let oldest = tm.find_extreme_file(&files, |a, b| a < b);
+        assert_eq!(oldest.0, &PathBuf::from("/a/old.txt"));
+
+        let newest = tm.find_extreme_file(&files, |a, b| a > b);
+        assert_eq!(newest.0, &PathBuf::from("/a/new.txt"));
     }
 }

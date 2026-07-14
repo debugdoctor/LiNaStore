@@ -4,6 +4,7 @@ mod db;
 mod dtos;
 mod error;
 mod front;
+mod mapper;
 mod porter;
 mod shutdown;
 mod utils;

@@ -1,23 +1,15 @@
-mod libs;
-extern crate linabase;
+mod command;
+mod handler;
 
 use clap::Parser;
-use libs::{
-    command::{Cli, Commands},
-    handler,
-};
+use command::{Cli, Commands};
 use std::env;
 use std::process;
 
-use crate::libs::command::{FileArgs, StoreArgs};
+use command::{FileArgs, StoreArgs};
 
-/// Main entry point for LiNaStore CLI application
-///
-/// This function handles the initialization and command routing for the LiNaStore system.
-/// It includes improved error handling with graceful exits and meaningful error messages.
 #[tokio::main]
 async fn main() {
-    // Parse command line arguments with proper error handling
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -26,7 +18,6 @@ async fn main() {
         }
     };
 
-    // Get current directory with enhanced error handling
     let current_dir = match env::current_dir() {
         Ok(path) => match path.to_str() {
             Some(dir_str) => dir_str.to_string(),
@@ -41,7 +32,6 @@ async fn main() {
         }
     };
 
-    // Execute the appropriate command with error handling
     let result = match &cli.commands {
         Some(Commands::Storage(StoreArgs::List(args))) => handler::handle_list(&current_dir, args).await,
         Some(Commands::Storage(StoreArgs::Put(args))) => handler::handle_put(&current_dir, args).await,
@@ -56,7 +46,6 @@ async fn main() {
         }
     };
 
-    // Handle any errors that occurred during command execution
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         process::exit(1);
