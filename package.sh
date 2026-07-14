@@ -114,9 +114,9 @@ package_for_platform() {
     echo "Building server component..."
     cargo build --release --target "${target}" -p linastore-server
     
-    # Build binary component (linastore CLI)
+    # Build binary component (linafs CLI)
     echo "Building binary component..."
-    cargo build --release --target "${target}" -p linastore
+    cargo build --release --target "${target}" -p linafs
     
     # Determine file extensions
     local ext=""
@@ -131,7 +131,7 @@ package_for_platform() {
     
     # Copy binary component
     local bin_output="${PROJECT_NAME}-bin-${platform_name}${ext}"
-    cp "target/${target}/release/linastore${ext}" "${BUILD_DIR}/${bin_output}" 2>/dev/null
+    cp "target/${target}/release/linafs${ext}" "${BUILD_DIR}/${bin_output}" 2>/dev/null
     
     echo "Created ${BUILD_DIR}/${server_output}"
     echo "Created ${BUILD_DIR}/${bin_output}"

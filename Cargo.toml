@@ -1,5 +1,5 @@
 [workspace]
-members = ["linabase", "linastore", "linastore-server"]
+members = ["linabase", "linafs", "linastore-server"]
 
 [profile.release]
 opt-level = 2
