@@ -251,6 +251,10 @@ public class LiNaStoreClient {
      * @throws IOException If upload fails due to network or protocol issues.
      */
     public boolean linaUploadFile(String fileName, byte[] data, int flags) throws LiNaStoreException {
+        return linaUploadFile(fileName, data, flags, "");
+    }
+
+    public boolean linaUploadFile(String fileName, byte[] data, int flags, String bucket) throws LiNaStoreException {
         // Refresh token if needed before operation
         refreshTokenIfNeeded();
         
@@ -278,11 +282,20 @@ public class LiNaStoreClient {
 
             // Prepare identifier (variable length)
             byte[] fileNameBytes = fileName.getBytes(StandardCharsets.UTF_8);
-            if (fileNameBytes.length > LINA_NAME_MAX_LENGTH) {
-                throw new LiNaStoreProtocolException("File name is too long: " + fileNameBytes.length + " bytes");
+            byte[] bucketBytes = bucket.isEmpty() ? null : bucket.getBytes(StandardCharsets.UTF_8);
+            byte[] identifier;
+            if (bucketBytes != null) {
+                identifier = new byte[bucketBytes.length + 1 + fileNameBytes.length];
+                System.arraycopy(bucketBytes, 0, identifier, 0, bucketBytes.length);
+                identifier[bucketBytes.length] = 0;
+                System.arraycopy(fileNameBytes, 0, identifier, bucketBytes.length + 1, fileNameBytes.length);
+            } else {
+                identifier = fileNameBytes;
             }
-            byte ilen = (byte) fileNameBytes.length;
-            byte[] identifier = fileNameBytes;
+            if (identifier.length > LINA_NAME_MAX_LENGTH) {
+                throw new LiNaStoreProtocolException("File identifier is too long: " + identifier.length + " bytes");
+            }
+            byte ilen = (byte) identifier.length;
 
             // Prepare data with optional session token
             byte[] payloadData;
@@ -356,6 +369,10 @@ public class LiNaStoreClient {
      * @throws IOException If download fails due to network or integrity issue.
      */
     public byte[] linaDownloadFile(String fileName) throws LiNaStoreException {
+        return linaDownloadFile(fileName, "");
+    }
+
+    public byte[] linaDownloadFile(String fileName, String bucket) throws LiNaStoreException {
         // Refresh token if needed before operation
         refreshTokenIfNeeded();
         
@@ -379,11 +396,20 @@ public class LiNaStoreClient {
 
             // Prepare identifier (variable length)
             byte[] fileNameBytes = fileName.getBytes(StandardCharsets.UTF_8);
-            if (fileNameBytes.length > LINA_NAME_MAX_LENGTH) {
-                throw new LiNaStoreProtocolException("File name is too long: " + fileNameBytes.length + " bytes");
+            byte[] bucketBytes = bucket.isEmpty() ? null : bucket.getBytes(StandardCharsets.UTF_8);
+            byte[] identifier;
+            if (bucketBytes != null) {
+                identifier = new byte[bucketBytes.length + 1 + fileNameBytes.length];
+                System.arraycopy(bucketBytes, 0, identifier, 0, bucketBytes.length);
+                identifier[bucketBytes.length] = 0;
+                System.arraycopy(fileNameBytes, 0, identifier, bucketBytes.length + 1, fileNameBytes.length);
+            } else {
+                identifier = fileNameBytes;
             }
-            byte ilen = (byte) fileNameBytes.length;
-            byte[] identifier = fileNameBytes;
+            if (identifier.length > LINA_NAME_MAX_LENGTH) {
+                throw new LiNaStoreProtocolException("File identifier is too long: " + identifier.length + " bytes");
+            }
+            byte ilen = (byte) identifier.length;
 
             // Prepare data with optional session token
             byte[] payloadData;
@@ -507,6 +533,10 @@ public class LiNaStoreClient {
      * @return True if successful.
      */
     public boolean linaDeleteFile(String fileName) throws LiNaStoreException {
+        return linaDeleteFile(fileName, "");
+    }
+
+    public boolean linaDeleteFile(String fileName, String bucket) throws LiNaStoreException {
         // Refresh token if needed before operation
         refreshTokenIfNeeded();
         
@@ -530,11 +560,20 @@ public class LiNaStoreClient {
 
             // Prepare identifier (variable length)
             byte[] fileNameBytes = fileName.getBytes(StandardCharsets.UTF_8);
-            if (fileNameBytes.length > LINA_NAME_MAX_LENGTH) {
-                throw new LiNaStoreProtocolException("File name is too long: " + fileNameBytes.length + " bytes");
+            byte[] bucketBytes = bucket.isEmpty() ? null : bucket.getBytes(StandardCharsets.UTF_8);
+            byte[] identifier;
+            if (bucketBytes != null) {
+                identifier = new byte[bucketBytes.length + 1 + fileNameBytes.length];
+                System.arraycopy(bucketBytes, 0, identifier, 0, bucketBytes.length);
+                identifier[bucketBytes.length] = 0;
+                System.arraycopy(fileNameBytes, 0, identifier, bucketBytes.length + 1, fileNameBytes.length);
+            } else {
+                identifier = fileNameBytes;
             }
-            byte ilen = (byte) fileNameBytes.length;
-            byte[] identifier = fileNameBytes;
+            if (identifier.length > LINA_NAME_MAX_LENGTH) {
+                throw new LiNaStoreProtocolException("File identifier is too long: " + identifier.length + " bytes");
+            }
+            byte ilen = (byte) identifier.length;
 
             // Prepare data with optional session token
             byte[] payloadData;

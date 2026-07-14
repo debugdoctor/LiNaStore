@@ -333,7 +333,12 @@ class LiNaStoreClient:
         
         return plaintext
 
-    def lina_upload_file(self, file_name: str, reader: io.BufferedReader) -> bool:
+    def _build_identifier(self, file_name: str, bucket: str) -> bytes:
+        if bucket:
+            return bucket.encode() + b'\x00' + file_name.encode()
+        return file_name.encode()
+
+    def lina_upload_file(self, file_name: str, reader: io.BufferedReader, bucket: str = "") -> bool:
         """
         Upload a file to LiNaStore.
         
@@ -342,6 +347,7 @@ class LiNaStoreClient:
         Args:
             file_name: Name of the file to upload
             reader: BufferedReader containing file data
+            bucket: Bucket name (default: "" for no bucket / legacy mode)
             
         Returns:
             True if upload successful
@@ -367,7 +373,7 @@ class LiNaStoreClient:
                 file_data = self.session_token.encode() + b'\x00' + file_data
             
             flags = 0x80.to_bytes(1, 'little')
-            identifier = file_name.encode()
+            identifier = self._build_identifier(file_name, bucket)
             if len(identifier) > self.LINA_NAME_MAX_LENGTH:
                 raise LiNaStoreProtocolError(f"File name too long: {len(identifier)} > {self.LINA_NAME_MAX_LENGTH}")
             ilen = len(identifier).to_bytes(1, 'little')
@@ -392,7 +398,7 @@ class LiNaStoreClient:
         finally:
             self.disconnect()
 
-    def lina_download_file(self, file_name: str) -> bytes:
+    def lina_download_file(self, file_name: str, bucket: str = "") -> bytes:
         """
         Download a file from LiNaStore.
         
@@ -400,6 +406,7 @@ class LiNaStoreClient:
         
         Args:
             file_name: Name of the file to download
+            bucket: Bucket name (default: "" for no bucket / legacy mode)
             
         Returns:
             File data as bytes
@@ -417,7 +424,7 @@ class LiNaStoreClient:
         
         try:
             flags = 0x40.to_bytes(1, 'little')
-            identifier = file_name.encode()
+            identifier = self._build_identifier(file_name, bucket)
             if len(identifier) > self.LINA_NAME_MAX_LENGTH:
                 raise LiNaStoreProtocolError(f"File name too long: {len(identifier)} > {self.LINA_NAME_MAX_LENGTH}")
             ilen = len(identifier).to_bytes(1, 'little')
@@ -475,7 +482,7 @@ class LiNaStoreClient:
         finally:
             self.disconnect()
     
-    def lina_delete_file(self, file_name: str) -> bool:
+    def lina_delete_file(self, file_name: str, bucket: str = "") -> bool:
         """
         Delete a file from LiNaStore.
         
@@ -483,6 +490,7 @@ class LiNaStoreClient:
         
         Args:
             file_name: Name of the file to delete
+            bucket: Bucket name (default: "" for no bucket / legacy mode)
             
         Returns:
             True if deletion successful
@@ -500,7 +508,7 @@ class LiNaStoreClient:
         
         try:
             flags = 0xC0.to_bytes(1, 'little')
-            identifier = file_name.encode()
+            identifier = self._build_identifier(file_name, bucket)
             if len(identifier) > self.LINA_NAME_MAX_LENGTH:
                 raise LiNaStoreProtocolError(f"File name too long: {len(identifier)} > {self.LINA_NAME_MAX_LENGTH}")
             ilen = len(identifier).to_bytes(1, 'little')

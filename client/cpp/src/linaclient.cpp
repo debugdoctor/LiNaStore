@@ -284,7 +284,7 @@ bool LiNaClient::disconnect()
     return true; // Already disconnected
 }
 
-bool LiNaClient::linaUploadFile(std::string name, std::vector<char> data, uint8_t flags)
+bool LiNaClient::linaUploadFile(std::string name, std::vector<char> data, uint8_t flags, std::string bucket)
 {
     // Refresh token if needed before operation
     linaRefreshTokenIfNeeded();
@@ -301,13 +301,14 @@ bool LiNaClient::linaUploadFile(std::string name, std::vector<char> data, uint8_
     }
 
     // Variable length identifier
-    if (name.length() > LINA_NAME_MAX_LENGTH)
+    std::string identifier = bucket.empty() ? name : bucket + '\0' + name;
+    if (identifier.length() > LINA_NAME_MAX_LENGTH)
     {
-        throw LiNaClientException("File name exceeds maximum length");
+        throw LiNaClientException("File identifier exceeds maximum length");
     }
 
-    uint8_t ilen = static_cast<uint8_t>(name.length());
-    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(name.data());
+    uint8_t ilen = static_cast<uint8_t>(identifier.length());
+    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(identifier.data());
 
     // Build payload data
     std::vector<uint8_t> payload_data;
@@ -380,7 +381,7 @@ bool LiNaClient::linaUploadFile(std::string name, std::vector<char> data, uint8_
     }
 }
 
-std::vector<char> LiNaClient::linaDownloadFile(std::string name)
+std::vector<char> LiNaClient::linaDownloadFile(std::string name, std::string bucket)
 {
     // Refresh token if needed before operation
     linaRefreshTokenIfNeeded();
@@ -390,13 +391,14 @@ std::vector<char> LiNaClient::linaDownloadFile(std::string name)
         throw LiNaClientException("File name cannot be empty");
     }
 
-    if (name.length() > LINA_NAME_MAX_LENGTH)
+    std::string identifier = bucket.empty() ? name : bucket + '\0' + name;
+    if (identifier.length() > LINA_NAME_MAX_LENGTH)
     {
-        throw LiNaClientException("File name exceeds maximum length");
+        throw LiNaClientException("File identifier exceeds maximum length");
     }
 
-    uint8_t ilen = static_cast<uint8_t>(name.length());
-    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(name.data());
+    uint8_t ilen = static_cast<uint8_t>(identifier.length());
+    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(identifier.data());
 
     std::vector<uint8_t> payload_data;
     if (!session_token.empty())
@@ -495,7 +497,7 @@ std::vector<char> LiNaClient::linaDownloadFile(std::string name)
     }
 }
 
-bool LiNaClient::linaDeleteFile(std::string name)
+bool LiNaClient::linaDeleteFile(std::string name, std::string bucket)
 {
     // Refresh token if needed before operation
     linaRefreshTokenIfNeeded();
@@ -507,13 +509,14 @@ bool LiNaClient::linaDeleteFile(std::string name)
 
     uint8_t flags = LINA_DELETE;
 
-    if (name.length() > LINA_NAME_MAX_LENGTH)
+    std::string identifier = bucket.empty() ? name : bucket + '\0' + name;
+    if (identifier.length() > LINA_NAME_MAX_LENGTH)
     {
-        throw LiNaClientException("File name exceeds maximum length");
+        throw LiNaClientException("File identifier exceeds maximum length");
     }
 
-    uint8_t ilen = static_cast<uint8_t>(name.length());
-    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(name.data());
+    uint8_t ilen = static_cast<uint8_t>(identifier.length());
+    const uint8_t* identifier_ptr = reinterpret_cast<const uint8_t*>(identifier.data());
 
     std::vector<uint8_t> payload_data;
     if (!session_token.empty())

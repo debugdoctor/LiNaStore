@@ -38,9 +38,9 @@ public:
     LiNaClient(std::string address, int port, bool auto_refresh = true, uint32_t refresh_buffer = 300);
     ~LiNaClient();
 
-    bool linaUploadFile(std::string name, std::vector<char> data, uint8_t flags);
-    std::vector<char> linaDownloadFile(std::string name);
-    bool linaDeleteFile(std::string name);
+    bool linaUploadFile(std::string name, std::vector<char> data, uint8_t flags, std::string bucket = "");
+    std::vector<char> linaDownloadFile(std::string name, std::string bucket = "");
+    bool linaDeleteFile(std::string name, std::string bucket = "");
     HandshakeResult linaHandshake(std::string username, std::string password, bool cache_credentials = true);
 
     void check_sendv(const std::vector<std::pair<const void*, size_t>>& buffers, const char* context);

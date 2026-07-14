@@ -84,9 +84,9 @@ typedef struct HandshakeResult {
     char* message;
 } HandshakeResult;
 
-LiNaResult lina_upload_file(LiNaClient* client, char* name, char* data, size_t data_len, uint8_t flags);
-LiNaResult lina_download_file(LiNaClient* client, char* name);
-LiNaResult lina_delete_file(LiNaClient* client, char* name);
+LiNaResult lina_upload_file(LiNaClient* client, char* name, char* data, size_t data_len, uint8_t flags, const char* bucket);
+LiNaResult lina_download_file(LiNaClient* client, char* name, const char* bucket);
+LiNaResult lina_delete_file(LiNaClient* client, char* name, const char* bucket);
 HandshakeResult lina_handshake(LiNaClient* client, char* username, char* password, bool cache_credentials);
 void lina_free_result(LiNaResult* result);
 void lina_free_handshake_result(HandshakeResult* result);
