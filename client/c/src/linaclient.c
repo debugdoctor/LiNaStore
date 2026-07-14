@@ -263,7 +263,7 @@ bool _disconnect(LiNaClient *client)
     return result == 0;
 }
 
-LiNaResult lina_upload_file(LiNaClient *client, char *name, char *data, size_t data_len, uint8_t flags)
+LiNaResult lina_upload_file(LiNaClient *client, char *name, char *data, size_t data_len, uint8_t flags, const char* bucket)
 {
     LiNaResult res = { .status = false };
     char *msg = (char *)malloc(MAX_MSG_LEN);
@@ -292,22 +292,30 @@ LiNaResult lina_upload_file(LiNaClient *client, char *name, char *data, size_t d
     }
 
     size_t name_len = strlen(name);
-    if (name_len > 255)
+    size_t bucket_len = (bucket && bucket[0]) ? strlen(bucket) : 0;
+    size_t id_len = name_len + (bucket_len ? bucket_len + 1 : 0);
+    if (id_len > 255)
     {
-        snprintf(msg, MAX_MSG_LEN, "File name is too long: %zu > 255", name_len);
+        snprintf(msg, MAX_MSG_LEN, "Identifier too long: %zu > 255", id_len);
         res.payload.message = msg;
         return res;
     }
 
-    name_buf = (char*)malloc(name_len);
+    name_buf = (char*)malloc(id_len);
     if (!name_buf) {
         snprintf(msg, MAX_MSG_LEN, "Memory allocation failed for name buffer");
         res.payload.message = msg;
         return res;
     }
     
-    memcpy(name_buf, name, name_len);
-    ilen = (uint8_t)name_len;
+    if (bucket_len) {
+        memcpy(name_buf, bucket, bucket_len);
+        name_buf[bucket_len] = '\0';
+        memcpy(name_buf + bucket_len + 1, name, name_len);
+    } else {
+        memcpy(name_buf, name, name_len);
+    }
+    ilen = (uint8_t)id_len;
 
     if (client->session_token && client->session_token[0] != '\0')
     {
@@ -428,7 +436,7 @@ cleanup:
     return res;
 }
 
-LiNaResult lina_download_file(LiNaClient* client, char* name)
+LiNaResult lina_download_file(LiNaClient* client, char* name, const char* bucket)
 {
     LiNaResult res = { .status = false };
     char *msg = (char *)malloc(MAX_MSG_LEN);
@@ -457,22 +465,30 @@ LiNaResult lina_download_file(LiNaClient* client, char* name)
 
     uint8_t flags = LINA_READ;
     size_t name_len = strlen(name);
-    if (name_len > 255)
+    size_t bucket_len = (bucket && bucket[0]) ? strlen(bucket) : 0;
+    size_t id_len = name_len + (bucket_len ? bucket_len + 1 : 0);
+    if (id_len > 255)
     {
-        snprintf(msg, MAX_MSG_LEN, "File name is too long: %zu > 255", name_len);
+        snprintf(msg, MAX_MSG_LEN, "Identifier too long: %zu > 255", id_len);
         res.payload.message = msg;
         goto cleanup;
     }
 
-    name_buf = (char*)malloc(name_len);
+    name_buf = (char*)malloc(id_len);
     if (!name_buf) {
         snprintf(msg, MAX_MSG_LEN, "Memory allocation failed for name buffer");
         res.payload.message = msg;
         goto cleanup;
     }
     
-    memcpy(name_buf, name, name_len);
-    ilen = (uint8_t)name_len;
+    if (bucket_len) {
+        memcpy(name_buf, bucket, bucket_len);
+        name_buf[bucket_len] = '\0';
+        memcpy(name_buf + bucket_len + 1, name, name_len);
+    } else {
+        memcpy(name_buf, name, name_len);
+    }
+    ilen = (uint8_t)id_len;
 
     if (client->session_token && client->session_token[0] != '\0')
     {
@@ -604,7 +620,7 @@ cleanup:
     return res;
 }
 
-LiNaResult lina_delete_file(LiNaClient *client, char *name)
+LiNaResult lina_delete_file(LiNaClient *client, char *name, const char* bucket)
 {
     LiNaResult res = { .status = false };
     char *msg = (char *)malloc(MAX_MSG_LEN);
@@ -632,22 +648,30 @@ LiNaResult lina_delete_file(LiNaClient *client, char *name)
 
     uint8_t flags = LINA_DELETE;
     size_t name_len = strlen(name);
-    if (name_len > 255)
+    size_t bucket_len = (bucket && bucket[0]) ? strlen(bucket) : 0;
+    size_t id_len = name_len + (bucket_len ? bucket_len + 1 : 0);
+    if (id_len > 255)
     {
-        snprintf(msg, MAX_MSG_LEN, "File name is too long: %zu > 255", name_len);
+        snprintf(msg, MAX_MSG_LEN, "Identifier too long: %zu > 255", id_len);
         res.payload.message = msg;
         goto cleanup;
     }
 
-    name_buf = (char*)malloc(name_len);
+    name_buf = (char*)malloc(id_len);
     if (!name_buf) {
         snprintf(msg, MAX_MSG_LEN, "Memory allocation failed for name buffer");
         res.payload.message = msg;
         goto cleanup;
     }
     
-    memcpy(name_buf, name, name_len);
-    ilen = (uint8_t)name_len;
+    if (bucket_len) {
+        memcpy(name_buf, bucket, bucket_len);
+        name_buf[bucket_len] = '\0';
+        memcpy(name_buf + bucket_len + 1, name, name_len);
+    } else {
+        memcpy(name_buf, name, name_len);
+    }
+    ilen = (uint8_t)id_len;
 
     if (client->session_token && client->session_token[0] != '\0')
     {
