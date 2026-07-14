@@ -6,12 +6,26 @@ use std::path::Path;
 
 pub async fn handle_mount(root: &str, args: &command::MountArgs) -> Result<(), Box<dyn Error>> {
     let root = root.to_string();
-    let mp = args.mount_point.clone();
-    println!("Mounting linastore at {}...", mp);
-    tokio::task::spawn_blocking(move || crate::fuse::mount(&root, &mp))
-        .await
-        .map_err(|e| format!("FUSE thread failed: {}", e))?
-        .map_err(|e| format!("FUSE mount failed: {}", e))?;
+    let mount_point = args.mount_point.clone();
+    let display_mp = mount_point.clone();
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FUSE runtime error: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = crate::fuse::mount_inner(&root, &mount_point, &rt) {
+            eprintln!("FUSE error: {}", e);
+        }
+    });
+
+    println!("Linastore mounted at {}", display_mp);
+    println!("PID: {}", std::process::id());
+    tokio::signal::ctrl_c().await?;
+    println!("Shutting down...");
     Ok(())
 }
 

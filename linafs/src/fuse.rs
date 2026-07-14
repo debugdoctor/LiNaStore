@@ -218,10 +218,7 @@ impl Filesystem for LinaFs {
     }
 }
 
-/// Mount linastore at the given mount point.
-/// Blocks until unmounted. Call on a blocking thread via spawn_blocking.
-pub fn mount(root: &str, mount_point: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let rt = tokio::runtime::Runtime::new()?;
+pub fn mount_inner(root: &str, mount_point: &str, rt: &tokio::runtime::Runtime) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fs = rt.block_on(LinaFs::new(root))?;
     fuser::mount2(fs, Path::new(mount_point), &[])?;
     Ok(())
