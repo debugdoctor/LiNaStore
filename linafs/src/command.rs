@@ -130,10 +130,28 @@ pub struct TidyArgs {
     pub target_dir: String,
 }
 
+/// Arguments for the mount command
+#[derive(Parser, Clone)]
+pub struct MountArgs {
+    #[arg(value_name = "MOUNT_POINT", help = "Mount point directory")]
+    pub mount_point: String,
+
+    #[arg(
+        short = 'r',
+        long = "root",
+        value_name = "DIR",
+        default_value = ".",
+        help = "Storage root directory (default: current directory)"
+    )]
+    pub root: String,
+}
+
 #[derive(Subcommand, Clone)]
 pub enum FileArgs {
     #[command(about = "Linastore file system tools")]
     Tidy(TidyArgs),
+    #[command(about = "Mount linastore as a FUSE filesystem")]
+    Mount(MountArgs),
 }
 
 // Update Commands enum
