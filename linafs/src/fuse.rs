@@ -224,3 +224,66 @@ pub fn mount_inner(root: &str, mount_point: &str) -> Result<(), Box<dyn std::err
     fuser::mount2(fs, Path::new(mount_point), &[])?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ino_from_name_deterministic() {
+        let a = ino_from_name("hello.txt");
+        let b = ino_from_name("hello.txt");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_ino_from_name_different() {
+        let a = ino_from_name("a.txt");
+        let b = ino_from_name("b.txt");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_ino_from_name_not_zero() {
+        let ino = ino_from_name("anything");
+        assert_ne!(ino, 0, "zero inode would conflict with reserved sentinels");
+        assert_ne!(ino, ROOT_INO, "should not collide with root inode");
+    }
+
+    #[test]
+    fn test_make_attr_regular_file() {
+        let attr = make_attr(42, 1024, FileType::RegularFile, 0o644);
+        assert_eq!(attr.ino, 42);
+        assert_eq!(attr.size, 1024);
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(attr.perm, 0o644);
+        assert_eq!(attr.nlink, 1);
+        assert_eq!(attr.blksize, 4096);
+        assert_eq!(attr.blocks, (1024 + 511) / 512);
+    }
+
+    #[test]
+    fn test_make_attr_directory() {
+        let attr = make_attr(ROOT_INO, 0, FileType::Directory, 0o755);
+        assert_eq!(attr.ino, ROOT_INO);
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+        assert_eq!(attr.nlink, 2);
+    }
+
+    #[test]
+    fn test_make_attr_zero_size() {
+        let attr = make_attr(99, 0, FileType::RegularFile, 0o444);
+        assert_eq!(attr.size, 0);
+        assert_eq!(attr.blocks, 0);
+    }
+
+    #[test]
+    fn test_ino_from_name_consistency_across_names() {
+        let names: Vec<String> = (0..100).map(|i| format!("file_{}.txt", i)).collect();
+        let mut inos: Vec<u64> = names.iter().map(|n| ino_from_name(n)).collect();
+        inos.sort();
+        inos.dedup();
+        assert_eq!(inos.len(), names.len(), "all 100 names should produce unique inodes");
+    }
+}

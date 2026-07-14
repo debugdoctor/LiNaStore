@@ -7,11 +7,24 @@ use std::path::Path;
 pub async fn handle_mount(root: &str, args: &command::MountArgs) -> Result<(), Box<dyn Error>> {
     let root = root.to_string();
     let mp = args.mount_point.clone();
-    println!("Mounted at {} (PID: {}), umount to stop", mp, std::process::id());
-    tokio::task::spawn_blocking(move || crate::fuse::mount_inner(&root, &mp))
-        .await
-        .map_err(|e| format!("FUSE thread failed: {}", e))?
-        .map_err(|e| format!("FUSE error: {}", e))?;
+
+    match unsafe { libc::fork() } {
+        -1 => return Err("fork failed".into()),
+        0 => {
+            // child — daemon
+            match crate::fuse::mount_inner(&root, &mp) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("FUSE error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        pid => {
+            // parent
+            println!("Mounted at {}, PID: {}", mp, pid);
+        }
+    }
     Ok(())
 }
 
