@@ -1141,7 +1141,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "linastore"
+name = "linafs"
 version = "0.1.0"
 dependencies = [
  "clap",
