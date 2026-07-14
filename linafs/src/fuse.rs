@@ -218,7 +218,8 @@ impl Filesystem for LinaFs {
     }
 }
 
-pub fn mount_inner(root: &str, mount_point: &str, rt: &tokio::runtime::Runtime) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn mount_inner(root: &str, mount_point: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Runtime::new()?;
     let fs = rt.block_on(LinaFs::new(root))?;
     fuser::mount2(fs, Path::new(mount_point), &[])?;
     Ok(())
