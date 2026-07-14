@@ -110,13 +110,13 @@ package_for_platform() {
     # Add target for cross-compilation
     rustup target add "${target}" 2>/dev/null || true
     
-    # Build server component (main.rs)
+    # Build server component
     echo "Building server component..."
-    cargo build --release --target "${target}"
+    cargo build --release --target "${target}" -p linastore-server
     
-    # Build binary component (linastore.rs)
+    # Build binary component (linastore CLI)
     echo "Building binary component..."
-    cargo build --release --target "${target}" --bin linastore
+    cargo build --release --target "${target}" -p linastore
     
     # Determine file extensions
     local ext=""

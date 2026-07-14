@@ -4,20 +4,22 @@ use crate::vars;
 
 use super::advanced_service::run_advanced_server;
 use super::http_service::run_http_server;
+use super::s3_service::run_s3_server;
 
 #[instrument(skip_all)]
 pub async fn front() {
     event!(tracing::Level::INFO, "Front started");
 
-    // Read environment variables
     let envars = vars::EnvVar::get_instance();
 
     let ip = envars.ip_address.clone();
     let http_port = envars.http_port.clone();
     let advanced_port = envars.advanced_port.clone();
+    let s3_port = envars.s3_port.clone();
 
     let http_addr = format!("{}:{}", ip, http_port);
     let advanced_addr = format!("{}:{}", ip, advanced_port);
+    let s3_addr = format!("{}:{}", ip, s3_port);
 
     tokio::join!(
         async {
@@ -27,6 +29,10 @@ pub async fn front() {
         async {
             run_advanced_server(&advanced_addr).await;
             event!(tracing::Level::WARN, "Advanced server exited");
+        },
+        async {
+            run_s3_server(&s3_addr).await;
+            event!(tracing::Level::WARN, "S3 server exited");
         },
     );
 }

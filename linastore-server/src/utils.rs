@@ -129,6 +129,15 @@ pub async fn run_server(log_dir: Option<String>, daemon: bool) -> Result<()> {
         .map(String::from)
         .context("Failed to convert current directory to string")?;
 
+    let current_path = std::path::Path::new(&current_dir);
+
+    // Initialize bucket mapper
+    if let Err(e) = crate::mapper::init_mapper(current_path).await {
+        event!(tracing::Level::ERROR, "Failed to initialize bucket mapper: {:?}", e);
+        return Err(crate::error::err_msg(format!("Bucket mapper init failed: {}", e)));
+    }
+    event!(tracing::Level::INFO, "Bucket mapper initialized");
+
     // Initialize Shutdown Manager
     let shutdown_state = Shutdown::get_instance();
 

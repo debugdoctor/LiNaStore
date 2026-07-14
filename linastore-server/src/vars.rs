@@ -39,6 +39,7 @@ pub struct EnvVar {
     pub ip_address: String,
     pub advanced_port: String,
     pub http_port: String,
+    pub s3_port: String,
     pub max_payload_size: usize,
     pub auth_required: bool,
     pub admin_username: String,
@@ -78,6 +79,13 @@ impl EnvVar {
                 "LINASTORE_ADVANCED_PORT not set, using default"
             );
             "8096".to_string()
+        });
+        let s3_port = std::env::var("LINASTORE_S3_PORT").unwrap_or_else(|_| {
+            event!(
+                tracing::Level::WARN,
+                "LINASTORE_S3_PORT not set, using default"
+            );
+            "8087".to_string()
         });
         let mut init_errors: Vec<String> = Vec::new();
 
@@ -152,6 +160,7 @@ impl EnvVar {
             ip_address,
             http_port,
             advanced_port,
+            s3_port,
             max_payload_size,
             auth_required,
             admin_username,

@@ -435,9 +435,50 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             Op::Auth | Op::None => Behavior::None,
         };
 
+        let id_bytes = &message.payload.identifier;
+        let (bucket, key) = if let Some(null_pos) = id_bytes.iter().position(|&b| b == 0) {
+            let b = String::from_utf8_lossy(&id_bytes[..null_pos]);
+            let k = String::from_utf8_lossy(&id_bytes[null_pos + 1..]);
+            (b.into_owned(), k.into_owned())
+        } else {
+            let k = String::from_utf8_lossy(id_bytes).to_string();
+            (crate::mapper::DEFAULT_BUCKET.to_string(), k)
+        };
+
+        let resolved_identifier = match op {
+            Op::Write => {
+                let internal_name = Uuid::new_v4().to_string();
+                if let Some(m) = crate::mapper::get_mapper() {
+                    let _ = m.register(&bucket, &key, &internal_name).await;
+                }
+                Bytes::from(internal_name)
+            }
+            _ => {
+                match crate::mapper::get_mapper() {
+                    Some(m) => match m.resolve(&bucket, &key).await {
+                        Ok(Some(internal)) => Bytes::from(internal),
+                        _ => {
+                            event!(
+                                Level::ERROR,
+                                "[waitress {}] Bucket mapping not found: {}/{}",
+                                &log_id, &bucket, &key
+                            );
+                            write_error_response(&mut stream, &log_id, Status::FileNotFound, None).await;
+                            return;
+                        }
+                    },
+                    None => {
+                        event!(Level::ERROR, "[waitress {}] Mapper unavailable", &log_id);
+                        write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
+                        return;
+                    }
+                }
+            }
+        };
+
         order_pkg.content = Content {
             flags: message.flags,
-            identifier: message.payload.identifier.clone(),
+            identifier: resolved_identifier,
             data: file_data,
         };
 

@@ -3,6 +3,7 @@ use std::{path::Path, time::Duration};
 use crate::{
     conveyer::ConveyQueue,
     dtos::{Behavior, Package},
+    mapper,
     shutdown::Shutdown,
 };
 use http_body_util::Full;
@@ -33,18 +34,31 @@ fn get_mime_type(filename: &str) -> &'static str {
     }
 }
 
+async fn resolve_with_mapper(bucket: &str, key: &str) -> Result<String, Response<Full<Bytes>>> {
+    match mapper::get_mapper() {
+        Some(m) => match m.resolve(bucket, key).await {
+            Ok(Some(internal)) => Ok(internal),
+            _ => Err(Response::builder()
+                .status(hyper::StatusCode::NOT_FOUND)
+                .body(Full::new(HyperBytes::from("Not Found")))
+                .unwrap()),
+        },
+        None => Err(Response::builder()
+            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::new(HyperBytes::from("Mapper unavailable")))
+            .unwrap()),
+    }
+}
+
 #[instrument(skip_all)]
 async fn handle_http(
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::http::Error> {
-    // Only handle GET requests
     if req.method() != &Method::GET {
         return Ok(Response::builder()
             .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
             .body(Full::new(HyperBytes::from("Method Not Allowed")))?);
     }
-
-    let log_id = Uuid::new_v4().to_string();
 
     let uri = req.uri().to_string();
     let path = uri.strip_prefix('/').unwrap_or(&uri);
@@ -53,26 +67,35 @@ async fn handle_http(
             .status(hyper::StatusCode::OK)
             .body(Full::new(HyperBytes::from("LiNastore is running")))?);
     }
+
     let path_vec: Vec<&str> = path.split('/').collect();
-    if path_vec.len() != 1 {
-        event!(Level::ERROR, "Invalid URL: {}", uri);
+    let file_identifier: String = if path_vec.len() >= 2 {
+        let bucket = path_vec[0];
+        let key = path_vec[1..].join("/");
+        match resolve_with_mapper(bucket, &key).await {
+            Ok(id) => id,
+            Err(resp) => return Ok(resp),
+        }
+    } else if path_vec.len() == 1 {
+        let key = path_vec[0];
+        match resolve_with_mapper(mapper::DEFAULT_BUCKET, key).await {
+            Ok(id) => id,
+            Err(resp) => return Ok(resp),
+        }
+    } else {
         return Ok(Response::builder()
             .status(hyper::StatusCode::BAD_REQUEST)
             .body(Full::new(HyperBytes::from("Invalid URL")))?);
-    }
+    };
 
-    // Create package for the queue
+    let log_id = Uuid::new_v4().to_string();
+
     let uuid = Uuid::new_v4();
     let uni_id = uuid.into_bytes();
     let mut package = Package::new_with_id(&uuid);
     package.behavior = Behavior::GetFile;
+    package.content.identifier = Bytes::copy_from_slice(file_identifier.as_bytes());
 
-    let name_bytes = path_vec[0].as_bytes();
-    // Set identifier directly as Bytes
-    package.content.identifier = Bytes::copy_from_slice(name_bytes);
-    package.behavior = Behavior::GetFile;
-
-    // Register waiter before sending to queue
     let con_queue = ConveyQueue::get_instance();
     let receiver = match con_queue.register_waiter(uni_id) {
         Some(rx) => rx,
@@ -84,7 +107,6 @@ async fn handle_http(
         }
     };
 
-    // Send to queue
     if let Err(e) = con_queue.produce_order(package) {
         event!(Level::ERROR, "Failed to produce order: {}", e);
         con_queue.unregister_waiter(uni_id);
@@ -93,7 +115,6 @@ async fn handle_http(
             .body(Full::new(HyperBytes::from("Failed to process request")))?);
     }
 
-    // Wait for response via channel with timeout
     let timeout = Duration::from_secs(10);
     match tokio::time::timeout(timeout, receiver).await {
         Ok(Ok(pkg)) => {
