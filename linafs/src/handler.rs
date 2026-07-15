@@ -1,29 +1,42 @@
 use crate::command;
+use crate::fuse::LinaFs;
+use fuser::Config;
 use linabase::service::{StoreManager, TidyManager};
 use std::error::Error;
 use std::fs;
 use std::path::Path;
+use tokio::sync::oneshot;
 
 pub async fn handle_mount(root: &str, args: &command::MountArgs) -> Result<(), Box<dyn Error>> {
     let root = root.to_string();
     let mp = args.mount_point.clone();
 
-    match unsafe { libc::fork() } {
-        -1 => return Err("fork failed".into()),
-        0 => {
-            // child — daemon
-            match crate::fuse::mount_inner(&root, &mp) {
-                Ok(()) => std::process::exit(0),
-                Err(e) => {
-                    eprintln!("FUSE error: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        pid => {
-            // parent
-            println!("Mounted at {}, PID: {}", mp, pid);
-        }
+    let config = Config::default();
+
+    let fs = LinaFs::new(&root)
+        .await
+        .map_err(|e| format!("Failed to initialize filesystem: {}", e))?;
+    let bg = fuser::spawn_mount2(fs, Path::new(&mp), &config)?;
+
+    if args.foreground {
+        println!("Mounted at {}. Press Ctrl+C to unmount.", mp);
+        tokio::signal::ctrl_c().await?;
+        println!("Unmounting {}...", mp);
+        drop(bg);
+    } else {
+        println!(
+            "Mounted at {} (PID: {}). Use 'fusermount -u {}' to unmount.",
+            mp,
+            std::process::id(),
+            mp
+        );
+        let (tx, rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = bg.join();
+            let _ = tx.send(());
+        });
+        let _ = rx.await;
+        println!("Unmounted {}", mp);
     }
     Ok(())
 }

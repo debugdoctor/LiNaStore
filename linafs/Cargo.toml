@@ -7,5 +7,5 @@ edition = "2024"
 linabase = { path = "../linabase" }
 clap = { version = "4.5.50", default-features = false, features = ["derive", "std", "help", "usage"] }
 fuser = "0.17"
-tokio = { version = "1.47.2", features = ["rt-multi-thread", "macros"] }
-libc = "0.2"
+tokio = { version = "1.47.2", features = ["rt-multi-thread", "macros", "signal"] }
+

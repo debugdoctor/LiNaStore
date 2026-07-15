@@ -144,6 +144,14 @@ pub struct MountArgs {
         help = "Storage root directory (default: current directory)"
     )]
     pub root: String,
+
+    #[arg(
+        short = 'f',
+        long = "foreground",
+        action = clap::ArgAction::SetTrue,
+        help = "Run in foreground (default: daemonize)"
+    )]
+    pub foreground: bool,
 }
 
 #[derive(Subcommand, Clone)]
