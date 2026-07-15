@@ -7,8 +7,6 @@ use command::{Cli, Commands};
 use std::env;
 use std::process;
 
-use command::{FileArgs, StoreArgs};
-
 #[tokio::main]
 async fn main() {
     let cli = match Cli::try_parse() {
@@ -34,14 +32,8 @@ async fn main() {
     };
 
     let result = match &cli.commands {
-        Some(Commands::Storage(StoreArgs::List(args))) => handler::handle_list(&current_dir, args).await,
-        Some(Commands::Storage(StoreArgs::Put(args))) => handler::handle_put(&current_dir, args).await,
-        Some(Commands::Storage(StoreArgs::Get(args))) => handler::handle_get(&current_dir, args).await,
-        Some(Commands::Storage(StoreArgs::Delete(args))) => {
-            handler::handle_delete(&current_dir, args).await
-        }
-        Some(Commands::File(FileArgs::Tidy(args))) => handler::handle_tidy(args),
-        Some(Commands::File(FileArgs::Mount(args))) => handler::handle_mount(&current_dir, args).await,
+        Some(Commands::Mount(args)) => handler::handle_mount(&current_dir, args).await,
+        Some(Commands::Umount(args)) => handler::handle_umount(args).await,
         None => {
             eprintln!("Error: No command provided. Use --help for usage information.");
             process::exit(1);
