@@ -26,6 +26,13 @@ CREATE TABLE IF NOT EXISTS source (
     update_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dir (
+    path TEXT PRIMARY KEY,
+    parent TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS dir_parent_idx ON dir (parent);
+
 CREATE INDEX IF NOT EXISTS source_size_idx ON source (size);
 "#;
 
@@ -49,6 +56,12 @@ pub struct Source {
     pub count: u64,
     pub create_at: String,
     pub update_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub path: String,
+    pub parent: String,
 }
 
 // DAO struct for database operations
@@ -203,6 +216,69 @@ impl Dao {
             .await
             .context("Failed to delete link")?;
         Ok(())
+    }
+}
+
+// Directory CRUD operations.
+impl Dao {
+    pub async fn insert_dir(&self, path: &str, parent: &str) -> Result<()> {
+        sqlx::query("INSERT INTO dir (path, parent) VALUES (?1, ?2)")
+            .bind(path)
+            .bind(parent)
+            .execute(&self.pool)
+            .await
+            .context("Failed to insert dir")?;
+        Ok(())
+    }
+
+    pub async fn delete_dir(&self, path: &str) -> Result<()> {
+        sqlx::query("DELETE FROM dir WHERE path = ?1")
+            .bind(path)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete dir")?;
+        Ok(())
+    }
+
+    pub async fn get_dir_by_path(&self, path: &str) -> Result<Option<DirEntry>> {
+        let row = sqlx::query("SELECT path, parent FROM dir WHERE path = ?1")
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to get dir by path")?;
+        Ok(row.map(|r: sqlx::sqlite::SqliteRow| DirEntry {
+            path: r.get("path"),
+            parent: r.get("parent"),
+        }))
+    }
+
+    pub async fn list_dirs_by_parent(&self, parent: &str) -> Result<Vec<DirEntry>> {
+        let rows = sqlx::query("SELECT path, parent FROM dir WHERE parent = ?1 ORDER BY path")
+            .bind(parent)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list dirs by parent")?;
+        Ok(rows
+            .into_iter()
+            .map(|r: sqlx::sqlite::SqliteRow| DirEntry {
+                path: r.get("path"),
+                parent: r.get("parent"),
+            })
+            .collect())
+    }
+
+    pub async fn list_all_dirs(&self) -> Result<Vec<DirEntry>> {
+        let rows = sqlx::query("SELECT path, parent FROM dir ORDER BY path")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list all dirs")?;
+        Ok(rows
+            .into_iter()
+            .map(|r: sqlx::sqlite::SqliteRow| DirEntry {
+                path: r.get("path"),
+                parent: r.get("parent"),
+            })
+            .collect())
     }
 }
 

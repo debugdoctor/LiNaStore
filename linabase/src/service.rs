@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::utils::BlockManager;
 
-use super::dao::{Dao, Link, Source};
+use super::dao::{Dao, DirEntry, Link, Source};
 use super::utils;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -72,6 +72,14 @@ impl StoreManager {
             ));
         }
 
+        // Reconcile directory table with existing file paths
+        if let Err(err) = manager.sync_dirs_from_links().await {
+            return Err(boxed_io_error(
+                io::ErrorKind::Other,
+                format!("Startup dir sync failed: {}", err),
+            ));
+        }
+
         Ok(manager)
     }
 
@@ -84,6 +92,74 @@ impl StoreManager {
     ) -> Result<Vec<Link>, BoxError> {
         let _read_guard = self.operation_lock.read().await;
         self.list_locked(pattern, n, isext, use_regex).await
+    }
+
+    pub async fn is_dir(&self, path: &str) -> Result<bool, BoxError> {
+        let _read_guard = self.operation_lock.read().await;
+        self.dao
+            .get_dir_by_path(path)
+            .await
+            .map_err(dao_to_io_error)
+            .map(|d| d.is_some())
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    pub async fn list_child_dirs(&self, parent: &str) -> Result<Vec<DirEntry>, BoxError> {
+        let _read_guard = self.operation_lock.read().await;
+        self.dao
+            .list_dirs_by_parent(parent)
+            .await
+            .map_err(dao_to_io_error)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    pub async fn all_dirs(&self) -> Result<Vec<DirEntry>, BoxError> {
+        let _read_guard = self.operation_lock.read().await;
+        self.dao
+            .list_all_dirs()
+            .await
+            .map_err(dao_to_io_error)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    pub async fn mkdir(&self, path: &str, parent: &str) -> Result<(), BoxError> {
+        let _write_guard = self.operation_lock.write().await;
+        self.dao
+            .insert_dir(path, parent)
+            .await
+            .map_err(dao_to_io_error)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    pub async fn rmdir(&self, path: &str) -> Result<(), BoxError> {
+        let _write_guard = self.operation_lock.write().await;
+        self.dao
+            .delete_dir(path)
+            .await
+            .map_err(dao_to_io_error)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    pub async fn sync_dirs_from_links(&self) -> Result<(), BoxError> {
+        let _write_guard = self.operation_lock.write().await;
+        let links = self.list_locked("*", 0, false, true).await?;
+        for link in &links {
+            if let Some(slash) = link.name.rfind('/') {
+                let parent = &link.name[..slash];
+                let parts: Vec<&str> = parent.split('/').collect();
+                let mut acc = String::new();
+                let mut prev = String::new();
+                for part in &parts {
+                    if !acc.is_empty() {
+                        acc.push('/');
+                    }
+                    acc.push_str(part);
+                    let _ = self.dao.insert_dir(&acc, &prev).await;
+                    prev = acc.clone();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
