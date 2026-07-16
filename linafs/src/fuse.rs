@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     hash::{Hash, Hasher},
+    path::Path,
     sync::{Arc, RwLock},
     time::{Duration, UNIX_EPOCH},
 };
@@ -9,8 +10,8 @@ use std::{
 use bytes::Bytes;
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, LockOwner, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
-    TimeOrNow,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use linabase::{dao::Link, service::StoreManager};
 
@@ -58,6 +59,31 @@ fn make_attr(ino: u64, size: u64, kind: FileType, perm: u16) -> FileAttr {
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
     }
+}
+
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+const S_IFDIR: u32 = 0o040000;
+
+const MODE_FILE: u32 = S_IFREG | 0o644;
+const MODE_SYMLINK: u32 = S_IFLNK | 0o777;
+const MODE_DIR: u32 = S_IFDIR | 0o755;
+
+fn kind_from_mode(mode: u32) -> FileType {
+    if mode >= S_IFREG {
+        match mode & S_IFMT {
+            S_IFLNK => FileType::Symlink,
+            S_IFDIR => FileType::Directory,
+            _ => FileType::RegularFile,
+        }
+    } else {
+        FileType::RegularFile
+    }
+}
+
+fn perm_from_mode(mode: u32) -> u16 {
+    (mode & 0o777) as u16
 }
 
 fn direct_child_name(full: &str, prefix: &str) -> Option<String> {
@@ -140,7 +166,9 @@ impl Filesystem for LinaFs {
         match self.rt(self.store.get_binary_data(&full_path)) {
             Ok(data) => {
                 let ino = file_ino(&full_path);
-                let attr = make_attr(ino, data.len() as u64, FileType::RegularFile, 0o444);
+                let link = self.all_files().iter().find(|l| l.name == full_path);
+                let mode = link.map(|l| l.mode).unwrap_or(MODE_FILE);
+                let attr = make_attr(ino, data.len() as u64, kind_from_mode(mode), perm_from_mode(mode));
                 return reply.entry(&TTL, &attr, fuser::Generation(0));
             }
             Err(_) => {}
@@ -176,8 +204,8 @@ impl Filesystem for LinaFs {
                         let attr = make_attr(
                             ino_val,
                             data.len() as u64,
-                            FileType::RegularFile,
-                            0o444,
+                            kind_from_mode(link.mode),
+                            perm_from_mode(link.mode),
                         );
                         return reply.attr(&TTL, &attr);
                     }
@@ -187,8 +215,8 @@ impl Filesystem for LinaFs {
         }
 
         let dirs = self.rt(self.store.all_dirs()).unwrap_or_default();
-        if dirs.iter().any(|d| dir_ino(&d.path) == ino_val) {
-            let attr = make_attr(ino_val, 0, FileType::Directory, 0o755);
+        if let Some(d) = dirs.iter().find(|d| dir_ino(&d.path) == ino_val) {
+            let attr = make_attr(ino_val, 0, FileType::Directory, d.mode as u16);
             return reply.attr(&TTL, &attr);
         }
 
@@ -224,9 +252,11 @@ impl Filesystem for LinaFs {
 
         // Other directories
         let dirs = self.rt(self.store.all_dirs()).unwrap_or_default();
-        if dirs.iter().any(|d| dir_ino(&d.path) == ino_val) {
-            let perm = mode.unwrap_or(0o755) as u16;
-            let attr = make_attr(ino_val, 0, FileType::Directory, perm);
+        if let Some(d) = dirs.iter().find(|d| dir_ino(&d.path) == ino_val) {
+            if let Some(m) = mode {
+                let _ = self.rt(self.store.set_dir_mode(&d.path, m));
+            }
+            let attr = make_attr(ino_val, 0, FileType::Directory, perm_from_mode(d.mode));
             return reply.attr(&TTL, &attr);
         }
 
@@ -268,6 +298,14 @@ impl Filesystem for LinaFs {
             }
         }
 
+        let link = self.all_files().iter().find(|l| file_ino(&l.name) == ino_val);
+        let file_mode = link.map(|l| l.mode).unwrap_or(MODE_FILE);
+
+        if let Some(m) = mode {
+            let new_mode = (file_mode & S_IFMT) | (m & 0o777);
+            let _ = self.rt(self.store.set_file_mode(&name, new_mode));
+        }
+
         let data_len = {
             let buf = self.write_buf.read().unwrap();
             buf.get(&ino_val)
@@ -279,8 +317,7 @@ impl Filesystem for LinaFs {
                 })
         };
 
-        let perm = mode.unwrap_or(0o644) as u16;
-        let attr = make_attr(ino_val, data_len, FileType::RegularFile, perm);
+        let attr = make_attr(ino_val, data_len, kind_from_mode(file_mode), perm_from_mode(file_mode));
         reply.attr(&TTL, &attr);
     }
 
@@ -330,7 +367,7 @@ impl Filesystem for LinaFs {
                     } else {
                         format!("{}/{}", prefix, leaf)
                     };
-                    entries.push((file_ino(&full), FileType::RegularFile, leaf));
+                    entries.push((file_ino(&full), kind_from_mode(link.mode), leaf));
                     seen.insert(leaf);
                 }
             }
@@ -343,6 +380,16 @@ impl Filesystem for LinaFs {
             }
         }
         reply.ok();
+    }
+
+    fn open(
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        _flags: OpenFlags,
+        reply: ReplyOpen,
+    ) {
+        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
     }
 
     fn read(
@@ -504,6 +551,44 @@ impl Filesystem for LinaFs {
         }
     }
 
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let ino_val: u64 = ino.into();
+
+        let (name, data) = {
+            let mut buf = self.write_buf.write().unwrap();
+            match buf.remove(&ino_val) {
+                Some(d) => {
+                    let name = match self
+                        .all_files()
+                        .iter()
+                        .find(|l| file_ino(&l.name) == ino_val)
+                    {
+                        Some(l) => l.name.clone(),
+                        None => return reply.error(fuser::Errno::ENOENT),
+                    };
+                    (name, d)
+                }
+                None => return reply.ok(),
+            }
+        };
+
+        match self
+            .rt(self
+                .store
+                .put_binary_data(&name, &Bytes::from(data), true, self.compressed))
+        {
+            Ok(_) => reply.ok(),
+            Err(_) => reply.error(fuser::Errno::EIO),
+        }
+    }
+
     fn create(
         &self,
         _req: &Request,
@@ -515,6 +600,7 @@ impl Filesystem for LinaFs {
         reply: ReplyCreate,
     ) {
         let parent_val: u64 = parent.into();
+        let mode = S_IFREG | (_mode & 0o777);
 
         let parent_path = if parent_val == ROOT_INO {
             String::new()
@@ -542,8 +628,9 @@ impl Filesystem for LinaFs {
                 .put_binary_data(&full_path, &Bytes::new(), false, self.compressed))
         {
             Ok(_) => {
+                let _ = self.rt(self.store.set_file_mode(&full_path, mode));
                 let ino = file_ino(&full_path);
-                let attr = make_attr(ino, 0, FileType::RegularFile, 0o644);
+                let attr = make_attr(ino, 0, kind_from_mode(mode), perm_from_mode(mode));
                 reply.created(
                     &TTL,
                     &attr,
@@ -552,6 +639,78 @@ impl Filesystem for LinaFs {
                     fuser::FopenFlags::empty(),
                 );
             }
+            Err(_) => reply.error(fuser::Errno::EIO),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: fuser::INodeNo,
+        name: &OsStr,
+        link: &Path,
+        reply: ReplyEntry,
+    ) {
+        let parent_val: u64 = parent.into();
+
+        let parent_path = if parent_val == ROOT_INO {
+            String::new()
+        } else {
+            match self.resolve_dir_path(parent_val) {
+                Some(p) => p,
+                None => return reply.error(fuser::Errno::ENOENT),
+            }
+        };
+
+        let name_str = match name.to_str() {
+            Some(n) => n,
+            None => return reply.error(fuser::Errno::EINVAL),
+        };
+
+        let full_path = if parent_path.is_empty() {
+            name_str.to_string()
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        };
+
+        let target = match link.to_str() {
+            Some(t) => t.as_bytes(),
+            None => return reply.error(fuser::Errno::EINVAL),
+        };
+
+        match self
+            .rt(self
+                .store
+                .put_binary_data(&full_path, &Bytes::from(target), false, self.compressed))
+        {
+            Ok(_) => {
+                let _ = self.rt(self.store.set_file_mode(&full_path, MODE_SYMLINK));
+                let ino = file_ino(&full_path);
+                let attr = make_attr(ino, target.len() as u64, FileType::Symlink, 0o777);
+                reply.entry(&TTL, &attr, fuser::Generation(0));
+            }
+            Err(_) => reply.error(fuser::Errno::EIO),
+        }
+    }
+
+    fn readlink(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        reply: ReplyData,
+    ) {
+        let ino_val: u64 = ino.into();
+        let name = match self
+            .all_files()
+            .iter()
+            .find(|l| file_ino(&l.name) == ino_val)
+        {
+            Some(l) => l.name.clone(),
+            None => return reply.error(fuser::Errno::ENOENT),
+        };
+
+        match self.rt(self.store.get_binary_data(&name)) {
+            Ok(data) => reply.data(&data),
             Err(_) => reply.error(fuser::Errno::EIO),
         }
     }
@@ -566,6 +725,7 @@ impl Filesystem for LinaFs {
         reply: ReplyEntry,
     ) {
         let parent_val: u64 = parent.into();
+        let mode = S_IFDIR | (_mode & 0o777);
 
         let parent_path = if parent_val == ROOT_INO {
             String::new()
@@ -589,8 +749,9 @@ impl Filesystem for LinaFs {
 
         match self.rt(self.store.mkdir(&dir_path, &parent_path)) {
             Ok(_) => {
+                let _ = self.rt(self.store.set_dir_mode(&dir_path, mode));
                 let ino = dir_ino(&dir_path);
-                let attr = make_attr(ino, 0, FileType::Directory, 0o755);
+                let attr = make_attr(ino, 0, FileType::Directory, perm_from_mode(mode));
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
             Err(_) => reply.error(fuser::Errno::EIO),
@@ -741,6 +902,77 @@ impl Filesystem for LinaFs {
         }
         let _ = self.rt(self.store.delete(&old_path, false));
         reply.ok();
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        _fh: FileHandle,
+        _offset: u64,
+        _length: u64,
+        _mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        _fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let ino_val: u64 = ino.into();
+
+        let file_size = match self.all_files().iter().find(|l| file_ino(&l.name) == ino_val) {
+            Some(l) => {
+                let buf = self.write_buf.read().unwrap();
+                buf.get(&ino_val)
+                    .map(|d| d.len())
+                    .unwrap_or_else(|| {
+                        self.rt(self.store.get_binary_data(&l.name))
+                            .map(|d| d.len())
+                            .unwrap_or(0)
+                    })
+            }
+            None => 0,
+        } as i64;
+
+        // SEEK_END
+        if whence == 2 {
+            reply.offset(file_size.wrapping_add(offset).max(0) as u64);
+            return;
+        }
+        // SEEK_DATA: no holes, data starts at this offset if within file
+        if whence == 3 {
+            let o = offset.max(0) as i64;
+            if o > file_size {
+                reply.offset(o as u64);  // ENXIO handled by caller
+            } else {
+                reply.offset(o as u64);
+            }
+            return;
+        }
+        // SEEK_HOLE: no holes, hole at EOF
+        if whence == 4 {
+            reply.offset(file_size as u64);
+            return;
+        }
+        reply.offset(0);
+    }
+
+    fn statfs(
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        reply: ReplyStatfs,
+    ) {
+        let files = self.all_files().len() as u64;
+        reply.statfs(0, 0, 0, files, 0, 4096, 255, 4096);
     }
 }
 
