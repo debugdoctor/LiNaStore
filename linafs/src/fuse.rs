@@ -68,6 +68,7 @@ const S_IFDIR: u32 = 0o040000;
 
 const MODE_FILE: u32 = S_IFREG | 0o644;
 const MODE_SYMLINK: u32 = S_IFLNK | 0o777;
+#[allow(unused)]
 const MODE_DIR: u32 = S_IFDIR | 0o755;
 
 fn kind_from_mode(mode: u32) -> FileType {
@@ -166,8 +167,11 @@ impl Filesystem for LinaFs {
         match self.rt(self.store.get_binary_data(&full_path)) {
             Ok(data) => {
                 let ino = file_ino(&full_path);
-                let link = self.all_files().iter().find(|l| l.name == full_path);
-                let mode = link.map(|l| l.mode).unwrap_or(MODE_FILE);
+                let files = self.all_files();
+                let mode = files.iter()
+                    .find(|l| l.name == full_path)
+                    .map(|l| l.mode)
+                    .unwrap_or(MODE_FILE);
                 let attr = make_attr(ino, data.len() as u64, kind_from_mode(mode), perm_from_mode(mode));
                 return reply.entry(&TTL, &attr, fuser::Generation(0));
             }
@@ -253,10 +257,14 @@ impl Filesystem for LinaFs {
         // Other directories
         let dirs = self.rt(self.store.all_dirs()).unwrap_or_default();
         if let Some(d) = dirs.iter().find(|d| dir_ino(&d.path) == ino_val) {
-            if let Some(m) = mode {
-                let _ = self.rt(self.store.set_dir_mode(&d.path, m));
-            }
-            let attr = make_attr(ino_val, 0, FileType::Directory, perm_from_mode(d.mode));
+            let dir_mode = if let Some(m) = mode {
+                let new_mode = (d.mode & S_IFMT) | (m & 0o777);
+                let _ = self.rt(self.store.set_dir_mode(&d.path, new_mode));
+                new_mode
+            } else {
+                d.mode
+            };
+            let attr = make_attr(ino_val, 0, FileType::Directory, perm_from_mode(dir_mode));
             return reply.attr(&TTL, &attr);
         }
 
@@ -298,12 +306,13 @@ impl Filesystem for LinaFs {
             }
         }
 
-        let link = self.all_files().iter().find(|l| file_ino(&l.name) == ino_val);
-        let file_mode = link.map(|l| l.mode).unwrap_or(MODE_FILE);
+        let files = self.all_files();
+        let link = files.iter().find(|l| file_ino(&l.name) == ino_val);
+        let mut file_mode = link.map(|l| l.mode).unwrap_or(MODE_FILE);
 
         if let Some(m) = mode {
-            let new_mode = (file_mode & S_IFMT) | (m & 0o777);
-            let _ = self.rt(self.store.set_file_mode(&name, new_mode));
+            file_mode = (file_mode & S_IFMT) | (m & 0o777);
+            let _ = self.rt(self.store.set_file_mode(&name, file_mode));
         }
 
         let data_len = {
@@ -367,13 +376,12 @@ impl Filesystem for LinaFs {
                     } else {
                         format!("{}/{}", prefix, leaf)
                     };
-                    entries.push((file_ino(&full), kind_from_mode(link.mode), leaf));
+                    entries.push((file_ino(&full), kind_from_mode(link.mode), leaf.clone()));
                     seen.insert(leaf);
                 }
             }
         }
 
-        let entries_len = entries.len();
         for (i, (e_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(fuser::INodeNo(*e_ino), (i + 1) as u64, *kind, name) {
                 break;
@@ -404,6 +412,18 @@ impl Filesystem for LinaFs {
         reply: ReplyData,
     ) {
         let ino_val: u64 = ino.into();
+
+        let buf = self.write_buf.read().unwrap();
+        if let Some(data) = buf.get(&ino_val) {
+            let start = offset as usize;
+            if start >= data.len() {
+                return reply.data(&[]);
+            }
+            let end = (start + size as usize).min(data.len());
+            let chunk = data[start..end].to_vec();
+            return reply.data(&chunk);
+        }
+
         let name = match self
             .all_files()
             .iter()
@@ -673,20 +693,22 @@ impl Filesystem for LinaFs {
             format!("{}/{}", parent_path, name_str)
         };
 
-        let target = match link.to_str() {
-            Some(t) => t.as_bytes(),
+        let target: Vec<u8> = match link.to_str() {
+            Some(t) => t.as_bytes().to_vec(),
             None => return reply.error(fuser::Errno::EINVAL),
         };
 
+        let target_len = target.len();
+        let target_bytes = Bytes::from(target);
         match self
             .rt(self
                 .store
-                .put_binary_data(&full_path, &Bytes::from(target), false, self.compressed))
+                .put_binary_data(&full_path, &target_bytes, false, self.compressed))
         {
             Ok(_) => {
                 let _ = self.rt(self.store.set_file_mode(&full_path, MODE_SYMLINK));
                 let ino = file_ino(&full_path);
-                let attr = make_attr(ino, target.len() as u64, FileType::Symlink, 0o777);
+                let attr = make_attr(ino, target_len as u64, FileType::Symlink, 0o777);
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
             Err(_) => reply.error(fuser::Errno::EIO),
@@ -927,8 +949,9 @@ impl Filesystem for LinaFs {
         reply: ReplyLseek,
     ) {
         let ino_val: u64 = ino.into();
+        let files = self.all_files();
 
-        let file_size = match self.all_files().iter().find(|l| file_ino(&l.name) == ino_val) {
+        let file_size = match files.iter().find(|l| file_ino(&l.name) == ino_val) {
             Some(l) => {
                 let buf = self.write_buf.read().unwrap();
                 buf.get(&ino_val)
@@ -944,22 +967,22 @@ impl Filesystem for LinaFs {
 
         // SEEK_END
         if whence == 2 {
-            reply.offset(file_size.wrapping_add(offset).max(0) as u64);
+            reply.offset(file_size.wrapping_add(offset).max(0) as i64);
             return;
         }
         // SEEK_DATA: no holes, data starts at this offset if within file
         if whence == 3 {
             let o = offset.max(0) as i64;
             if o > file_size {
-                reply.offset(o as u64);  // ENXIO handled by caller
+                reply.offset(o as i64);  // ENXIO handled by caller
             } else {
-                reply.offset(o as u64);
+                reply.offset(o as i64);
             }
             return;
         }
         // SEEK_HOLE: no holes, hole at EOF
         if whence == 4 {
-            reply.offset(file_size as u64);
+            reply.offset(file_size as i64);
             return;
         }
         reply.offset(0);

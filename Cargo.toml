@@ -1,5 +1,6 @@
 [workspace]
 members = ["linabase", "linafs", "linastore-server"]
+resolver = "3"
 
 [profile.release]
 opt-level = 2
