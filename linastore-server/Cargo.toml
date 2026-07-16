@@ -5,28 +5,28 @@ edition = "2024"
 
 [dependencies]
 linabase = { path = "../linabase" }
-chrono = "0.4.43"
-clap = { version = "4.5.50", default-features = false, features = ["derive", "std", "help", "usage"] }
-http-body-util = "0.1.3"
-hyper = { version = "1.8.0", features = ["server", "http1"] }
-hyper-util = { version = "0.1.18", features = ["tokio"] }
-tokio = { version = "1.47.2", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
-uuid = { version = "1.18.1", features = ["v4"] }
-tracing = "0.1.43"
-tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt"] }
-bytes = "1.10.1"
-crc32fast = "1.5.0"
-serde = { version = "1.0.228", features = ["derive"] }
-sha2 = "0.10.9"
-hex = "0.4.3"
-serde_json = "1.0.145"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono"] }
-aes-gcm = "0.10.3"
+chrono = "0.4"
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage"] }
+http-body-util = "0.1"
+hyper = { version = "1.8", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+uuid = { version = "1.18", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+bytes = "1.10"
+crc32fast = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+serde_json = "1.0"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono"] }
+aes-gcm = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
-libc = "0.2.182"
+libc = "0.2"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", default-features = false, features = ["process", "fs"] }
+nix = { version = "0.30", default-features = false, features = ["process", "fs"] }
 
 [features]
 default = []
@@ -35,6 +35,6 @@ postgres = ["sqlx/postgres"]
 full = ["mysql", "postgres"]
 
 [dev-dependencies]
-tempfile = "3.23.0"
+tempfile = "3.23"
 reqwest = { version = "0.12", features = ["blocking"] }
 serial_test = "3.2"
