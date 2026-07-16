@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS link (
     name TEXT NOT NULL,
     ext TEXT NOT NULL,
     source_id TEXT NOT NULL,
+    mode INTEGER NOT NULL DEFAULT 420,
     FOREIGN KEY (source_id) REFERENCES source (id) ON DELETE RESTRICT
 );
 
@@ -28,7 +29,8 @@ CREATE TABLE IF NOT EXISTS source (
 
 CREATE TABLE IF NOT EXISTS dir (
     path TEXT PRIMARY KEY,
-    parent TEXT NOT NULL DEFAULT ''
+    parent TEXT NOT NULL DEFAULT '',
+    mode INTEGER NOT NULL DEFAULT 493
 );
 
 CREATE INDEX IF NOT EXISTS dir_parent_idx ON dir (parent);
@@ -44,6 +46,7 @@ pub struct Link {
     pub name: String,
     pub ext: String,
     pub source_id: String,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,7 @@ pub struct Source {
 pub struct DirEntry {
     pub path: String,
     pub parent: String,
+    pub mode: u32,
 }
 
 // DAO struct for database operations
@@ -108,6 +112,15 @@ impl Dao {
             .execute(&self.pool)
             .await
             .context("Failed to initialize database schema")?;
+
+        // Migration: add mode column for existing databases
+        let _ = sqlx::query("ALTER TABLE link ADD COLUMN mode INTEGER NOT NULL DEFAULT 420")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE dir ADD COLUMN mode INTEGER NOT NULL DEFAULT 493")
+            .execute(&self.pool)
+            .await;
+
         Ok(())
     }
 }
@@ -120,14 +133,16 @@ impl Dao {
         name: &str,
         ext: &str,
         source_id: &str,
+        mode: u32,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO link (id, name, ext, source_id) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO link (id, name, ext, source_id, mode) VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(id)
         .bind(name)
         .bind(ext)
         .bind(source_id)
+        .bind(mode)
         .execute(&self.pool)
         .await
         .context("Failed to insert link")?;
@@ -136,13 +151,13 @@ impl Dao {
 
     pub async fn get_links_by_name(&self, name: &str, fuzzy: bool) -> Result<Vec<Link>> {
         let rows = if fuzzy {
-            sqlx::query("SELECT id, name, ext, source_id FROM link WHERE name LIKE ?1")
+            sqlx::query("SELECT id, name, ext, source_id, mode FROM link WHERE name LIKE ?1")
                 .bind(name)
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to query links by name (fuzzy)")?
         } else {
-            sqlx::query("SELECT id, name, ext, source_id FROM link WHERE name = ?1")
+            sqlx::query("SELECT id, name, ext, source_id, mode FROM link WHERE name = ?1")
                 .bind(name)
                 .fetch_all(&self.pool)
                 .await
@@ -156,6 +171,7 @@ impl Dao {
                 name: row.get("name"),
                 ext: row.get("ext"),
                 source_id: row.get("source_id"),
+                mode: row.get::<i64, _>("mode") as u32,
             })
             .collect();
 
@@ -163,7 +179,7 @@ impl Dao {
     }
 
     pub async fn get_links_by_ext(&self, ext: &str) -> Result<Vec<Link>> {
-        let rows = sqlx::query("SELECT id, name, ext, source_id FROM link WHERE ext = ?1")
+        let rows = sqlx::query("SELECT id, name, ext, source_id, mode FROM link WHERE ext = ?1")
             .bind(ext)
             .fetch_all(&self.pool)
             .await
@@ -176,6 +192,7 @@ impl Dao {
                 name: row.get("name"),
                 ext: row.get("ext"),
                 source_id: row.get("source_id"),
+                mode: row.get::<i64, _>("mode") as u32,
             })
             .collect();
 
@@ -184,12 +201,12 @@ impl Dao {
 
     pub async fn get_n_links(&self, n: u64) -> Result<Vec<Link>> {
         let rows = if n == 0 {
-            sqlx::query("SELECT id, name, ext, source_id FROM link")
+            sqlx::query("SELECT id, name, ext, source_id, mode FROM link")
                 .fetch_all(&self.pool)
                 .await
                 .context("Failed to query all links")?
         } else {
-            sqlx::query("SELECT id, name, ext, source_id FROM link LIMIT ?1")
+            sqlx::query("SELECT id, name, ext, source_id, mode FROM link LIMIT ?1")
                 .bind(n as i64)
                 .fetch_all(&self.pool)
                 .await
@@ -203,10 +220,21 @@ impl Dao {
                 name: row.get("name"),
                 ext: row.get("ext"),
                 source_id: row.get("source_id"),
+                mode: row.get::<i64, _>("mode") as u32,
             })
             .collect();
 
         Ok(links)
+    }
+
+    pub async fn set_link_mode(&self, name: &str, mode: u32) -> Result<()> {
+        sqlx::query("UPDATE link SET mode = ?1 WHERE name = ?2")
+            .bind(mode)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update link mode")?;
+        Ok(())
     }
 
     pub async fn delete_link_by_id(&self, id: &str) -> Result<()> {
@@ -222,7 +250,7 @@ impl Dao {
 // Directory CRUD operations.
 impl Dao {
     pub async fn insert_dir(&self, path: &str, parent: &str) -> Result<()> {
-        sqlx::query("INSERT INTO dir (path, parent) VALUES (?1, ?2)")
+        sqlx::query("INSERT INTO dir (path, parent, mode) VALUES (?1, ?2, 493)")
             .bind(path)
             .bind(parent)
             .execute(&self.pool)
@@ -241,7 +269,7 @@ impl Dao {
     }
 
     pub async fn get_dir_by_path(&self, path: &str) -> Result<Option<DirEntry>> {
-        let row = sqlx::query("SELECT path, parent FROM dir WHERE path = ?1")
+        let row = sqlx::query("SELECT path, parent, mode FROM dir WHERE path = ?1")
             .bind(path)
             .fetch_optional(&self.pool)
             .await
@@ -249,11 +277,12 @@ impl Dao {
         Ok(row.map(|r: sqlx::sqlite::SqliteRow| DirEntry {
             path: r.get("path"),
             parent: r.get("parent"),
+            mode: r.get::<i64, _>("mode") as u32,
         }))
     }
 
     pub async fn list_dirs_by_parent(&self, parent: &str) -> Result<Vec<DirEntry>> {
-        let rows = sqlx::query("SELECT path, parent FROM dir WHERE parent = ?1 ORDER BY path")
+        let rows = sqlx::query("SELECT path, parent, mode FROM dir WHERE parent = ?1 ORDER BY path")
             .bind(parent)
             .fetch_all(&self.pool)
             .await
@@ -263,12 +292,13 @@ impl Dao {
             .map(|r: sqlx::sqlite::SqliteRow| DirEntry {
                 path: r.get("path"),
                 parent: r.get("parent"),
+                mode: r.get::<i64, _>("mode") as u32,
             })
             .collect())
     }
 
     pub async fn list_all_dirs(&self) -> Result<Vec<DirEntry>> {
-        let rows = sqlx::query("SELECT path, parent FROM dir ORDER BY path")
+        let rows = sqlx::query("SELECT path, parent, mode FROM dir ORDER BY path")
             .fetch_all(&self.pool)
             .await
             .context("Failed to list all dirs")?;
@@ -277,8 +307,19 @@ impl Dao {
             .map(|r: sqlx::sqlite::SqliteRow| DirEntry {
                 path: r.get("path"),
                 parent: r.get("parent"),
+                mode: r.get::<i64, _>("mode") as u32,
             })
             .collect())
+    }
+
+    pub async fn set_dir_mode(&self, path: &str, mode: u32) -> Result<()> {
+        sqlx::query("UPDATE dir SET mode = ?1 WHERE path = ?2")
+            .bind(mode)
+            .bind(path)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update dir mode")?;
+        Ok(())
     }
 }
 
@@ -440,7 +481,7 @@ mod tests {
             .await
             .expect("Failed to insert source");
 
-        let result = dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id).await;
+        let result = dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id, 420).await;
         if let Err(e) = &result {
             eprintln!("Error inserting link: {:?}", e);
         }
@@ -458,7 +499,7 @@ mod tests {
         dao.insert_source(&source_id, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id, 420)
             .await
             .expect("Failed to insert link");
 
@@ -486,10 +527,10 @@ mod tests {
         dao.insert_source(&source_id2, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file1.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file1.txt", "txt", &source_id1, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file2.txt", "txt", &source_id2)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file2.txt", "txt", &source_id2, 420)
             .await
             .expect("Failed to insert link");
 
@@ -532,13 +573,13 @@ mod tests {
         dao.insert_source(&source_id3, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file1.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file1.txt", "txt", &source_id1, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file2.txt", "txt", &source_id2)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file2.txt", "txt", &source_id2, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file3.pdf", "pdf", &source_id3)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file3.pdf", "pdf", &source_id3, 420)
             .await
             .expect("Failed to insert link");
 
@@ -568,13 +609,13 @@ mod tests {
         dao.insert_source(&source_id3, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file1.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file1.txt", "txt", &source_id1, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file2.txt", "txt", &source_id2)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file2.txt", "txt", &source_id2, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file3.txt", "txt", &source_id3)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "file3.txt", "txt", &source_id3, 420)
             .await
             .expect("Failed to insert link");
 
@@ -596,7 +637,7 @@ mod tests {
         dao.insert_source(&source_id, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id, 420)
             .await
             .expect("Failed to insert link");
 
@@ -700,7 +741,7 @@ mod tests {
         dao.insert_source(&source_id2, hash256, false, 1024)
             .await
             .expect("Failed to insert source");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id1)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id1, 420)
             .await
             .expect("Failed to insert link");
 
@@ -788,7 +829,7 @@ mod tests {
             .expect("Failed to insert source");
 
         // Insert link referencing the source
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "test_file.txt", "txt", &source_id, 420)
             .await
             .expect("Failed to insert link");
 
@@ -820,13 +861,13 @@ mod tests {
             .await
             .expect("Failed to insert source");
 
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link1.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link1.txt", "txt", &source_id, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link2.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link2.txt", "txt", &source_id, 420)
             .await
             .expect("Failed to insert link");
-        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link3.txt", "txt", &source_id)
+        dao.insert_link_with_id(&Uuid::new_v4().to_string(), "link3.txt", "txt", &source_id, 420)
             .await
             .expect("Failed to insert link");
 

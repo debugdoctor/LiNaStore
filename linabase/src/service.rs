@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio::task;
 use uuid::Uuid;
@@ -140,6 +141,24 @@ impl StoreManager {
             .map_err(|e| Box::new(e) as BoxError)
     }
 
+    pub async fn set_file_mode(&self, name: &str, mode: u32) -> Result<(), BoxError> {
+        let _write_guard = self.operation_lock.write().await;
+        self.dao
+            .set_link_mode(name, mode)
+            .await
+            .map_err(dao_to_io_error)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    pub async fn set_dir_mode(&self, path: &str, mode: u32) -> Result<(), BoxError> {
+        let _write_guard = self.operation_lock.write().await;
+        self.dao
+            .set_dir_mode(path, mode)
+            .await
+            .map_err(dao_to_io_error)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
     pub async fn sync_dirs_from_links(&self) -> Result<(), BoxError> {
         let _write_guard = self.operation_lock.write().await;
         let links = self.list_locked("*", 0, false, true).await?;
@@ -170,7 +189,7 @@ impl StoreManager {
             return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
         }
 
-        let (compressed, source_size, file_bytes) = {
+        let (compressed, source_size, expected_hash, file_bytes) = {
             let _read_guard = self.operation_lock.read().await;
             let links = self
                 .dao
@@ -190,7 +209,7 @@ impl StoreManager {
 
             let source_path = self.source_path(&source.id);
             let file_bytes = fs::read(&source_path).await?;
-            (source.compressed, source.size as usize, file_bytes)
+            (source.compressed, source.size as usize, source.hash256.clone(), file_bytes)
         };
 
         if compressed {
@@ -200,8 +219,16 @@ impl StoreManager {
             })
             .await
             .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("decompress task join error: {}", e)))??;
+            let actual_hash = utils::get_hash256_from_binary(&decoded);
+            if actual_hash != expected_hash {
+                return Err(boxed_io_error(io::ErrorKind::InvalidData, "data integrity check failed"));
+            }
             Ok(Bytes::from(decoded))
         } else {
+            let actual_hash = utils::get_hash256_from_binary(&file_bytes);
+            if actual_hash != expected_hash {
+                return Err(boxed_io_error(io::ErrorKind::InvalidData, "data integrity check failed"));
+            }
             Ok(Bytes::from(file_bytes))
         }
     }
@@ -354,7 +381,7 @@ impl StoreManager {
                         .to_string();
                     let _ = self
                         .dao
-                        .insert_link_with_id(&link.id, &link.name, &ext, &link.source_id)
+                        .insert_link_with_id(&link.id, &link.name, &ext, &link.source_id, link.mode)
                         .await
                         .map_err(dao_to_io_error);
                     return Err(err);
@@ -424,23 +451,57 @@ impl StoreManager {
                 .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "Source not found"))?;
 
             if cover {
-                let source_path = self.source_path(&link.source_id);
-                let previous_storage_bytes = fs::read(&source_path).await?;
+                // If this source is shared, don't overwrite in place.
+                // Create a new source so other links pointing to the same
+                // content are not affected by this write/truncate.
+                if source.count > 1 {
+                    let new_source_id = Self::file_name_gen();
+                    self.persist_source_bytes(&new_source_id, new_storage_bytes).await?;
 
-                self.persist_source_bytes(&link.source_id, new_storage_bytes).await?;
-                if let Err(err) = self
-                    .dao
-                    .update_source(
-                        &link.source_id,
-                        new_hash256,
-                        compressed,
-                        new_size,
-                        source.count,
-                    )
-                    .await
-                {
-                    let _ = self.persist_source_bytes(&link.source_id, &previous_storage_bytes).await;
-                    return Err(Box::new(dao_to_io_error(err)));
+                    if let Err(err) = self
+                        .dao
+                        .insert_source(&new_source_id, new_hash256, compressed, new_size)
+                        .await
+                    {
+                        let _ = self.remove_source_file_if_exists(&new_source_id).await;
+                        return Err(Box::new(dao_to_io_error(err)));
+                    }
+
+                    if let Err(err) = self.dao.update_link_source_id(&link.id, &new_source_id).await {
+                        let _ = self.dao.delete_source_by_id(&new_source_id).await.map_err(dao_to_io_error);
+                        let _ = self.remove_source_file_if_exists(&new_source_id).await;
+                        return Err(Box::new(dao_to_io_error(err)));
+                    }
+
+                    let source_count = source
+                        .count
+                        .checked_sub(1)
+                        .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
+                    if let Err(err) = self.release_source(&link, &source, source_count).await {
+                        let _ = self.dao.update_link_source_id(&link.id, &source.id).await.map_err(dao_to_io_error);
+                        let _ = self.dao.delete_source_by_id(&new_source_id).await.map_err(dao_to_io_error);
+                        let _ = self.remove_source_file_if_exists(&new_source_id).await;
+                        return Err(Box::new(io::Error::other(err.to_string())));
+                    }
+                } else {
+                    let source_path = self.source_path(&link.source_id);
+                    let previous_storage_bytes = fs::read(&source_path).await?;
+
+                    self.persist_source_bytes(&link.source_id, new_storage_bytes).await?;
+                    if let Err(err) = self
+                        .dao
+                        .update_source(
+                            &link.source_id,
+                            new_hash256,
+                            compressed,
+                            new_size,
+                            source.count,
+                        )
+                        .await
+                    {
+                        let _ = self.persist_source_bytes(&link.source_id, &previous_storage_bytes).await;
+                        return Err(Box::new(dao_to_io_error(err)));
+                    }
                 }
             } else {
                 if new_hash256 == source.hash256 && source.compressed == compressed {
@@ -498,7 +559,7 @@ impl StoreManager {
             {
                 let link_id = Uuid::new_v4().to_string();
                 self.dao
-                    .insert_link_with_id(&link_id, file_name, ext, &source.id)
+                    .insert_link_with_id(&link_id, file_name, ext, &source.id, 420)
                     .await
                     .map_err(dao_to_io_error)?;
 
@@ -536,7 +597,7 @@ impl StoreManager {
 
             if let Err(err) = self
                 .dao
-                .insert_link_with_id(&link_id, file_name, ext, &source_id)
+                .insert_link_with_id(&link_id, file_name, ext, &source_id, 420)
                 .await
             {
                 let _ = self
@@ -632,7 +693,11 @@ impl StoreManager {
         let target_path = source_dir.join(source_id);
         let tmp_path = source_dir.join(format!("{}.tmp-{}", source_id, Uuid::new_v4()));
 
-        fs::write(&tmp_path, bytes).await?;
+        let mut f = fs::File::create(&tmp_path).await?;
+        f.write_all(bytes).await?;
+        f.sync_all().await?;
+        drop(f);
+
         if let Err(err) = fs::rename(&tmp_path, &target_path).await {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(Box::new(err));
