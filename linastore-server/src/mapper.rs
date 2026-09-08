@@ -49,12 +49,19 @@ impl BucketMapper {
         .await
     }
 
+    /// Get-or-create a mapping. Reusing the same internal name across
+    /// overwrites lets the store version in place instead of leaking an
+    /// orphaned link + blob per write.
     pub async fn register(
         &self,
         bucket: &str,
         key: &str,
         internal_name: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<String, sqlx::Error> {
+        if let Some(existing) = self.resolve(bucket, key).await? {
+            return Ok(existing);
+        }
+
         sqlx::query(
             "INSERT OR IGNORE INTO bucket_mappings (bucket, key, internal_name) VALUES (?1, ?2, ?3)",
         )
@@ -63,7 +70,12 @@ impl BucketMapper {
         .bind(internal_name)
         .execute(&self.pool)
         .await?;
-        Ok(())
+
+        // Racy first-writes: return whichever name won the insert.
+        Ok(self
+            .resolve(bucket, key)
+            .await?
+            .unwrap_or_else(|| internal_name.to_string()))
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<(), sqlx::Error> {

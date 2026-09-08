@@ -302,6 +302,51 @@ impl BlockManager {
 
         Ok(result)
     }
+    /// Decode a single stored block: `flag` 0 = raw data, 1 = gzip. Used by
+    /// the streaming reader to decompress one block at a time.
+    pub fn decompress_block(&self, flag: u8, data: &[u8]) -> Result<Vec<u8>, BoxError> {
+        match flag {
+            0 => Ok(data.to_vec()),
+            1 => self.__decode(data),
+            _ => Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown chunk flag: {}", flag),
+            ))),
+        }
+    }
+
+    /// Compress one block with its storage header (flag + u16 length + data).
+    /// Used by the streaming writer to compress incrementally.
+    pub fn compress_block(&self, chunk: &[u8]) -> Result<Vec<u8>, BoxError> {
+        let compressed_chunk = self.__encode(chunk)?;
+        let raw_len = chunk.len();
+
+        let mut out = Vec::with_capacity(compressed_chunk.len() + 3);
+        if compressed_chunk.len() > raw_len {
+            out.push(0);
+            out.extend_from_slice(&(raw_len as u16).to_le_bytes());
+            out.extend_from_slice(chunk);
+        } else {
+            if compressed_chunk.len() > 0x10000 {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Compressed chunk length is greater than 64KiB: {:x}",
+                        compressed_chunk.len()
+                    ),
+                )));
+            }
+            out.push(1);
+            out.extend_from_slice(&(compressed_chunk.len() as u16).to_le_bytes());
+            out.extend_from_slice(&compressed_chunk);
+        }
+        Ok(out)
+    }
+
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
     // Input bytes less than 0x10000 (64KiB) - 0xa
     fn __encode(&self, chunk: &[u8]) -> Result<Vec<u8>, BoxError> {
         let result = Vec::with_capacity(u16::MAX as usize);

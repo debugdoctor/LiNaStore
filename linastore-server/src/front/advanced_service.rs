@@ -13,8 +13,8 @@ use crate::{
         HandshakeStatus, decrypt_with_token, extract_password, extract_username, get_auth_manager,
         get_handshake_rate_limiter,
     },
-    conveyer::ConveyQueue,
-    dtos::{Behavior, Content, LiNaProtocol, Op, Package, Status},
+    conveyer::{AdmissionError, ConveyQueue},
+    dtos::{Behavior, LiNaProtocol, Op, OrderRequest, Status},
     shutdown::Shutdown,
 };
 
@@ -297,9 +297,9 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             continue;
         }
 
-        let uuid = Uuid::new_v4();
-        let uni_id = uuid.into_bytes();
-
+        // The framed Advanced protocol is parsed before admission, so its
+        // payload is already in memory here. HTTP/S3 uploads use the streamed
+        // payload channel and apply socket backpressure before body reads.
         // Extract session token from payload data for write operations
         let (session_token, file_data) = if op == Op::Write
             && !message.payload.data.is_empty()
@@ -424,14 +424,12 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             file_data
         };
 
-        // Order generation
-        let mut order_pkg = Package::new_with_id(&uuid);
-        order_pkg.behavior = match op {
+        // Order generation — meta only; the body streams via the order's channel.
+        let behavior = match op {
             Op::Delete => Behavior::DeleteFile,
             Op::Write => Behavior::PutFile,
             Op::Read => Behavior::GetFile,
-            // Auth was handled above and returns early; None means an unknown
-            // / unset op field, dispatched as a no-op for the worker.
+            // Auth was handled above; None means an unknown/unset op.
             Op::Auth | Op::None => Behavior::None,
         };
 
@@ -447,10 +445,13 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 
         let resolved_identifier = match op {
             Op::Write => {
-                let internal_name = Uuid::new_v4().to_string();
-                if let Some(m) = crate::mapper::get_mapper() {
-                    let _ = m.register(&bucket, &key, &internal_name).await;
-                }
+                // Get-or-create the key's canonical name so overwrites version
+                // in place instead of leaking an orphaned link + blob.
+                let suggested = Uuid::new_v4().to_string();
+                let internal_name = match crate::mapper::get_mapper() {
+                    Some(m) => m.register(&bucket, &key, &suggested).await.unwrap_or(suggested),
+                    None => suggested,
+                };
                 Bytes::from(internal_name)
             }
             _ => {
@@ -476,55 +477,82 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             }
         };
 
-        order_pkg.content = Content {
-            flags: message.flags,
-            identifier: resolved_identifier,
-            data: file_data,
-        };
+        let is_put = matches!(behavior, Behavior::PutFile);
+        let (data_tx, order) = OrderRequest::create(
+            behavior,
+            message.flags,
+            resolved_identifier,
+            file_data.len() as u64,
+            true,
+        );
+        let uni_id = order.uni_id;
 
-        // Register waiter before sending to conveyer
         let con_queue = ConveyQueue::get_instance();
-        let receiver = match con_queue.register_waiter(uni_id) {
-            Some(rx) => rx,
-            None => {
+        let receiver = match con_queue.register_waiter(uni_id).await {
+            Ok(rx) => rx,
+            Err(AdmissionError::TimedOut) => {
                 event!(
-                    Level::ERROR,
-                    "[waitress {}] Failed to register waiter",
+                    Level::WARN,
+                    "[waitress {}] Admission wait timed out",
                     &log_id
                 );
+                write_error_response(&mut stream, &log_id, Status::Overloaded, None).await;
+                return;
+            }
+            Err(_) => {
                 write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
                 return;
             }
         };
 
-        // Send order to conveyer
-        match con_queue.produce_order(order_pkg) {
-            Ok(_) => {}
-            Err(err) => {
-                event!(Level::ERROR, "[waitress {}] {}", &log_id, err);
+        if let Err(err) = con_queue.produce_order(order) {
+            event!(Level::ERROR, "[waitress {}] {}", &log_id, err);
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
+            write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
+            return;
+        }
+
+        // Hand the payload over only now that a worker owns the meta.
+        if is_put {
+            if data_tx.send(file_data).await.is_err() {
+                event!(
+                    Level::ERROR,
+                    "[waitress {}] Order dropped before payload handover",
+                    &log_id
+                );
                 con_queue.unregister_waiter(uni_id);
-                con_queue.remove_order(uni_id);
                 write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
                 return;
             }
         }
+        drop(data_tx);
 
-        // Wait for response via channel with timeout
         let timeout = Duration::from_secs(10);
         match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(pkg)) => {
-                let mut response = LiNaProtocol::new();
-                response.status = pkg.status;
-                response.payload.identifier = pkg.content.identifier;
-                response.payload.ilen = response.payload.identifier.len() as u8;
-                response.payload.dlen = pkg.content.data.len() as u32;
-                response.payload.data = pkg.content.data;
-                // Calculate checksum after setting all the data
-                response.payload.checksum = response.calculate_checksum();
-                let resp_data = response.serialize_protocol_message();
-
-                if let Err(e) = stream.write_all(&resp_data).await {
-                    event!(tracing::Level::ERROR, "Error writing to stream: {}", e);
+            Ok(Ok(res)) => {
+                // Header: status(1) + ilen(1) + identifier + dlen(4) + checksum(4)
+                let status = res.status as u8;
+                let identifier = res.identifier;
+                let data_len = res.data_len;
+                let checksum = res.checksum;
+                let mut data = res.data;
+                let mut header = Vec::with_capacity(1 + 1 + identifier.len() + 8);
+                header.push(status);
+                header.push(identifier.len() as u8);
+                header.extend_from_slice(&identifier);
+                header.extend_from_slice(&(data_len as u32).to_le_bytes());
+                header.extend_from_slice(&checksum.to_le_bytes());
+                if let Err(e) = stream.write_all(&header).await {
+                    event!(tracing::Level::ERROR, "Error writing header to stream: {}", e);
+                    return;
+                }
+                // Stream the body chunks; the receiver closes at EOF.
+                while let Some(chunk) = data.recv().await {
+                    if let Err(e) = stream.write_all(&chunk).await {
+                        event!(tracing::Level::ERROR, "Error writing to stream: {}", e);
+                        return;
+                    }
                 }
             }
             Ok(Err(_)) => {

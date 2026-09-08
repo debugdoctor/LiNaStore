@@ -1,20 +1,29 @@
-use std::time::Duration;
+use std::{io, time::Duration};
 
 use crate::{
-    conveyer::ConveyQueue,
-    dtos::{Behavior, Package, Status},
+    conveyer::{AdmissionError, ConveyQueue},
+    dtos::{Behavior, OrderRequest, ResponseStream, PAYLOAD_UNKNOWN_LEN, Status},
     mapper,
     shutdown::Shutdown,
 };
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request, Response, StatusCode, server::conn::http1, service::service_fn};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use hyper::{Method, Request, Response, StatusCode, body::Frame, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{Level, event, instrument};
 use uuid::Uuid;
 
 const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+// Per-frame body read timeout while streaming an upload to the worker.
+const BODY_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
+type S3Body = BoxBody<Bytes, io::Error>;
+
+fn boxed_full(body: Bytes) -> S3Body {
+    Full::new(body).map_err(|never| match never {}).boxed()
+}
 
 fn s3_error_xml(code: &str, message: &str, resource: &str) -> String {
     format!(
@@ -89,48 +98,59 @@ fn parse_s3_path(path: &str) -> (Option<&str>, Option<&str>) {
     (bucket, key)
 }
 
-fn build_response(status: StatusCode, body: String, content_type: &str) -> Response<Full<Bytes>> {
+fn build_response(status: StatusCode, body: String, content_type: &str) -> Response<S3Body> {
     Response::builder()
         .status(status)
         .header("Content-Type", content_type)
         .header("Content-Length", body.len().to_string())
-        .body(Full::new(Bytes::from(body)))
+        .body(boxed_full(Bytes::from(body)))
         .unwrap()
 }
 
-fn build_empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+fn build_empty_response(status: StatusCode) -> Response<S3Body> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::new()))
+        .body(boxed_full(Bytes::new()))
         .unwrap()
 }
 
-async fn process_through_queue(behavior: Behavior, identifier: &str, data: Bytes) -> Result<Package, Status> {
-    let uuid = Uuid::new_v4();
-    let uni_id = uuid.into_bytes();
-    let mut package = Package::new_with_id(&uuid);
-    package.behavior = behavior;
-    package.content.identifier = Bytes::copy_from_slice(identifier.as_bytes());
-    package.content.data = data;
+/// Build a streaming body that drains an `mpsc::Receiver<Bytes>`.
+fn stream_body(rx: tokio::sync::mpsc::Receiver<Bytes>) -> S3Body {
+    let stream = ReceiverStream::new(rx).map(|chunk| Ok::<_, io::Error>(Frame::data(chunk)));
+    StreamBody::new(stream).boxed()
+}
+
+/// Enqueue a body-less order (GET/HEAD/DELETE) and wait for the response.
+async fn process_through_queue(behavior: Behavior, identifier: &str) -> Result<ResponseStream, Status> {
+    let (data_tx, order) = OrderRequest::create(
+        behavior,
+        0,
+        Bytes::copy_from_slice(identifier.as_bytes()),
+        0,
+        false,
+    );
+    drop(data_tx);
+    let uni_id = order.uni_id;
 
     let con_queue = ConveyQueue::get_instance();
-    let receiver = match con_queue.register_waiter(uni_id) {
-        Some(rx) => rx,
-        None => return Err(Status::InternalError),
+    let receiver = match con_queue.register_waiter(uni_id).await {
+        Ok(rx) => rx,
+        Err(AdmissionError::TimedOut) => return Err(Status::Overloaded),
+        Err(_) => return Err(Status::InternalError),
     };
 
-    if let Err(e) = con_queue.produce_order(package) {
+    if let Err(e) = con_queue.produce_order(order) {
         event!(Level::ERROR, "Failed to produce order: {}", e);
         con_queue.unregister_waiter(uni_id);
         return Err(Status::InternalError);
     }
 
     match tokio::time::timeout(Duration::from_secs(10), receiver).await {
-        Ok(Ok(pkg)) => {
-            if pkg.status == Status::Success {
-                Ok(pkg)
+        Ok(Ok(res)) => {
+            if res.status == Status::Success {
+                Ok(res)
             } else {
-                Err(pkg.status)
+                Err(res.status)
             }
         }
         Ok(Err(_)) => {
@@ -147,7 +167,81 @@ async fn process_through_queue(behavior: Behavior, identifier: &str, data: Bytes
     }
 }
 
-async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::http::Error> {
+/// Streaming upload: only the meta enters the queue; the body is forwarded
+/// chunk-by-chunk into the order's bounded channel while the worker processes.
+async fn put_through_queue(
+    identifier: &str,
+    data_len: u64,
+    body: hyper::body::Incoming,
+) -> Result<ResponseStream, Status> {
+    let (data_tx, order) = OrderRequest::create(Behavior::PutFile, 0, Bytes::from(identifier.to_string()), data_len, false);
+    let uni_id = order.uni_id;
+
+    let con_queue = ConveyQueue::get_instance();
+    let receiver = match con_queue.register_waiter(uni_id).await {
+        Ok(rx) => rx,
+        Err(AdmissionError::TimedOut) => return Err(Status::Overloaded),
+        Err(_) => return Err(Status::InternalError),
+    };
+
+    if let Err(e) = con_queue.produce_order(order) {
+        event!(Level::ERROR, "Failed to produce order: {}", e);
+        con_queue.unregister_waiter(uni_id);
+        return Err(Status::InternalError);
+    }
+
+    // The bounded channel throttles the socket to the worker's write rate.
+    let mut body = body;
+    let mut stream_failed = false;
+    loop {
+        match tokio::time::timeout(BODY_CHUNK_TIMEOUT, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                if data_tx.send(data).await.is_err() {
+                        stream_failed = true;
+                        break;
+                    }
+                    con_queue.touch_waiter(uni_id);
+                }
+            }
+            Ok(Some(Err(_))) | Err(_) => {
+                stream_failed = true;
+                break;
+            }
+            Ok(None) => break,
+        }
+    }
+    drop(data_tx);
+
+    if stream_failed {
+        con_queue.unregister_waiter(uni_id);
+        con_queue.remove_order(uni_id);
+        return Err(Status::BadRequest);
+    }
+
+    match tokio::time::timeout(Duration::from_secs(10), receiver).await {
+        Ok(Ok(res)) => {
+            if res.status == Status::Success {
+                Ok(res)
+            } else {
+                Err(res.status)
+            }
+        }
+        Ok(Err(_)) => {
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
+            Err(Status::InternalError)
+        }
+        Err(_) => {
+            event!(Level::ERROR, "S3 request timeout");
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
+            Err(Status::InternalError)
+        }
+    }
+}
+
+async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<S3Body>, hyper::http::Error> {
     let method = req.method().clone();
     let uri = req.uri().to_string();
     let path = uri.split('?').next().unwrap_or(&uri);
@@ -190,19 +284,22 @@ async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<Full<
                     };
                     match internal_name {
                         Some(ref name) => {
-                            match process_through_queue(Behavior::GetFile, &name, Bytes::new()).await {
-                                Ok(pkg) => {
+                            match process_through_queue(Behavior::GetFile, &name).await {
+                                Ok(res) => {
                                     let content_type = get_mime_type(key);
                                     Response::builder()
                                         .status(StatusCode::OK)
                                         .header("Content-Type", content_type)
-                                        .header("Content-Length", pkg.content.data.len().to_string())
+                                        .header("Content-Length", res.data_len.to_string())
                                         .header("ETag", format!("\"{}\"", Uuid::new_v4().simple()))
-                                        .body(Full::new(Bytes::from(pkg.content.data)))
+                                        .body(stream_body(res.data))
                                         .unwrap()
                                 }
                                 Err(Status::FileNotFound) => {
                                     build_response(StatusCode::NOT_FOUND, s3_error_xml("NoSuchKey", "The specified key does not exist.", key), "application/xml")
+                                }
+                                Err(Status::Overloaded) => {
+                                    build_response(StatusCode::SERVICE_UNAVAILABLE, s3_error_xml("SlowDown", "Please reduce your request rate.", key), "application/xml")
                                 }
                                 Err(_) => {
                                     build_response(StatusCode::INTERNAL_SERVER_ERROR, s3_error_xml("InternalError", "Internal server error", key), "application/xml")
@@ -225,14 +322,14 @@ async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<Full<
                     };
                     match internal_name {
                         Some(name) => {
-                            match process_through_queue(Behavior::GetFile, &name, Bytes::new()).await {
-                                Ok(pkg) => {
+                            match process_through_queue(Behavior::GetFile, &name).await {
+                                Ok(res) => {
                                     Response::builder()
                                         .status(StatusCode::OK)
                                         .header("Content-Type", get_mime_type(k))
-                                        .header("Content-Length", pkg.content.data.len().to_string())
+                                        .header("Content-Length", res.data_len.to_string())
                                         .header("ETag", format!("\"{}\"", Uuid::new_v4().simple()))
-                                        .body(Full::new(Bytes::new()))
+                                        .body(boxed_full(Bytes::new()))
                                         .unwrap()
                                 }
                                 Err(_) => build_empty_response(StatusCode::NOT_FOUND),
@@ -255,23 +352,43 @@ async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<Full<
                 Some(b) => b,
                 None => return Ok(build_response(StatusCode::BAD_REQUEST, s3_error_xml("BadRequest", "Bucket name required", ""), "application/xml")),
             };
-            let body_bytes = match req.into_body().collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => return Ok(build_response(StatusCode::BAD_REQUEST, s3_error_xml("BadRequest", "Failed to read request body", key), "application/xml")),
+            let content_length: Option<u64> = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+
+            let internal_name = match &some_mapper {
+                Some(m) => {
+                    let suggested = Uuid::new_v4().to_string();
+                    m.register(bucket, key, &suggested).await.unwrap_or(suggested)
+                }
+                None => Uuid::new_v4().to_string(),
             };
 
-            let internal_name = Uuid::new_v4().to_string();
-            if let Some(m) = &some_mapper {
-                let _ = m.register(bucket, key, &internal_name).await;
-            }
-
-            match process_through_queue(Behavior::PutFile, &internal_name, body_bytes).await {
+            match put_through_queue(
+                &internal_name,
+                content_length.unwrap_or(PAYLOAD_UNKNOWN_LEN),
+                req.into_body(),
+            )
+            .await
+            {
                 Ok(_) => {
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("ETag", format!("\"{}\"", Uuid::new_v4().simple()))
-                        .body(Full::new(Bytes::new()))
+                        .body(boxed_full(Bytes::new()))
                         .unwrap()
+                }
+                Err(Status::BadRequest) => {
+                    build_response(
+                        StatusCode::BAD_REQUEST,
+                        s3_error_xml("IncompleteBody", "The request body was aborted before completion.", key),
+                        "application/xml",
+                    )
+                }
+                Err(Status::Overloaded) => {
+                    build_response(StatusCode::SERVICE_UNAVAILABLE, s3_error_xml("SlowDown", "Please reduce your request rate.", key), "application/xml")
                 }
                 Err(_) => {
                     build_response(StatusCode::INTERNAL_SERVER_ERROR, s3_error_xml("InternalError", "Failed to store object", key), "application/xml")
@@ -286,7 +403,7 @@ async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<Full<
                         let internal_name = m.resolve(b, k).await.unwrap_or(None);
                         if let Some(name) = internal_name {
                             let _ = m.delete(b, k).await;
-                            let _ = process_through_queue(Behavior::DeleteFile, &name, Bytes::new()).await;
+                            let _ = process_through_queue(Behavior::DeleteFile, &name).await;
                         }
                     }
                     build_empty_response(StatusCode::NO_CONTENT)

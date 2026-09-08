@@ -1,18 +1,30 @@
-use std::{path::Path, time::Duration};
+use std::{io, path::Path, time::Duration};
 
 use crate::{
-    conveyer::ConveyQueue,
-    dtos::{Behavior, Package},
+    conveyer::{AdmissionError, ConveyQueue},
+    dtos::{Behavior, OrderRequest},
     mapper,
     shutdown::Shutdown,
 };
-use http_body_util::Full;
-use hyper::{Method, Request, Response, body::Bytes as HyperBytes, server::conn::http1, service::service_fn};
 use bytes::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use hyper::{Method, Request, Response, body::Frame, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{Level, event, instrument};
 use uuid::Uuid;
+
+type HttpBody = BoxBody<Bytes, io::Error>;
+
+fn boxed_full(body: Bytes) -> HttpBody {
+    Full::new(body).map_err(|never| match never {}).boxed()
+}
+
+fn stream_body(rx: tokio::sync::mpsc::Receiver<Bytes>) -> HttpBody {
+    let stream = ReceiverStream::new(rx).map(|chunk| Ok::<_, io::Error>(Frame::data(chunk)));
+    StreamBody::new(stream).boxed()
+}
 
 fn get_mime_type(filename: &str) -> &'static str {
     match Path::new(filename).extension().and_then(|e| e.to_str()) {
@@ -34,18 +46,18 @@ fn get_mime_type(filename: &str) -> &'static str {
     }
 }
 
-async fn resolve_with_mapper(bucket: &str, key: &str) -> Result<String, Response<Full<Bytes>>> {
+async fn resolve_with_mapper(bucket: &str, key: &str) -> Result<String, Response<HttpBody>> {
     match mapper::get_mapper() {
         Some(m) => match m.resolve(bucket, key).await {
             Ok(Some(internal)) => Ok(internal),
             _ => Err(Response::builder()
                 .status(hyper::StatusCode::NOT_FOUND)
-                .body(Full::new(HyperBytes::from("Not Found")))
+                .body(boxed_full(Bytes::from("Not Found")))
                 .unwrap()),
         },
         None => Err(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(HyperBytes::from("Mapper unavailable")))
+            .body(boxed_full(Bytes::from("Mapper unavailable")))
             .unwrap()),
     }
 }
@@ -53,11 +65,11 @@ async fn resolve_with_mapper(bucket: &str, key: &str) -> Result<String, Response
 #[instrument(skip_all)]
 async fn handle_http(
     req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::http::Error> {
+) -> Result<Response<HttpBody>, hyper::http::Error> {
     if req.method() != &Method::GET {
         return Ok(Response::builder()
             .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
-            .body(Full::new(HyperBytes::from("Method Not Allowed")))?);
+            .body(boxed_full(Bytes::from("Method Not Allowed")))?);
     }
 
     let uri = req.uri().to_string();
@@ -65,7 +77,7 @@ async fn handle_http(
     if path.is_empty() {
         return Ok(Response::builder()
             .status(hyper::StatusCode::OK)
-            .body(Full::new(HyperBytes::from("LiNastore is running")))?);
+            .body(boxed_full(Bytes::from("LiNastore is running")))?);
     }
 
     let path_vec: Vec<&str> = path.split('/').collect();
@@ -85,56 +97,57 @@ async fn handle_http(
     } else {
         return Ok(Response::builder()
             .status(hyper::StatusCode::BAD_REQUEST)
-            .body(Full::new(HyperBytes::from("Invalid URL")))?);
+            .body(boxed_full(Bytes::from("Invalid URL")))?);
     };
 
     let log_id = Uuid::new_v4().to_string();
 
-    let uuid = Uuid::new_v4();
-    let uni_id = uuid.into_bytes();
-    let mut package = Package::new_with_id(&uuid);
-    package.behavior = Behavior::GetFile;
-    package.content.identifier = Bytes::copy_from_slice(file_identifier.as_bytes());
+    // GET has no body: close the payload channel, only meta enters the queue.
+    let (data_tx, order) = OrderRequest::create(
+        Behavior::GetFile,
+        0,
+        Bytes::copy_from_slice(file_identifier.as_bytes()),
+        0,
+        false,
+    );
+    drop(data_tx);
+    let uni_id = order.uni_id;
 
     let con_queue = ConveyQueue::get_instance();
-    let receiver = match con_queue.register_waiter(uni_id) {
-        Some(rx) => rx,
-        None => {
-            event!(Level::ERROR, "Failed to register waiter for request");
+    let receiver = match con_queue.register_waiter(uni_id).await {
+        Ok(rx) => rx,
+        Err(AdmissionError::TimedOut) => {
+            event!(Level::WARN, "Admission wait timed out");
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
+                .body(boxed_full(Bytes::from("Server busy, retry later")))?);
+        }
+        Err(_) => {
             return Ok(Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(HyperBytes::from("Failed to process request")))?);
+                .body(boxed_full(Bytes::from("Failed to register request")))?);
         }
     };
 
-    if let Err(e) = con_queue.produce_order(package) {
+    if let Err(e) = con_queue.produce_order(order) {
         event!(Level::ERROR, "Failed to produce order: {}", e);
         con_queue.unregister_waiter(uni_id);
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(HyperBytes::from("Failed to process request")))?);
+            .body(boxed_full(Bytes::from("Failed to process request")))?);
     }
 
     let timeout = Duration::from_secs(10);
     match tokio::time::timeout(timeout, receiver).await {
-        Ok(Ok(pkg)) => {
-            let valid_data_end = pkg
-                .content
-                .identifier
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(pkg.content.identifier.len());
-
-            let content_type = get_mime_type(
-                &String::from_utf8_lossy(&pkg.content.identifier[..valid_data_end]).to_string(),
-            );
+        Ok(Ok(res)) => {
+            let content_type = get_mime_type(&String::from_utf8_lossy(&res.identifier).to_string());
             Ok(Response::builder()
                 .status(hyper::StatusCode::OK)
                 .header("X-Content-Type-Options", "nosniff")
                 .header("X-Frame-Options", "DENY")
                 .header("Content-Type", content_type)
-                .header("Content-Length", pkg.content.data.len().to_string())
-                .body(Full::new(Bytes::from(pkg.content.data)))?)
+                .header("Content-Length", res.data_len.to_string())
+                .body(stream_body(res.data))?)
         }
         Ok(Err(_)) => {
             event!(
@@ -146,7 +159,7 @@ async fn handle_http(
             con_queue.remove_order(uni_id);
             Ok(Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("Channel closed unexpectedly")))?)
+                .body(boxed_full(Bytes::from("Channel closed unexpectedly")))?)
         }
         Err(_) => {
             event!(Level::ERROR, "[waitress {}] Timeout exceeded", &log_id);
@@ -154,7 +167,7 @@ async fn handle_http(
             con_queue.remove_order(uni_id);
             Ok(Response::builder()
                 .status(hyper::StatusCode::REQUEST_TIMEOUT)
-                .body(Full::new(Bytes::from("Request timeout")))?)
+                .body(boxed_full(Bytes::from("Request timeout")))?)
         }
     }
 }

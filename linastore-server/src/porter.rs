@@ -1,13 +1,19 @@
 use bytes::Bytes;
 use std::{sync::Arc, time::Duration};
 
-use linabase::service::StoreManager;
-use tokio::{sync::Semaphore, task::JoinSet};
+use linabase::service::{ObjectReader, StoreManager};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 use tracing::{Level, event, instrument};
 
 use crate::{
     conveyer::ConveyQueue,
-    dtos::{Behavior, FlagType, Package, Status},
+    dtos::{
+        Behavior, FlagType, OrderRequest, ResponseStream, PAYLOAD_UNKNOWN_LEN, Status,
+        active_limit, channel_depth, in_flight_limit,
+    },
     shutdown::Shutdown,
 };
 
@@ -18,20 +24,16 @@ fn flag_set(flags: u8, bit: FlagType) -> bool {
 
 // Error logging interval to avoid log flooding
 const ERROR_LOG_INTERVAL: u32 = 100;
-const MAX_PORTER_CONCURRENCY: usize = 8;
-
-fn porter_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(2, MAX_PORTER_CONCURRENCY)
-}
+// Give up on a payload stream whose frontend stalls between chunks.
+const PAYLOAD_RECV_TIMEOUT: Duration = Duration::from_secs(30);
+// Response streaming chunk size.
+const RESPONSE_CHUNK_SIZE: usize = 64 * 1024;
 
 #[instrument(skip_all)]
 pub async fn porter(root: &str) {
     event!(
         tracing::Level::INFO,
-        "Porter started with transaction-based order processing"
+        "Porter started: meta-only order queue with streamed payloads"
     );
 
     let store_manager = match StoreManager::new(root).await {
@@ -40,9 +42,20 @@ pub async fn porter(root: &str) {
     };
 
     let mut error_count = 0u32;
-    let concurrency_limit = porter_concurrency();
-    let in_flight_limit = Arc::new(Semaphore::new(concurrency_limit));
-    let mut workers = JoinSet::new();
+    // Active slot count = floor(CPUs / 2); in-flight = 2x active.
+    let active_count = active_limit();
+    event!(
+        Level::INFO,
+        "[porter] active slots={} in-flight={}",
+        active_count,
+        in_flight_limit(),
+    );
+    // The active-worker pool: only real processing (hash/compress, file IO,
+    // DB) holds one of these, 1:1 per request. Waiting on network/streaming
+    // or on the SQL queue does NOT occupy a slot. In-flight is bounded by the
+    // conveyer's waiter permits, so no separate semaphore here.
+    let active = Arc::new(Semaphore::new(active_count));
+    let mut tasks = JoinSet::new();
     let mut shutting_down = false;
 
     let shutdown_status = Shutdown::get_instance();
@@ -50,18 +63,16 @@ pub async fn porter(root: &str) {
     let mut order_notifier = conveyers.subscribe_orders();
 
     loop {
-        while !shutting_down && workers.len() < concurrency_limit {
+        while !shutting_down {
             match conveyers.consume_order() {
-                Ok(Some(pkg)) => {
-                    let Ok(permit) = in_flight_limit.clone().acquire_owned().await else {
-                        shutting_down = true;
-                        break;
-                    };
+                Ok(Some(req)) => {
+                    // Each queued order already holds an in-flight permit (taken
+                    // at waiter registration), so spawned tasks are bounded by it.
                     let store_manager = Arc::clone(&store_manager);
                     let conveyers = Arc::clone(&conveyers);
-                    workers.spawn(async move {
-                        let _permit = permit;
-                        process_package(&pkg, store_manager.as_ref(), &conveyers).await
+                    let active = Arc::clone(&active);
+                    tasks.spawn(async move {
+                        process_order(req, store_manager.as_ref(), &conveyers, &active).await
                     });
                 }
                 Ok(None) => break,
@@ -81,7 +92,7 @@ pub async fn porter(root: &str) {
             }
         }
 
-        if shutting_down && workers.is_empty() {
+        if shutting_down && tasks.is_empty() {
             break;
         }
 
@@ -89,12 +100,12 @@ pub async fn porter(root: &str) {
             _ = shutdown_status.wait(), if !shutting_down => {
                 shutting_down = true;
             }
-            changed = order_notifier.changed(), if !shutting_down && workers.len() < concurrency_limit => {
+            changed = order_notifier.changed(), if !shutting_down => {
                 if changed.is_err() {
                     shutting_down = true;
                 }
             }
-            Some(result) = workers.join_next(), if !workers.is_empty() => {
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -102,7 +113,7 @@ pub async fn porter(root: &str) {
                         if error_count % ERROR_LOG_INTERVAL == 0 {
                             event!(
                                 Level::ERROR,
-                                "[porter] Failed to process package ({} errors): {}",
+                                "[porter] Failed to process order ({} errors): {}",
                                 error_count,
                                 e
                             );
@@ -129,93 +140,232 @@ pub async fn porter(root: &str) {
     }
 }
 
-/// Process single package logic, optimized for SQLite serial processing
-async fn process_package(
-    pkg: &Package,
+/// Process a meta-only order. Network/streaming waits and the SQL queue reply
+/// don't hold an active-worker slot; only hash/compress, file IO and DB calls
+/// acquire it, so slow transfers never starve the processing pool.
+async fn process_order(
+    req: OrderRequest,
     store_manager: &StoreManager,
     conveyers: &ConveyQueue,
+    active: &Arc<Semaphore>,
 ) -> Result<(), String> {
-    let mut res_pkg = Package::new();
-    res_pkg.uni_id = pkg.uni_id;
-    res_pkg.content.identifier = pkg.content.identifier.clone();
-    res_pkg.content.flags = pkg.content.flags;
-
-    // Optimize filename validation: use iterator to avoid repeated computation
-    let valid_data_end = pkg
-        .content
+    let valid_data_end = req
         .identifier
         .iter()
         .position(|&b| b == 0)
-        .unwrap_or(pkg.content.identifier.len());
+        .unwrap_or(req.identifier.len());
 
     if valid_data_end == 0 {
-        res_pkg.status = Status::FileNameInvalid;
-        return send_response(&res_pkg, conveyers);
+        return send_response(
+            response_no_data(req.uni_id, Status::FileNameInvalid, req.identifier),
+            conveyers,
+        );
     }
 
-    let identifier_bytes = &pkg.content.identifier[..valid_data_end];
+    let identifier_bytes = &req.identifier[..valid_data_end];
     let identifier = match std::str::from_utf8(identifier_bytes) {
         Ok(s) => s.to_string(),
         Err(_) => {
-            res_pkg.status = Status::FileNameInvalid;
-            return send_response(&res_pkg, conveyers);
+            return send_response(
+                response_no_data(req.uni_id, Status::FileNameInvalid, req.identifier),
+                conveyers,
+            );
         }
     };
 
-    // SQLite serial processing: each operation is independent to avoid transaction conflicts
-    match pkg.behavior {
+    let behavior = req.behavior.clone();
+    match behavior {
         Behavior::PutFile => {
-            let flags = pkg.content.flags;
-            let should_cover = flag_set(flags, FlagType::Cover);
+            let flags = req.flags;
             let should_compress = flag_set(flags, FlagType::Compress);
 
-            match store_manager.put_binary_data(
-                &identifier,
-                &pkg.content.data,
-                should_cover,
-                should_compress,
-            ).await {
-                Ok(_) => {
-                    res_pkg.status = Status::Success;
-                    send_response(&res_pkg, conveyers)
+            // Stream the payload straight into the object file (bounded
+            // memory, incremental hash) — network-paced, no active slot held.
+            let expected = if req.data_len == PAYLOAD_UNKNOWN_LEN {
+                None
+            } else {
+                Some(req.data_len)
+            };
+            let status = match store_manager
+                .put_stream(&identifier, req.payload, PAYLOAD_RECV_TIMEOUT, should_compress, expected)
+                .await
+            {
+                Ok(_) => Status::Success,
+                Err(e) => {
+                    event!(Level::WARN, "[porter] Payload stream failed: {}", e);
+                    Status::StoreFailed
                 }
-                Err(_) => {
-                    res_pkg.status = Status::StoreFailed;
-                    send_response(&res_pkg, conveyers)
-                }
-            }
+            };
+            send_response(
+                response_no_data(req.uni_id, status, req.identifier),
+                conveyers,
+            )
         }
-        Behavior::GetFile => match store_manager.get_binary_data(&identifier).await {
-            Ok(data) => {
-                res_pkg.status = Status::Success;
-                res_pkg.content.data = Bytes::from(data);
-                send_response(&res_pkg, conveyers)
-            }
-            Err(_) => {
-                res_pkg.status = Status::FileNotFound;
-                send_response(&res_pkg, conveyers)
-            }
-        },
-        Behavior::DeleteFile => match store_manager.delete(&identifier, false).await {
-            Ok(_) => {
-                res_pkg.status = Status::Success;
-                send_response(&res_pkg, conveyers)
-            }
-            Err(_) => {
-                res_pkg.status = Status::FileNotFound;
-                send_response(&res_pkg, conveyers)
-            }
-        },
-        _ => {
-            res_pkg.status = Status::InternalError;
-            send_response(&res_pkg, conveyers)
+        Behavior::GetFile => stream_get_response(store_manager, req, &identifier, conveyers, active).await,
+        Behavior::DeleteFile => {
+            drop(req.payload);
+            let _slot = active.clone().acquire_owned().await;
+            let status = match store_manager.delete(&identifier, false).await {
+                Ok(_) => Status::Success,
+                Err(_) => Status::FileNotFound,
+            };
+            send_response(
+                response_no_data(req.uni_id, status, req.identifier),
+                conveyers,
+            )
         }
+        _ => send_response(
+            response_no_data(req.uni_id, Status::InternalError, req.identifier),
+            conveyers,
+        ),
     }
 }
 
-/// Unified response sending function to reduce code duplication
-fn send_response(res_pkg: &Package, conveyers: &ConveyQueue) -> Result<(), String> {
+/// Build a response with no body (channel closed immediately). The checksum
+/// is always valid so LiNa clients can verify even empty responses.
+fn response_no_data(uni_id: [u8; 16], status: Status, identifier: Bytes) -> ResponseStream {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&[identifier.len() as u8]);
+    hasher.update(&identifier);
+    hasher.update(&0u32.to_le_bytes());
+    let checksum = hasher.finalize();
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    ResponseStream {
+        uni_id,
+        status,
+        identifier,
+        data_len: 0,
+        checksum,
+        data: rx,
+    }
+}
+
+/// Stream a read. The response (with the data receiver) is sent first, then
+/// the object is read chunk-by-chunk and pushed into the bounded channel, so
+/// neither the porter nor the queue ever buffers the whole file.
+async fn stream_get_response(
+    store_manager: &StoreManager,
+    req: OrderRequest,
+    identifier: &str,
+    conveyers: &ConveyQueue,
+    active: &Arc<Semaphore>,
+) -> Result<(), String> {
+    let identifier_bytes = Bytes::copy_from_slice(identifier.as_bytes());
+
+    let need_crc = req.need_response_checksum;
+    // Opening + (for LiNa) the CRC/integrity pre-pass hold an active slot;
+    // the actual streaming below does not.
+    let (mut reader, checksum) = {
+        let _slot = active.clone().acquire_owned().await;
+        if need_crc {
+            // LiNa protocol needs the CRC before the header, so compute it in a
+            // first streaming pass (also verifies integrity) before streaming data.
+            match open_verified_reader(store_manager, &identifier).await {
+                Ok(mut reader) => {
+                    let data_len = reader.data_len();
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&[identifier_bytes.len() as u8]);
+                    hasher.update(&identifier_bytes);
+                    hasher.update(&(data_len as u32).to_le_bytes());
+                    let mut buf = vec![0u8; RESPONSE_CHUNK_SIZE];
+                    loop {
+                        let n = match reader.read_chunk(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return send_response(
+                                    response_no_data(req.uni_id, Status::InternalError, req.identifier),
+                                    conveyers,
+                                );
+                            }
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    let checksum = hasher.finalize();
+                    match store_manager.open_read(&identifier).await {
+                        Ok(Some(reader)) => (reader, checksum),
+                        _ => {
+                            return send_response(
+                                response_no_data(req.uni_id, Status::InternalError, req.identifier),
+                                conveyers,
+                            );
+                        }
+                    }
+                }
+                Err(status) => {
+                    return send_response(response_no_data(req.uni_id, status, req.identifier), conveyers);
+                }
+            }
+        } else {
+            match store_manager.open_read(&identifier).await {
+                Ok(Some(reader)) => (reader, 0),
+                Ok(None) => {
+                    return send_response(
+                        response_no_data(req.uni_id, Status::FileNotFound, req.identifier),
+                        conveyers,
+                    );
+                }
+                Err(_) => {
+                    return send_response(
+                        response_no_data(req.uni_id, Status::InternalError, req.identifier),
+                        conveyers,
+                    );
+                }
+            }
+        }
+    };
+
+    let (tx, rx) = mpsc::channel(channel_depth());
+    let res = ResponseStream {
+        uni_id: req.uni_id,
+        status: Status::Success,
+        identifier: identifier_bytes,
+        data_len: reader.data_len(),
+        checksum,
+        data: rx,
+    };
+    send_response(res, conveyers)?;
+
+    // Stream the object into the channel. A client that drains slowly applies
+    // backpressure here (no active slot held); on read error (incl. integrity
+    // failure) we drop the sender so the frontend sees an aborted stream.
+    let mut buf = vec![0u8; RESPONSE_CHUNK_SIZE];
+    loop {
+        let n = match reader.read_chunk(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                event!(Level::ERROR, "[porter] Read stream failed: {}", e);
+                break;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+            break;
+        }
+    }
+    drop(tx);
+    Ok(())
+}
+
+/// Open a reader that is guaranteed to exist, mapping errors to a Status.
+async fn open_verified_reader(
+    store_manager: &StoreManager,
+    identifier: &str,
+) -> Result<ObjectReader, Status> {
+    match store_manager.open_read(identifier).await {
+        Ok(Some(reader)) => Ok(reader),
+        Ok(None) => Err(Status::FileNotFound),
+        Err(_) => Err(Status::InternalError),
+    }
+}
+
+fn send_response(res: ResponseStream, conveyers: &ConveyQueue) -> Result<(), String> {
     conveyers
-        .produce_service(res_pkg.clone())
+        .produce_service(res)
         .map_err(|e| format!("Failed to send response: {}", e))
 }

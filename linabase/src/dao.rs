@@ -95,7 +95,11 @@ impl Dao {
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
 
-        let pool = sqlx::SqlitePool::connect_with(options)
+        // Single-connection pool: all access serializes on one connection.
+        let pool = sqlx::pool::PoolOptions::<Sqlite>::new()
+            .max_connections(1)
+            .min_connections(1)
+            .connect_with(options)
             .await
             .context("Failed to connect to database")?;
 

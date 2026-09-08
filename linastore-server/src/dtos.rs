@@ -1,6 +1,48 @@
 use bytes::{Bytes, BytesMut};
-use chrono::Utc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// Sentinel for unknown payload length (e.g. no Content-Length header).
+pub const PAYLOAD_UNKNOWN_LEN: u64 = u64::MAX;
+
+/// Bounded streaming-channel depth (slots), shared by the request payload and
+/// the response channels. Larger depth = more chunks buffered in flight (higher
+/// throughput, weaker backpressure); smaller = tighter backpressure. Tune via
+/// `LINASTORE_CHANNEL_DEPTH` (default 64). Memory per channel ~= depth * chunk
+/// size, so keep an eye on it when raising the depth.
+pub fn channel_depth() -> usize {
+    std::env::var("LINASTORE_CHANNEL_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+        .max(1)
+}
+
+/// Active worker slots = floor(logical CPUs / 2), at least 1. Override via
+/// `LINASTORE_PORTER_CONCURRENCY`.
+pub fn active_limit() -> usize {
+    std::env::var("LINASTORE_PORTER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get() / 2)
+                .unwrap_or(1)
+                .max(1)
+        })
+        .max(1)
+}
+
+/// In-flight request cap: 2x the active slot count. Override via
+/// `LINASTORE_IN_FLIGHT`. This bounds how many requests may be open at once
+/// (including ones parked on IO); when full, new requests wait at admission.
+pub fn in_flight_limit() -> usize {
+    std::env::var("LINASTORE_IN_FLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| 2 * active_limit())
+        .max(1)
+}
 
 #[derive(Clone, PartialEq)]
 pub struct PayLoad {
@@ -118,50 +160,64 @@ impl Op {
     }
 }
 
-#[derive(Clone, PartialEq)]
-pub struct Package {
+/// Streamed response delivered to the frontend waiter. The entity body is NOT
+/// carried inline: a porter worker pushes chunks through the bounded `data`
+/// channel only while it is actually reading, so reads never buffer a whole
+/// file in memory.
+pub struct ResponseStream {
+    pub uni_id: [u8; 16],
     pub status: Status,
+    pub identifier: Bytes,
+    /// Uncompressed data length, in bytes.
+    pub data_len: u64,
+    /// CRC32 over `[ilen][identifier][dlen_le][data]` for the LiNa protocol.
+    /// Zero when the frontend does not require a checksum.
+    pub checksum: u32,
+    /// Data chunks; the channel closes at EOF.
+    pub data: mpsc::Receiver<Bytes>,
+}
+
+/// Meta-only order enqueued in the conveyer queue. The entity body never goes
+/// in the queue: the frontend keeps the `mpsc::Sender` and streams the payload
+/// only after a worker dequeues the meta, so memory scales with worker
+/// concurrency rather than queue depth.
+#[derive(Debug)]
+pub struct OrderRequest {
     pub uni_id: [u8; 16],
     pub behavior: Behavior,
-    pub content: Content,
-    pub created_at: i64,
-}
-
-impl Package {
-    pub fn new() -> Self {
-        Package {
-            status: Status::None,
-            uni_id: Uuid::new_v4().into_bytes(),
-            behavior: Behavior::None,
-            content: Content {
-                flags: 0x40,
-                identifier: Bytes::new(),
-                data: Bytes::new(),
-            },
-            created_at: Utc::now().timestamp(),
-        }
-    }
-
-    pub fn new_with_id(uni_id: &Uuid) -> Self {
-        Package {
-            status: Status::None,
-            uni_id: uni_id.into_bytes(),
-            behavior: Behavior::None,
-            content: Content {
-                flags: 0,
-                identifier: Bytes::new(),
-                data: Bytes::new(),
-            },
-            created_at: Utc::now().timestamp(),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq)]
-pub struct Content {
     pub flags: u8,
-    pub identifier: Bytes, // Variable length identifier
-    pub data: Bytes,
+    pub identifier: Bytes,
+    /// Expected payload size; the worker rejects truncated streams. Use
+    /// `PAYLOAD_UNKNOWN_LEN` when unknown.
+    pub data_len: u64,
+    /// Whether the response must carry a CRC32 checksum (LiNa protocol).
+    pub need_response_checksum: bool,
+    /// Receiver half for the streamed payload. Dropping it signals the frontend
+    /// to abort streaming; normal admission never evicts an accepted order.
+    pub payload: mpsc::Receiver<Bytes>,
+}
+
+impl OrderRequest {
+    /// Create a meta order plus the sender half of its payload channel.
+    pub fn create(
+        behavior: Behavior,
+        flags: u8,
+        identifier: Bytes,
+        data_len: u64,
+        need_response_checksum: bool,
+    ) -> (mpsc::Sender<Bytes>, Self) {
+        let (payload_tx, payload) = mpsc::channel(channel_depth());
+        let order = OrderRequest {
+            uni_id: Uuid::new_v4().into_bytes(),
+            behavior,
+            flags,
+            identifier,
+            data_len,
+            need_response_checksum,
+            payload,
+        };
+        (payload_tx, order)
+    }
 }
 
 // Should not excced u8::MAX
@@ -173,6 +229,7 @@ pub enum Status {
     FileNameInvalid = 3,
     Unauthorized = 4,
     BadRequest = 5,
+    Overloaded = 6,
     InternalError = 127,
     None = 255,
 }
@@ -286,40 +343,6 @@ mod tests {
         assert_eq!(Status::BadRequest as u8, 5);
         assert_eq!(Status::InternalError as u8, 127);
         assert_eq!(Status::None as u8, 255);
-    }
-
-    #[test]
-    fn test_package_new() {
-        let package = Package::new();
-
-        assert_eq!(package.status, Status::None);
-        assert_eq!(package.uni_id.len(), 16);
-        assert_eq!(package.behavior, Behavior::None);
-        assert_eq!(package.content.flags, 0x40);
-        assert!(package.content.data.is_empty());
-    }
-
-    #[test]
-    fn test_package_new_with_id() {
-        let uuid = uuid::Uuid::new_v4();
-        let package = Package::new_with_id(&uuid);
-
-        assert_eq!(package.uni_id, uuid.into_bytes());
-        assert_eq!(package.status, Status::None);
-        assert_eq!(package.behavior, Behavior::None);
-    }
-
-    #[test]
-    fn test_content_new() {
-        let content = Content {
-            flags: 0x01,
-            identifier: Bytes::from(vec![42u8]),
-            data: Bytes::from(vec![1, 2, 3]),
-        };
-
-        assert_eq!(content.flags, 0x01);
-        assert_eq!(content.identifier[0], 42);
-        assert_eq!(content.data.len(), 3);
     }
 
     #[test]

@@ -1,32 +1,50 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
-use crate::dtos::Package;
+use crate::dtos::{OrderRequest, ResponseStream, in_flight_limit};
 
-const ORDER_QUEUE_CAPACITY: usize = 32;
-const WAITERS_TTL: Duration = Duration::from_secs(20);
+// Orders are meta-only. The in-flight permit is acquired before an order is
+// enqueued, so the queue cannot grow independently of the admission limit.
+const ORDER_QUEUE_CAPACITY: usize = 128;
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const WAITERS_TTL: Duration = Duration::from_secs(120);
 const WAITERS_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    TimedOut,
+    Duplicate,
+    Closed,
+}
+
 struct WaiterEntry {
-    sender: oneshot::Sender<Package>,
+    sender: oneshot::Sender<ResponseStream>,
     created_at: Instant,
+    // In-flight permit; released when the entry is removed (response sent or waiter
+    // cleaned up). Bounds how many requests may be open at once.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Meta-only conveyer: the queue carries request metadata plus the receiver
+/// half of a bounded payload channel; bodies are streamed by workers only.
+/// Registers an in-flight permit per waiter. When the permit pool is exhausted,
+/// admission waits for an in-flight permit before the frontend starts reading
+/// a request body. This lets HTTP/TCP backpressure pause a client rather than
+/// rejecting a PUT after its body has started.
 pub struct ConveyQueue {
-    order_queue: Arc<Mutex<VecDeque<Package>>>,
-    // Maps uni_id to a channel sender for transaction-based responses
+    order_queue: Arc<Mutex<VecDeque<OrderRequest>>>,
+    // uni_id -> response channel sender
     waiters: Arc<Mutex<HashMap<[u8; 16], WaiterEntry>>>,
-    // Channel for notifying when new orders are available
+    // Notifies when new orders are available
     order_notifier: tokio::sync::watch::Sender<usize>,
+    in_flight: Arc<Semaphore>,
 }
 
-// Lazy singleton initialization
 static INSTANCE: OnceLock<Arc<ConveyQueue>> = OnceLock::new();
 
 impl ConveyQueue {
-    // Initialize singleton
     pub fn init() {
         let _ = Self::get_instance();
     }
@@ -39,6 +57,7 @@ impl ConveyQueue {
                     order_queue: Arc::new(Mutex::new(VecDeque::new())),
                     waiters: Arc::new(Mutex::new(HashMap::new())),
                     order_notifier,
+                    in_flight: Arc::new(Semaphore::new(in_flight_limit())),
                 });
                 Self::start_waiter_cleanup_task(&instance);
                 instance
@@ -46,7 +65,7 @@ impl ConveyQueue {
             .clone()
     }
 
-    pub fn produce_order(&self, order: Package) -> Result<(), String> {
+    pub fn produce_order(&self, order: OrderRequest) -> Result<(), String> {
         let queue_len = {
             let mut queue = self
                 .order_queue
@@ -54,17 +73,16 @@ impl ConveyQueue {
                 .map_err(|_| "Failed to lock order queue".to_string())?;
 
             if queue.len() >= ORDER_QUEUE_CAPACITY {
-                // DropOldest policy: remove the oldest order when queue is full.
-                if let Some(dropped) = queue.pop_front() {
-                    self.unregister_waiter(dropped.uni_id);
-                }
+                // Never evict an order: its frontend may already be streaming
+                // the body and eviction would turn load shedding into a
+                // mid-upload failure. Admission normally makes this unreachable.
+                return Err("Order queue is full".to_string());
             }
 
             queue.push_back(order);
             queue.len()
         };
 
-        // Notify that a new order is available
         let _ = self.order_notifier.send(queue_len);
 
         Ok(())
@@ -75,7 +93,7 @@ impl ConveyQueue {
         self.order_notifier.subscribe()
     }
 
-    pub fn consume_order(&self) -> Result<Option<Package>, String> {
+    pub fn consume_order(&self) -> Result<Option<OrderRequest>, String> {
         let mut guard = self
             .order_queue
             .lock()
@@ -88,32 +106,57 @@ impl ConveyQueue {
         Ok(guard.pop_front())
     }
 
-    pub fn produce_service(&self, order: Package) -> Result<(), String> {
-        let uni_id = order.uni_id;
+    pub fn produce_service(&self, res: ResponseStream) -> Result<(), String> {
+        let uni_id = res.uni_id;
 
-        // Send through registered channel if exists
         let mut waiters = self
             .waiters
             .lock()
             .map_err(|_| "Failed to lock waiter registry".to_string())?;
         if let Some(entry) = waiters.remove(&uni_id) {
-            // Send through channel, ignore error if receiver is dropped
-            let _ = entry.sender.send(order);
+            let _ = entry.sender.send(res);
             return Ok(());
         }
 
         Err("No waiter registered for this response".to_string())
     }
 
-    /// Register a waiter for a response with given uni_id.
-    /// Returns oneshot receiver that will receive the response package.
-    /// If a waiter already exists for this uni_id, returns None.
-    pub fn register_waiter(&self, uni_id: [u8; 16]) -> Option<oneshot::Receiver<Package>> {
+    /// Register a response channel for `uni_id`, waiting for admission when
+    /// all in-flight permits are occupied. The caller should not consume a
+    /// request body until this future resolves successfully.
+    pub async fn register_waiter(
+        &self,
+        uni_id: [u8; 16],
+    ) -> Result<oneshot::Receiver<ResponseStream>, AdmissionError> {
+        if self
+            .waiters
+            .lock()
+            .map_err(|_| AdmissionError::Closed)?
+            .contains_key(&uni_id)
+        {
+            return Err(AdmissionError::Duplicate);
+        }
+
+        let permit = match tokio::time::timeout(
+            ADMISSION_TIMEOUT,
+            self.in_flight.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(AdmissionError::Closed),
+            Err(_) => return Err(AdmissionError::TimedOut),
+        };
+
         let (sender, receiver) = oneshot::channel();
-        let mut waiters = self.waiters.lock().ok()?;
+        let mut waiters = self
+            .waiters
+            .lock()
+            .map_err(|_| AdmissionError::Closed)?;
 
         if waiters.contains_key(&uni_id) {
-            return None;
+            drop(permit);
+            return Err(AdmissionError::Duplicate);
         }
 
         waiters.insert(
@@ -121,9 +164,19 @@ impl ConveyQueue {
             WaiterEntry {
                 sender,
                 created_at: Instant::now(),
+                _permit: permit,
             },
         );
-        Some(receiver)
+        Ok(receiver)
+    }
+
+    /// Refresh an active request's cleanup deadline while its body is flowing.
+    pub fn touch_waiter(&self, uni_id: [u8; 16]) {
+        if let Ok(mut waiters) = self.waiters.lock() {
+            if let Some(entry) = waiters.get_mut(&uni_id) {
+                entry.created_at = Instant::now();
+            }
+        }
     }
 
     pub fn unregister_waiter(&self, uni_id: [u8; 16]) {
@@ -135,7 +188,7 @@ impl ConveyQueue {
     pub fn remove_order(&self, uni_id: [u8; 16]) -> bool {
         if let Ok(mut guard) = self.order_queue.lock() {
             let before = guard.len();
-            guard.retain(|pkg| pkg.uni_id != uni_id);
+            guard.retain(|order| order.uni_id != uni_id);
             return guard.len() != before;
         }
         false

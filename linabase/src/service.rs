@@ -8,16 +8,21 @@ use std::{
     path::{Path, PathBuf},
     result::Result,
     sync::Arc,
+    time::Duration,
 };
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 use uuid::Uuid;
 
+use crate::dbexec::{DbClient, DbExecutor, reconcile_orphans_files};
 use crate::utils::BlockManager;
 
-use super::dao::{Dao, DirEntry, Link, Source};
+use super::dao::DirEntry;
+use super::dao::Link;
+#[cfg(test)]
+use super::dao::Dao;
 use super::utils;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -33,16 +38,93 @@ fn boxed_io_error(kind: io::ErrorKind, message: impl Into<String>) -> BoxError {
     Box::new(io::Error::new(kind, message.into()))
 }
 
-fn dao_to_io_error(err: anyhow::Error) -> io::Error {
-    io::Error::other(err.to_string())
-}
+/// Uploads at or below this size are buffered in memory (avoids temp-file IO
+/// and lets dedup skip the disk write entirely); larger ones spool to disk.
+const INLINE_MEMORY_THRESHOLD: usize = 4 * 1024 * 1024;
 
+/// Concurrent object store. Metadata lives behind the single-threaded
+/// `DbExecutor`; object file IO here is lock-free and runs in parallel.
 #[derive(Debug)]
 pub struct StoreManager {
     root: PathBuf,
-    dao: Dao,
+    db: DbClient,
     bm: Arc<BlockManager>,
-    operation_lock: Arc<RwLock<()>>,
+    #[cfg(test)]
+    dao: Dao,
+}
+
+/// Streaming reader for a stored object. Yields decompressed data in bounded
+/// chunks and verifies the BLAKE3 hash at EOF, so reads never buffer a whole
+/// file in memory.
+pub struct ObjectReader {
+    data_len: u64,
+    expected_hash: String,
+    hasher: blake3::Hasher,
+    inner: ObjectReaderInner,
+    eof: bool,
+}
+
+enum ObjectReaderInner {
+    Plain(tokio::fs::File),
+    Blocks {
+        file: tokio::fs::File,
+        bm: Arc<BlockManager>,
+        pending: Vec<u8>,
+        pos: usize,
+    },
+}
+
+impl ObjectReader {
+    pub fn data_len(&self) -> u64 {
+        self.data_len
+    }
+
+    pub async fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, BoxError> {
+        let n = match &mut self.inner {
+            ObjectReaderInner::Plain(file) => file.read(buf).await?,
+            ObjectReaderInner::Blocks { .. } => self.read_block_chunk(buf).await?,
+        };
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        }
+        if n == 0 && !self.eof {
+            self.eof = true;
+            let actual = self.hasher.finalize().to_hex().to_string();
+            if actual != self.expected_hash {
+                return Err(boxed_io_error(io::ErrorKind::InvalidData, "data integrity check failed"));
+            }
+        }
+        Ok(n)
+    }
+
+    async fn read_block_chunk(&mut self, buf: &mut [u8]) -> Result<usize, BoxError> {
+        let ObjectReaderInner::Blocks { file, bm, pending, pos } = &mut self.inner else {
+            unreachable!();
+        };
+        if *pos >= pending.len() {
+            pending.clear();
+            *pos = 0;
+            let mut header = [0u8; 3];
+            let read = file.read(&mut header).await?;
+            if read == 0 {
+                return Ok(0);
+            }
+            if read < 3 {
+                file.read_exact(&mut header[read..]).await?;
+            }
+            let flag = header[0];
+            let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+            let mut block = vec![0u8; len];
+            file.read_exact(&mut block).await?;
+            let bm = Arc::clone(bm);
+            let decoded = task::spawn_blocking(move || bm.decompress_block(flag, &block)).await??;
+            *pending = decoded;
+        }
+        let take = (pending.len() - *pos).min(buf.len());
+        buf[..take].copy_from_slice(&pending[*pos..*pos + take]);
+        *pos += take;
+        Ok(take)
+    }
 }
 
 pub struct TidyManager {
@@ -52,36 +134,32 @@ pub struct TidyManager {
 // Constructor and query-oriented APIs.
 impl StoreManager {
     pub async fn new<P: AsRef<Path>>(root: P) -> Result<Self, BoxError> {
-        let root_path = root.as_ref().to_path_buf(); // Convert to owning type
+        let root_path = root.as_ref().to_path_buf();
         fs::create_dir_all(root_path.join("linadata")).await?;
 
-        let manager = StoreManager {
-            root: root_path.clone(), // Store owned path
-            dao: Dao::new(root_path.join("linadata").join("meta.db"))
-                .await
-                .map_err(dao_to_io_error)?,
+        // Spawn the DB executor (owns SQLite, runs startup reconciliation).
+        let (tx, rx) = mpsc::channel(1024);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let spawn_root = root_path.clone();
+        tokio::spawn(async move {
+            DbExecutor::spawn(spawn_root, rx, ready_tx).await;
+        });
+        ready_rx
+            .await
+            .map_err(|_| boxed_io_error(io::ErrorKind::Other, "DB executor failed to start"))??;
+
+        #[cfg(test)]
+        let dao = Dao::new(root_path.join("linadata").join("meta.db"))
+            .await
+            .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("dao: {}", e)))?;
+
+        Ok(StoreManager {
+            root: root_path, // Store owned path
+            db: DbClient::new(tx),
             bm: Arc::new(BlockManager::new()),
-            operation_lock: Arc::new(RwLock::new(())),
-        };
-
-        // Reconcile filesystem with DB on startup: drop orphan source files,
-        // leftover tombstones, and write-in-progress temp files.
-        if let Err(err) = manager.reconcile_orphans().await {
-            return Err(boxed_io_error(
-                io::ErrorKind::Other,
-                format!("Startup reconciliation failed: {}", err),
-            ));
-        }
-
-        // Reconcile directory table with existing file paths
-        if let Err(err) = manager.sync_dirs_from_links().await {
-            return Err(boxed_io_error(
-                io::ErrorKind::Other,
-                format!("Startup dir sync failed: {}", err),
-            ));
-        }
-
-        Ok(manager)
+            #[cfg(test)]
+            dao,
+        })
     }
 
     pub async fn list(
@@ -91,94 +169,35 @@ impl StoreManager {
         isext: bool,
         use_regex: bool,
     ) -> Result<Vec<Link>, BoxError> {
-        let _read_guard = self.operation_lock.read().await;
-        self.list_locked(pattern, n, isext, use_regex).await
+        self.db.list(pattern, n, isext, use_regex).await
     }
 
     pub async fn is_dir(&self, path: &str) -> Result<bool, BoxError> {
-        let _read_guard = self.operation_lock.read().await;
-        self.dao
-            .get_dir_by_path(path)
-            .await
-            .map_err(dao_to_io_error)
-            .map(|d| d.is_some())
-            .map_err(|e| Box::new(e) as BoxError)
+        self.db.is_dir(path).await
     }
 
     pub async fn list_child_dirs(&self, parent: &str) -> Result<Vec<DirEntry>, BoxError> {
-        let _read_guard = self.operation_lock.read().await;
-        self.dao
-            .list_dirs_by_parent(parent)
-            .await
-            .map_err(dao_to_io_error)
-            .map_err(|e| Box::new(e) as BoxError)
+        self.db.list_child_dirs(parent).await
     }
 
     pub async fn all_dirs(&self) -> Result<Vec<DirEntry>, BoxError> {
-        let _read_guard = self.operation_lock.read().await;
-        self.dao
-            .list_all_dirs()
-            .await
-            .map_err(dao_to_io_error)
-            .map_err(|e| Box::new(e) as BoxError)
+        self.db.all_dirs().await
     }
 
     pub async fn mkdir(&self, path: &str, parent: &str) -> Result<(), BoxError> {
-        let _write_guard = self.operation_lock.write().await;
-        self.dao
-            .insert_dir(path, parent)
-            .await
-            .map_err(dao_to_io_error)
-            .map_err(|e| Box::new(e) as BoxError)
+        self.db.mkdir(path, parent).await
     }
 
     pub async fn rmdir(&self, path: &str) -> Result<(), BoxError> {
-        let _write_guard = self.operation_lock.write().await;
-        self.dao
-            .delete_dir(path)
-            .await
-            .map_err(dao_to_io_error)
-            .map_err(|e| Box::new(e) as BoxError)
+        self.db.rmdir(path).await
     }
 
     pub async fn set_file_mode(&self, name: &str, mode: u32) -> Result<(), BoxError> {
-        let _write_guard = self.operation_lock.write().await;
-        self.dao
-            .set_link_mode(name, mode)
-            .await
-            .map_err(dao_to_io_error)
-            .map_err(|e| Box::new(e) as BoxError)
+        self.db.set_file_mode(name, mode).await
     }
 
     pub async fn set_dir_mode(&self, path: &str, mode: u32) -> Result<(), BoxError> {
-        let _write_guard = self.operation_lock.write().await;
-        self.dao
-            .set_dir_mode(path, mode)
-            .await
-            .map_err(dao_to_io_error)
-            .map_err(|e| Box::new(e) as BoxError)
-    }
-
-    pub async fn sync_dirs_from_links(&self) -> Result<(), BoxError> {
-        let _write_guard = self.operation_lock.write().await;
-        let links = self.list_locked("*", 0, false, true).await?;
-        for link in &links {
-            if let Some(slash) = link.name.rfind('/') {
-                let parent = &link.name[..slash];
-                let parts: Vec<&str> = parent.split('/').collect();
-                let mut acc = String::new();
-                let mut prev = String::new();
-                for part in &parts {
-                    if !acc.is_empty() {
-                        acc.push('/');
-                    }
-                    acc.push_str(part);
-                    let _ = self.dao.insert_dir(&acc, &prev).await;
-                    prev = acc.clone();
-                }
-            }
-        }
-        Ok(())
+        self.db.set_dir_mode(path, mode).await
     }
 }
 
@@ -189,28 +208,18 @@ impl StoreManager {
             return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
         }
 
-        let (compressed, source_size, expected_hash, file_bytes) = {
-            let _read_guard = self.operation_lock.read().await;
-            let links = self
-                .dao
-                .get_links_by_name(file_name, false)
-                .await
-                .map_err(dao_to_io_error)?;
-            let link = links
-                .get(0)
-                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
+        // Metadata via the DB executor; only the file read runs on this task.
+        let meta = self
+            .db
+            .get_meta(file_name)
+            .await?
+            .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
 
-            let source = self
-                .dao
-                .get_source_by_id(&link.source_id)
-                .await
-                .map_err(dao_to_io_error)?
-                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
-
-            let source_path = self.source_path(&source.id);
-            let file_bytes = fs::read(&source_path).await?;
-            (source.compressed, source.size as usize, source.hash256.clone(), file_bytes)
-        };
+        let source_path = self.source_path(&meta.source_id);
+        let file_bytes = fs::read(&source_path).await?;
+        let compressed = meta.compressed;
+        let source_size = meta.size as usize;
+        let expected_hash = meta.hash256.clone();
 
         if compressed {
             let bm = Arc::clone(&self.bm);
@@ -231,6 +240,38 @@ impl StoreManager {
             }
             Ok(Bytes::from(file_bytes))
         }
+    }
+
+    /// Open a streaming read of an object. Returns `None` if the file does not
+    /// exist. Data is decompressed on the fly in bounded chunks; the BLAKE3
+    /// hash is verified when the stream reaches EOF.
+    pub async fn open_read(&self, file_name: &str) -> Result<Option<ObjectReader>, BoxError> {
+        if file_name.is_empty() {
+            return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
+        }
+        let meta = match self.db.get_meta(file_name).await? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let path = self.source_path(&meta.source_id);
+        let file = fs::File::open(&path).await?;
+        let inner = if meta.compressed {
+            ObjectReaderInner::Blocks {
+                file,
+                bm: Arc::clone(&self.bm),
+                pending: Vec::new(),
+                pos: 0,
+            }
+        } else {
+            ObjectReaderInner::Plain(file)
+        };
+        Ok(Some(ObjectReader {
+            data_len: meta.size,
+            expected_hash: meta.hash256,
+            hasher: blake3::Hasher::new(),
+            inner,
+            eof: false,
+        }))
     }
 
     pub async fn get_and_save<P: AsRef<Path>>(
@@ -261,11 +302,236 @@ impl StoreManager {
         Ok(())
     }
 
+    /// Stream a put from a chunk channel with bounded memory and dedup. Small
+    /// payloads (known length <= `INLINE_MEMORY_THRESHOLD`) are buffered in
+    /// memory; larger/unknown ones are streamed to a temp file on disk. The
+    /// BLAKE3 hash is computed incrementally; once the whole body has arrived
+    /// the DB is asked to dedup first — on a content-hash hit the object is
+    /// merged into the existing source (link only, no file kept).
+    pub async fn put_stream(
+        &self,
+        file_name: &str,
+        mut payload: mpsc::Receiver<Bytes>,
+        recv_timeout: Duration,
+        compressed: bool,
+        expected_len: Option<u64>,
+    ) -> Result<(), BoxError> {
+        if file_name.is_empty() {
+            return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
+        }
+
+        let new_source_id = Self::file_name_gen();
+        let source_dir = self.source_dir(&new_source_id);
+        let bm = Arc::clone(&self.bm);
+
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0u64;
+        // Inline (memory) until the body turns out to be large; spill to a
+        // temp file once the buffer would exceed the threshold.
+        let mut inline = matches!(expected_len, Some(len) if len as usize <= INLINE_MEMORY_THRESHOLD)
+            || expected_len.is_none();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut spool: Option<(tokio::fs::File, PathBuf)> = None;
+
+        if let Err(e) = Self::collect_body(
+            &mut payload,
+            recv_timeout,
+            &mut hasher,
+            &mut total,
+            &mut inline,
+            &mut buf,
+            &mut spool,
+            &bm,
+            &source_dir,
+            &new_source_id,
+            compressed,
+        )
+        .await
+        {
+            Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+            return Err(e);
+        }
+
+        let new_hash256 = hasher.finalize().to_hex().to_string();
+
+        // Size check before any commit.
+        if let Some(expected) = expected_len {
+            if total != expected {
+                Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+                return Err(boxed_io_error(
+                    io::ErrorKind::Other,
+                    format!("payload size mismatch: expected {} bytes, got {}", expected, total),
+                ));
+            }
+        }
+
+        // Dedup first: if the content hash already exists, just add a link and
+        // skip writing/keeping an object file entirely.
+        if self
+            .db
+            .dedup_or_link(file_name, &new_hash256, compressed)
+            .await?
+            .is_some()
+        {
+            Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+            return Ok(());
+        }
+
+        // Commit a new object file.
+        match (inline, spool) {
+            (true, None) => {
+                let input = Bytes::from(buf);
+                let stored: Bytes = if compressed {
+                    let bm = Arc::clone(&self.bm);
+                    let input2 = input.clone();
+                    let encoded = task::spawn_blocking(move || bm.compress_all(&input2)).await?
+                        .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("compress: {}", e)))?;
+                    Bytes::from(encoded)
+                } else {
+                    input
+                };
+                self.persist_source_bytes(&new_source_id, &stored).await?;
+            }
+            (false, Some((file, tmp_path))) => {
+                file.sync_all().await?;
+                drop(file);
+                fs::rename(&tmp_path, &source_dir.join(&new_source_id)).await?;
+            }
+            _ => return Err(boxed_io_error(io::ErrorKind::Other, "invalid spool state")),
+        }
+
+        // Metadata commit — serialized by the DB executor.
+        let out = match self
+            .db
+            .put_meta(file_name, &new_source_id, &new_hash256, compressed, total)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = self.remove_source_file_if_exists(&new_source_id).await;
+                return Err(e);
+            }
+        };
+
+        if !out.keep_new {
+            let _ = self.remove_source_file_if_exists(&new_source_id).await;
+        }
+        for source_id in &out.released {
+            let _ = self.remove_source_file_if_exists(source_id).await;
+        }
+
+        Ok(())
+    }
+
+    async fn collect_body(
+        payload: &mut mpsc::Receiver<Bytes>,
+        recv_timeout: Duration,
+        hasher: &mut blake3::Hasher,
+        total: &mut u64,
+        inline: &mut bool,
+        buf: &mut Vec<u8>,
+        spool: &mut Option<(tokio::fs::File, PathBuf)>,
+        bm: &Arc<BlockManager>,
+        source_dir: &Path,
+        new_source_id: &str,
+        compressed: bool,
+    ) -> Result<(), BoxError> {
+        let block_size = bm.chunk_size();
+        // Bytes accumulated but not yet flushed as a full block (spool mode).
+        let mut pending: Vec<u8> = Vec::with_capacity(block_size);
+
+        loop {
+            let chunk = match tokio::time::timeout(recv_timeout, payload.recv()).await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => return Err(boxed_io_error(io::ErrorKind::Other, "payload stream stalled")),
+            };
+            hasher.update(&chunk);
+            *total += chunk.len() as u64;
+
+            if *inline && buf.len() + chunk.len() <= INLINE_MEMORY_THRESHOLD {
+                buf.extend_from_slice(&chunk);
+                continue;
+            }
+
+            // From here on we are in spool mode: lazily create the temp file,
+            // dump the inline buffer into it, and stream blocks as they fill.
+            if spool.is_none() {
+                let (file, tmp_path) = Self::open_spool(source_dir, new_source_id).await?;
+                *spool = Some((file, tmp_path));
+            }
+            let (file, _) = spool.as_mut().expect("spool just created");
+            if *inline {
+                if !buf.is_empty() {
+                    Self::write_block(file, bm, buf, compressed).await?;
+                }
+                buf.clear();
+                *inline = false;
+            }
+            pending.extend_from_slice(&chunk);
+            while pending.len() >= block_size {
+                let block = pending[..block_size].to_vec();
+                pending.drain(..block_size);
+                Self::write_block(file, bm, &block, compressed).await?;
+            }
+        }
+
+        if !*inline {
+            let (file, _) = spool.as_mut().expect("spool mode has a file");
+            if !pending.is_empty() {
+                Self::write_block(file, bm, &pending, compressed).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn open_spool(
+        source_dir: &Path,
+        new_source_id: &str,
+    ) -> Result<(tokio::fs::File, PathBuf), BoxError> {
+        fs::create_dir_all(source_dir).await?;
+        let tmp_path = source_dir.join(format!("{}.tmp-{}", new_source_id, Uuid::new_v4()));
+        let file = fs::File::create(&tmp_path).await?;
+        Ok((file, tmp_path))
+    }
+
+    async fn cleanup_spool(
+        spool: Option<(tokio::fs::File, PathBuf)>,
+        _source_dir: &Path,
+        _new_source_id: &str,
+    ) {
+        if let Some((file, tmp_path)) = spool {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path).await;
+        }
+    }
+
+    /// Write one (up to block-size) chunk: raw for plain storage, or compressed
+    /// with the block header when `compressed` is set.
+    async fn write_block(
+        file: &mut tokio::fs::File,
+        bm: &Arc<BlockManager>,
+        block: &[u8],
+        compressed: bool,
+    ) -> Result<(), BoxError> {
+        if !compressed {
+            file.write_all(block).await?;
+            return Ok(());
+        }
+        let bm = Arc::clone(bm);
+        let block_owned = block.to_vec();
+        let encoded = task::spawn_blocking(move || bm.compress_block(&block_owned))
+            .await
+            .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("compress task join error: {}", e)))??;
+        file.write_all(&encoded).await?;
+        Ok(())
+    }
+
     pub async fn put_binary_data(
         &self,
         file_name: &str,
         input: &Bytes,
-        cover: bool,
+        _cover: bool,
         compressed: bool,
     ) -> Result<(), BoxError> {
         if file_name.is_empty() {
@@ -273,15 +539,8 @@ impl StoreManager {
         }
 
         let new_size = input.len() as u64;
-        let ext = Path::new(&file_name)
-            .extension()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap_or("")
-            .to_string();
 
-        // Hash + (optional) compression are CPU-bound; run them off the runtime
-        // so we don't block tokio workers on large payloads.
+        // Hash + compression are CPU-bound; run off the runtime.
         let bm = Arc::clone(&self.bm);
         let input_for_blocking = input.clone();
         let (new_hash256, new_storage_bytes) = task::spawn_blocking(move || -> Result<(String, Vec<u8>), BoxError> {
@@ -296,17 +555,31 @@ impl StoreManager {
         .await
         .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("encode task join error: {}", e)))??;
 
-        let _write_guard = self.operation_lock.write().await;
-        self.put_binary_data_locked(
-            file_name,
-            cover,
-            compressed,
-            &new_hash256,
-            new_size,
-            &new_storage_bytes,
-            &ext,
-        )
+        // Object file write — concurrent, no lock.
+        let new_source_id = Self::file_name_gen();
+        self.persist_source_bytes(&new_source_id, &new_storage_bytes).await?;
+
+        // Metadata commit — serialized by the DB executor.
+        let out = match self
+            .db
+            .put_meta(file_name, &new_source_id, &new_hash256, compressed, new_size)
             .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = self.remove_source_file_if_exists(&new_source_id).await;
+                return Err(e);
+            }
+        };
+
+        if !out.keep_new {
+            let _ = self.remove_source_file_if_exists(&new_source_id).await;
+        }
+        for source_id in &out.released {
+            let _ = self.remove_source_file_if_exists(source_id).await;
+        }
+
+        Ok(())
     }
 
     pub async fn put(
@@ -355,314 +628,16 @@ impl StoreManager {
             return Err(boxed_io_error(io::ErrorKind::Other, "No files requested"));
         }
 
-        {
-            let _write_guard = self.operation_lock.write().await;
-            let links = self.list_locked(pattern, 0, false, use_regx).await?;
-            for link in links {
-                let source = self
-                    .dao
-                    .get_source_by_id(&link.source_id)
-                    .await
-                    .map_err(dao_to_io_error)?
-                    .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
+        let released = self.db.delete_meta(pattern, use_regx).await?;
 
-                let source_count = source
-                    .count
-                    .checked_sub(1)
-                    .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
-
-                self.dao.delete_link_by_id(&link.id).await?;
-                if let Err(err) = self.release_source(&link, &source, source_count).await {
-                    let ext = Path::new(&link.name)
-                        .extension()
-                        .unwrap_or_default()
-                        .to_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let _ = self
-                        .dao
-                        .insert_link_with_id(&link.id, &link.name, &ext, &link.source_id, link.mode)
-                        .await
-                        .map_err(dao_to_io_error);
-                    return Err(err);
-                }
-            }
+        for source_id in &released {
+            let _ = self.remove_source_file_if_exists(source_id).await;
         }
 
         Ok(())
     }
 }
 
-// Source lifecycle and consistency helpers.
-impl StoreManager {
-    async fn list_locked(
-        &self,
-        pattern: &str,
-        n: u64,
-        isext: bool,
-        use_regex: bool,
-    ) -> Result<Vec<Link>, BoxError> {
-        let links = if isext {
-            self.dao.get_links_by_ext(pattern).await.map_err(dao_to_io_error)?
-        } else if (pattern == "" || pattern == "*") && use_regex {
-            self.dao.get_n_links(n).await.map_err(dao_to_io_error)?
-        } else if pattern.contains('*') && use_regex {
-            let sql_pattern = pattern.replace('*', "%");
-            self.dao
-                .get_links_by_name(&sql_pattern, true)
-                .await
-                .map_err(dao_to_io_error)?
-        } else {
-            self.dao
-                .get_links_by_name(pattern, false)
-                .await
-                .map_err(dao_to_io_error)?
-        };
-
-        Ok(links)
-    }
-
-    async fn put_binary_data_locked(
-        &self,
-        file_name: &str,
-        cover: bool,
-        compressed: bool,
-        new_hash256: &str,
-        new_size: u64,
-        new_storage_bytes: &[u8],
-        ext: &str,
-    ) -> Result<(), BoxError> {
-        let links = self
-            .dao
-            .get_links_by_name(file_name, false)
-            .await
-            .map_err(dao_to_io_error)?;
-
-        if links.len() > 0 {
-            let link = links
-                .get(0)
-                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "File not found"))?;
-
-            let source = self
-                .dao
-                .get_source_by_id(&link.source_id)
-                .await
-                .map_err(dao_to_io_error)?
-                .ok_or_else(|| boxed_io_error(io::ErrorKind::NotFound, "Source not found"))?;
-
-            if cover {
-                // If this source is shared, don't overwrite in place.
-                // Create a new source so other links pointing to the same
-                // content are not affected by this write/truncate.
-                if source.count > 1 {
-                    let new_source_id = Self::file_name_gen();
-                    self.persist_source_bytes(&new_source_id, new_storage_bytes).await?;
-
-                    if let Err(err) = self
-                        .dao
-                        .insert_source(&new_source_id, new_hash256, compressed, new_size)
-                        .await
-                    {
-                        let _ = self.remove_source_file_if_exists(&new_source_id).await;
-                        return Err(Box::new(dao_to_io_error(err)));
-                    }
-
-                    if let Err(err) = self.dao.update_link_source_id(&link.id, &new_source_id).await {
-                        let _ = self.dao.delete_source_by_id(&new_source_id).await.map_err(dao_to_io_error);
-                        let _ = self.remove_source_file_if_exists(&new_source_id).await;
-                        return Err(Box::new(dao_to_io_error(err)));
-                    }
-
-                    let source_count = source
-                        .count
-                        .checked_sub(1)
-                        .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
-                    if let Err(err) = self.release_source(&link, &source, source_count).await {
-                        let _ = self.dao.update_link_source_id(&link.id, &source.id).await.map_err(dao_to_io_error);
-                        let _ = self.dao.delete_source_by_id(&new_source_id).await.map_err(dao_to_io_error);
-                        let _ = self.remove_source_file_if_exists(&new_source_id).await;
-                        return Err(Box::new(io::Error::other(err.to_string())));
-                    }
-                } else {
-                    let source_path = self.source_path(&link.source_id);
-                    let previous_storage_bytes = fs::read(&source_path).await?;
-
-                    self.persist_source_bytes(&link.source_id, new_storage_bytes).await?;
-                    if let Err(err) = self
-                        .dao
-                        .update_source(
-                            &link.source_id,
-                            new_hash256,
-                            compressed,
-                            new_size,
-                            source.count,
-                        )
-                        .await
-                    {
-                        let _ = self.persist_source_bytes(&link.source_id, &previous_storage_bytes).await;
-                        return Err(Box::new(dao_to_io_error(err)));
-                    }
-                }
-            } else {
-                if new_hash256 == source.hash256 && source.compressed == compressed {
-                    return Ok(());
-                }
-
-                let new_source_id = Self::file_name_gen();
-                self.persist_source_bytes(&new_source_id, new_storage_bytes).await?;
-
-                if let Err(err) = self
-                    .dao
-                    .insert_source(&new_source_id, new_hash256, compressed, new_size)
-                    .await
-                {
-                    let _ = self.remove_source_file_if_exists(&new_source_id).await;
-                    return Err(Box::new(dao_to_io_error(err)));
-                }
-
-                if let Err(err) = self.dao.update_link_source_id(&link.id, &new_source_id).await {
-                    let _ = self
-                        .dao
-                        .delete_source_by_id(&new_source_id)
-                        .await
-                        .map_err(dao_to_io_error);
-                    let _ = self.remove_source_file_if_exists(&new_source_id).await;
-                    return Err(Box::new(dao_to_io_error(err)));
-                }
-
-                let source_count = source
-                    .count
-                    .checked_sub(1)
-                    .ok_or(io::Error::new(io::ErrorKind::Other, "Source count is 0"))?;
-
-                if let Err(err) = self.release_source(link, &source, source_count).await {
-                    let _ = self
-                        .dao
-                        .update_link_source_id(&link.id, &source.id)
-                        .await
-                        .map_err(dao_to_io_error);
-                    let _ = self
-                        .dao
-                        .delete_source_by_id(&new_source_id)
-                        .await
-                        .map_err(dao_to_io_error);
-                    let _ = self.remove_source_file_if_exists(&new_source_id).await;
-                    return Err(Box::new(io::Error::other(err.to_string())));
-                }
-            }
-        } else {
-            if let Some(source) = self
-                .dao
-                .get_source_by_hash256(new_hash256)
-                .await
-                .map_err(dao_to_io_error)?
-            {
-                let link_id = Uuid::new_v4().to_string();
-                self.dao
-                    .insert_link_with_id(&link_id, file_name, ext, &source.id, 420)
-                    .await
-                    .map_err(dao_to_io_error)?;
-
-                if let Err(err) = self
-                    .dao
-                    .update_source(
-                        &source.id,
-                        &source.hash256,
-                        source.compressed,
-                        source.size,
-                        source.count + 1,
-                    )
-                    .await
-                {
-                    let _ = self.dao.delete_link_by_id(&link_id).await.map_err(dao_to_io_error);
-                    return Err(Box::new(dao_to_io_error(err)));
-                }
-
-                return Ok(());
-            }
-
-            let source_id = Self::file_name_gen();
-            let link_id = Uuid::new_v4().to_string();
-
-            self.persist_source_bytes(&source_id, new_storage_bytes).await?;
-
-            if let Err(err) = self
-                .dao
-                .insert_source(&source_id, new_hash256, compressed, new_size)
-                .await
-            {
-                let _ = self.remove_source_file_if_exists(&source_id).await;
-                return Err(Box::new(dao_to_io_error(err)));
-            }
-
-            if let Err(err) = self
-                .dao
-                .insert_link_with_id(&link_id, file_name, ext, &source_id, 420)
-                .await
-            {
-                let _ = self
-                    .dao
-                    .delete_source_by_id(&source_id)
-                    .await
-                    .map_err(dao_to_io_error);
-                let _ = self.remove_source_file_if_exists(&source_id).await;
-                return Err(Box::new(dao_to_io_error(err)));
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn release_source(
-        &self,
-        link: &Link,
-        source: &Source,
-        source_count: u64,
-    ) -> Result<(), BoxError> {
-        // Delete source if count is 0
-        if source_count > 0 {
-            self.dao
-                .update_source(
-                    &source.id,
-                    &source.hash256,
-                    source.compressed,
-                    source.size,
-                    source_count as u64,
-                )
-                .await
-                .map_err(dao_to_io_error)?;
-        } else {
-            let source_path = self.source_path(&link.source_id);
-            let source_dir = self.source_dir(&link.source_id);
-            let tombstone_path = source_dir.join(format!("{}.deleting", link.source_id));
-
-            fs::rename(&source_path, &tombstone_path).await?;
-
-            if let Err(err) = self.dao.delete_source_by_id(&source.id).await {
-                let _ = fs::rename(&tombstone_path, &source_path).await;
-                return Err(Box::new(dao_to_io_error(err)));
-            }
-
-            if let Err(err) = fs::remove_file(&tombstone_path).await {
-                // Best-effort rollback: restore the file and the source row with
-                // its ORIGINAL count, not a default of 1.
-                let _ = fs::rename(&tombstone_path, &source_path).await;
-                let _ = self
-                    .dao
-                    .insert_source_with_count(
-                        &source.id,
-                        &source.hash256,
-                        source.compressed,
-                        source.size,
-                        source.count,
-                    )
-                    .await;
-                return Err(Box::new(err));
-            }
-        }
-        Ok(())
-    }
-}
 
 // Filesystem and identifier helpers.
 impl StoreManager {
@@ -715,130 +690,10 @@ impl StoreManager {
         }
     }
 
-    /// Reconcile the on-disk source store with the DB after a (potentially
-    /// crash-interrupted) restart:
-    /// - delete files left over from in-flight writes (`*.tmp-*`),
-    /// - delete stale tombstones from interrupted deletes (`*.deleting`),
-    /// - delete payload files whose source row no longer exists.
-    /// The DB is treated as the source of truth.
-    async fn reconcile_orphans(&self) -> Result<(), BoxError> {
-        let known_ids: HashSet<String> = self
-            .dao
-            .list_source_ids()
-            .await
-            .map_err(dao_to_io_error)?
-            .into_iter()
-            .collect();
-
-        let linadata_root = self.root.join("linadata");
-        let mut removed_tmp = 0u64;
-        let mut removed_tombstone = 0u64;
-        let mut removed_orphan = 0u64;
-
-        // The expected layout is linadata/<id[0..4]>/<id[4..6]>/<id>. Only
-        // descend two levels so we don't accidentally chew on meta.db / logs.
-        let mut top = match stdfs::read_dir(&linadata_root) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(Box::new(err)),
-        };
-
-        while let Some(top_entry) = top.next() {
-            let top_entry = top_entry?;
-            let top_path = top_entry.path();
-            let top_meta = match top_entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !top_meta.is_dir() {
-                continue;
-            }
-            // Source-id prefix dirs are always 4 chars; skip anything else (e.g. "logs").
-            if top_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.len() != 4)
-                .unwrap_or(true)
-            {
-                continue;
-            }
-
-            let mid = match stdfs::read_dir(&top_path) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            for mid_entry in mid {
-                let mid_entry = mid_entry?;
-                let mid_path = mid_entry.path();
-                let mid_meta = match mid_entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if !mid_meta.is_dir() {
-                    continue;
-                }
-                if mid_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.len() != 2)
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-
-                let leaves = match stdfs::read_dir(&mid_path) {
-                    Ok(rd) => rd,
-                    Err(_) => continue,
-                };
-                for leaf in leaves {
-                    let leaf = leaf?;
-                    let leaf_path = leaf.path();
-                    let leaf_meta = match leaf.metadata() {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    if !leaf_meta.is_file() {
-                        continue;
-                    }
-                    let name = match leaf_path.file_name().and_then(|n| n.to_str()) {
-                        Some(s) => s.to_string(),
-                        None => continue,
-                    };
-
-                    if name.contains(".tmp-") {
-                        if fs::remove_file(&leaf_path).await.is_ok() {
-                            removed_tmp += 1;
-                        }
-                        continue;
-                    }
-                    if let Some(stem) = name.strip_suffix(".deleting") {
-                        // If the DB still has the source, restore the file;
-                        // otherwise treat the tombstone as garbage.
-                        if known_ids.contains(stem) {
-                            let restored = mid_path.join(stem);
-                            let _ = fs::rename(&leaf_path, &restored).await;
-                        } else if fs::remove_file(&leaf_path).await.is_ok() {
-                            removed_tombstone += 1;
-                        }
-                        continue;
-                    }
-
-                    if !known_ids.contains(&name) {
-                        if fs::remove_file(&leaf_path).await.is_ok() {
-                            removed_orphan += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        if removed_tmp | removed_tombstone | removed_orphan > 0 {
-            eprintln!(
-                "[linastore] reconcile: removed_tmp={} removed_tombstone={} removed_orphan={}",
-                removed_tmp, removed_tombstone, removed_orphan
-            );
-        }
-        Ok(())
+    /// Clean orphan/tmp/tombstone files against the DB's known source ids.
+    pub async fn reconcile_orphans(&self) -> Result<(), BoxError> {
+        let known_ids: HashSet<String> = self.db.list_source_ids().await?.into_iter().collect();
+        reconcile_orphans_files(&known_ids, &self.root).await
     }
 }
 
@@ -1432,6 +1287,184 @@ mod tests {
 
         let roundtrip = sm.get_binary_data("kept.bin").await.expect("get");
         assert_eq!(roundtrip, data);
+    }
+
+    async fn read_all(sm: &StoreManager, name: &str) -> Result<Vec<u8>, BoxError> {
+        let mut reader = sm.open_read(name).await?.expect("reader");
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = reader.read_chunk(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn test_open_read_plain_and_compressed() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("store");
+        let data = generate_random_binary(4 * 1024 * 1024);
+
+        for compressed in [false, true] {
+            let name = if compressed { "stream.c.bin" } else { "stream.bin" };
+            sm.put_binary_data(name, &data, false, compressed).await.expect("put");
+            let got = read_all(&sm, name).await.expect("read");
+            assert_eq!(got, data, "streamed read mismatch (compressed={})", compressed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_read_rejects_corruption() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("store");
+        let data = generate_random_binary(256 * 1024);
+        sm.put_binary_data("corrupt.bin", &data, false, false).await.expect("put");
+
+        let links = sm.dao.get_links_by_name("corrupt.bin", false).await.expect("links");
+        let source_id = links[0].source_id.clone();
+        let path = sm.source_path(&source_id);
+        stdfs::write(&path, vec![0u8; data.len()]).expect("corrupt");
+
+        let err = read_all(&sm, "corrupt.bin").await.expect_err("should fail integrity check");
+        assert!(err.to_string().contains("integrity"), "err: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_roundtrip_plain_and_compressed() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("store");
+        let data = generate_random_binary(3 * 1024 * 1024);
+
+        for compressed in [false, true] {
+            let name = if compressed { "stream.c.bin" } else { "stream.bin" };
+            let (tx, rx) = mpsc::channel(4);
+            let data_clone = data.clone();
+            let sender = tokio::spawn(async move {
+                for c in data_clone.chunks(32 * 1024) {
+                    tx.send(Bytes::copy_from_slice(c)).await.expect("send chunk");
+                }
+            });
+            sm.put_stream(name, rx, Duration::from_secs(5), compressed, Some(data.len() as u64))
+                .await
+                .expect("put_stream");
+            sender.await.expect("sender");
+            let got = read_all(&sm, name).await.expect("read");
+            assert_eq!(got, data, "streamed put mismatch (compressed={})", compressed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_rejects_truncated() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("store");
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Bytes::from(vec![1, 2, 3])).await.expect("send");
+        drop(tx);
+
+        let err = sm
+            .put_stream("trunc.bin", rx, Duration::from_secs(5), false, Some(100))
+            .await
+            .expect_err("should reject truncated stream");
+        assert!(err.to_string().contains("size mismatch"), "err: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_spools_large_and_dedups() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("store");
+
+        // Larger than INLINE_MEMORY_THRESHOLD: exercises the disk-spool path.
+        let big = generate_random_binary(8 * 1024 * 1024);
+        let (tx, rx) = mpsc::channel(8);
+        let data_clone = big.clone();
+        let sender = tokio::spawn(async move {
+            for c in data_clone.chunks(128 * 1024) {
+                tx.send(Bytes::copy_from_slice(c)).await.expect("send");
+            }
+        });
+        if let Err(e) = sm.put_stream("big.bin", rx, Duration::from_secs(5), false, Some(big.len() as u64)).await {
+            panic!("put big failed: {}", e);
+        }
+        sender.await.expect("sender");
+        assert_eq!(read_all(&sm, "big.bin").await.expect("read"), big);
+
+        // Same content under a new name: must merge into the same source.
+        let (tx, rx) = mpsc::channel(8);
+        let data_clone = big.clone();
+        let sender = tokio::spawn(async move {
+            for c in data_clone.chunks(128 * 1024) {
+                tx.send(Bytes::copy_from_slice(c)).await.expect("send");
+            }
+        });
+        sm.put_stream("big2.bin", rx, Duration::from_secs(5), false, Some(big.len() as u64))
+            .await
+            .expect("put big2");
+        sender.await.expect("sender");
+
+        let links = sm.dao.get_links_by_name("big.bin", false).await.expect("links big");
+        let links2 = sm.dao.get_links_by_name("big2.bin", false).await.expect("links big2");
+        assert_eq!(links[0].source_id, links2[0].source_id, "dedup should share a source");
+        let source = sm
+            .dao
+            .get_source_by_id(&links[0].source_id)
+            .await
+            .expect("get source")
+            .expect("source exists");
+        assert_eq!(source.count, 2, "refcount should reflect both links");
+
+        assert_eq!(read_all(&sm, "big2.bin").await.expect("read big2"), big);
+        assert_eq!(count_blob_files(temp_dir.path()), 1, "only one deduped blob on disk");
+    }
+
+    fn count_blob_files(root: &Path) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = stdfs::read_dir(&root.join("linadata")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name == "logs" {
+                        continue;
+                    }
+                    count += count_dir_blobs(&path);
+                } else {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if !name.ends_with(".db")
+                        && !name.ends_with(".db-wal")
+                        && !name.ends_with(".db-shm")
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn count_dir_blobs(dir: &Path) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = stdfs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    count += count_dir_blobs(&path);
+                } else {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if !name.ends_with(".db")
+                        && !name.ends_with(".db-wal")
+                        && !name.ends_with(".db-shm")
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 
     #[test]
