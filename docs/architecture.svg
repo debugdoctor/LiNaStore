@@ -21,6 +21,7 @@
 <text x="435" y="475" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#0d9488">PUT after admission: payload channel full -&gt; send().await -&gt;</text>
 <text x="435" y="492" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#0d9488">frontend stops reading socket -&gt; TCP backpressure pauses client</text>
 <text x="435" y="509" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#dc2626">waiting requests never start their body; only 30s admission timeout -&gt; 503</text>
+<text x="435" y="526" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#7c3aed">Advanced auth PUT keeps legacy whole AES-GCM frame; unauthenticated PUT streams</text>
 <text x="1040" y="500" text-anchor="start" font-family="monospace" font-size="10.5" fill="#111">legend:</text>
 <text x="1040" y="516" text-anchor="start" font-family="monospace" font-size="10.5" fill="#111">blue = meta/control   teal = PUT body   orange = GET response</text>
 <text x="1040" y="532" text-anchor="start" font-family="monospace" font-size="10.5" fill="#111">dashed = backpressure / io-wait</text>

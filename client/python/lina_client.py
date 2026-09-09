@@ -19,6 +19,10 @@ class LiNaStoreProtocolError(LiNaStoreClientError):
     """Exception raised for protocol errors"""
     pass
 
+class LiNaStoreOverloadedError(LiNaStoreProtocolError):
+    """The server could not admit the request before its timeout."""
+    pass
+
 class LiNaStoreChecksumError(LiNaStoreProtocolError):
     """Exception raised for checksum verification failures"""
     pass
@@ -34,6 +38,8 @@ class LiNaStoreClient:
 
     LINA_NAME_MAX_LENGTH = 255
     LINA_HEADER_BASE_LENGTH = 10  # flags(1) + ilen(1) + dlen(4) + checksum(4)
+    STREAM_CHUNK_SIZE = 64 * 1024
+    ADMISSION_TIMEOUT = 35
 
     def __init__(self, address: str, port: int, timeout: int = 5,
                  auto_refresh: bool = True, refresh_buffer: int = 300):
@@ -57,12 +63,16 @@ class LiNaStoreClient:
         self._cached_password = None  # Cached password for auto-refresh
         self.auto_refresh = auto_refresh
         self.refresh_buffer = refresh_buffer  # Refresh token N seconds before expiration
+        self._pending_payload = None
         
     def connect(self):
         # Logic to connect to the LiNaStore service
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(self.timeout)
+            # The server may wait up to 30 seconds for admission before it
+            # starts reading an upload body. Keep the socket alive long enough
+            # for TCP backpressure to do its job.
+            self.socket.settimeout(max(self.timeout, self.ADMISSION_TIMEOUT))
             self.socket.connect((self.address, self.port))
         except socket.error as e:
             raise LiNaStoreConnectionError(f"Failed to connect to {self.address}:{self.port}: {str(e)}")
@@ -338,6 +348,43 @@ class LiNaStoreClient:
             return bucket.encode() + b'\x00' + file_name.encode()
         return file_name.encode()
 
+    def _read_response_header(self) -> tuple[int, bytes, int, int]:
+        prefix = self._recv_all(2)
+        status = prefix[0]
+        identifier = self._recv_all(prefix[1])
+        tail = self._recv_all(8)
+        data_len = int.from_bytes(tail[:4], 'little')
+        checksum = int.from_bytes(tail[4:], 'little')
+        return status, identifier, data_len, checksum
+
+    def _stream_plain_payload(self, reader: io.BufferedReader, ilen: bytes, identifier: bytes) -> tuple[int, int]:
+        try:
+            start = reader.tell()
+            reader.seek(0, io.SEEK_END)
+            end = reader.tell()
+            reader.seek(start)
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            data = reader.read()
+            if not isinstance(data, bytes):
+                raise LiNaStoreProtocolError("Upload reader must yield bytes")
+            self._pending_payload = data
+            dlen = len(data)
+            checksum = binascii.crc32(ilen + identifier + dlen.to_bytes(4, 'little') + data)
+            return dlen, checksum
+
+        dlen = end - start
+        if dlen > 0xFFFFFFFF:
+            raise LiNaStoreProtocolError(f"File is too large for the protocol: {dlen} bytes")
+        checksum = binascii.crc32(ilen + identifier + dlen.to_bytes(4, 'little'))
+        while True:
+            chunk = reader.read(self.STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            checksum = binascii.crc32(chunk, checksum)
+        reader.seek(start)
+        self._pending_payload = None
+        return dlen, checksum
+
     def lina_upload_file(self, file_name: str, reader: io.BufferedReader, bucket: str = "") -> bool:
         """
         Upload a file to LiNaStore.
@@ -364,35 +411,60 @@ class LiNaStoreClient:
             self.connect()
         
         try:
-            file_data = reader.read()
-            
-            # Encrypt data if session token is available
-            if self.session_token:
-                file_data = self.encrypt_with_token(self.session_token, file_data)
-                # Prepend token to encrypted data for server decryption
-                file_data = self.session_token.encode() + b'\x00' + file_data
-            
             flags = 0x80.to_bytes(1, 'little')
             identifier = self._build_identifier(file_name, bucket)
             if len(identifier) > self.LINA_NAME_MAX_LENGTH:
                 raise LiNaStoreProtocolError(f"File name too long: {len(identifier)} > {self.LINA_NAME_MAX_LENGTH}")
             ilen = len(identifier).to_bytes(1, 'little')
-            dlen = len(file_data).to_bytes(4, 'little')
-            checksum = binascii.crc32(ilen + identifier + dlen + file_data).to_bytes(4, 'little')
+
+            # Authenticated writes retain the legacy AES-GCM wire format:
+            # AES-GCM authenticates one complete ciphertext, so streaming it
+            # requires a separately versioned encrypted-frame protocol.
+            if self.session_token:
+                file_data = reader.read()
+                if not isinstance(file_data, bytes):
+                    raise LiNaStoreProtocolError("Upload reader must yield bytes")
+                file_data = self.encrypt_with_token(self.session_token, file_data)
+                file_data = self.session_token.encode() + b'\x00' + file_data
+                payload_len = len(file_data)
+                payload_checksum = None
+            else:
+                payload_len, payload_checksum = self._stream_plain_payload(reader, ilen, identifier)
+
+            dlen = payload_len.to_bytes(4, 'little')
+            if self.session_token:
+                checksum = binascii.crc32(ilen + identifier + dlen + file_data).to_bytes(4, 'little')
+            else:
+                checksum = payload_checksum.to_bytes(4, 'little')
             
             try:
-                self.socket.sendall(flags + ilen + identifier + dlen + checksum + file_data)
+                self.socket.sendall(flags + ilen + identifier + dlen + checksum)
+                if self.session_token:
+                    for offset in range(0, len(file_data), self.STREAM_CHUNK_SIZE):
+                        self.socket.sendall(file_data[offset:offset + self.STREAM_CHUNK_SIZE])
+                elif self._pending_payload is not None:
+                    for offset in range(0, len(self._pending_payload), self.STREAM_CHUNK_SIZE):
+                        self.socket.sendall(self._pending_payload[offset:offset + self.STREAM_CHUNK_SIZE])
+                else:
+                    while True:
+                        chunk = reader.read(self.STREAM_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        self.socket.sendall(chunk)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to send data for file {file_name}: {str(e)}")
 
             try:
-                header_len = self.LINA_HEADER_BASE_LENGTH + len(identifier)
-                resp = self._recv_all(header_len)
+                status, _, response_len, _ = self._read_response_header()
+                if response_len:
+                    self._recv_all(response_len)
             except socket.error as e:
                 raise LiNaStoreConnectionError(f"Failed to receive response for file {file_name}: {str(e)}")
 
-            if resp[0] != 0:
-                raise LiNaStoreProtocolError(f"Server returned error code: {resp[0]} for file: {file_name}")
+            if status == 6:
+                raise LiNaStoreOverloadedError(f"Server admission timed out for file: {file_name}")
+            if status != 0:
+                raise LiNaStoreProtocolError(f"Server returned error code: {status} for file: {file_name}")
 
             return True
         finally:

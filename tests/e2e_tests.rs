@@ -77,8 +77,16 @@ fn send_advanced_request(
     stream.set_read_timeout(Some(HTTP_REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(HTTP_REQUEST_TIMEOUT))?;
 
-    let request = build_lina_request(flags, identifier, data);
-    stream.write_all(&request)?;
+    let mut header = Vec::with_capacity(1 + 1 + identifier.len() + 4 + 4);
+    header.push(flags);
+    header.push(identifier.len() as u8);
+    header.extend_from_slice(identifier);
+    header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    header.extend_from_slice(&lina_checksum(identifier, data).to_le_bytes());
+    stream.write_all(&header)?;
+    for chunk in data.chunks(64 * 1024) {
+        stream.write_all(chunk)?;
+    }
 
     let mut status = [0u8; 1];
     stream.read_exact(&mut status)?;

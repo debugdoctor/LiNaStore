@@ -179,20 +179,40 @@ void LiNaClient::check_sendv(const std::vector<std::pair<const void *, size_t>> 
 
 void LiNaClient::check_recv(char *buf, size_t len, const char *context)
 {
-    ssize_t received = recv(sock, buf, len, 0);
-    if (received == -1)
-    {
-        std::ostringstream oss;
+    size_t received_total = 0;
+    while (received_total < len) {
+        ssize_t received = recv(sock, buf + received_total, len - received_total, 0);
+        if (received <= 0) {
+            std::ostringstream oss;
 #ifdef _WIN32
-        oss << "Winsock error: " << WSAGetLastError();
+            oss << "Winsock error: " << WSAGetLastError();
 #else
-        oss << "errno: " << errno;
+            oss << "errno: " << errno;
 #endif
-        throw LiNaClientException(std::string("Failed to recv ") + context + " - " + oss.str());
+            if (received == 0) {
+                throw LiNaClientException(std::string("Connection closed while receiving ") + context);
+            }
+            throw LiNaClientException(std::string("Failed to recv ") + context + " - " + oss.str());
+        }
+        received_total += static_cast<size_t>(received);
     }
-    else if (received == 0)
-    {
-        throw LiNaClientException(std::string("Connection closed while receiving ") + context);
+}
+
+void LiNaClient::send_all(const void *buf, size_t len, const char *context)
+{
+    size_t sent_total = 0;
+    while (sent_total < len) {
+        ssize_t sent = send(sock, static_cast<const char *>(buf) + sent_total, len - sent_total, 0);
+        if (sent <= 0) {
+            std::ostringstream oss;
+#ifdef _WIN32
+            oss << "Winsock error: " << WSAGetLastError();
+#else
+            oss << "errno: " << errno;
+#endif
+            throw LiNaClientException(std::string("Failed to send ") + context + " - " + oss.str());
+        }
+        sent_total += static_cast<size_t>(sent);
     }
 }
 
@@ -265,6 +285,16 @@ bool LiNaClient::connect()
         oss << "Failed to connect to server: " << error;
         throw LiNaClientException(oss.str());
     }
+
+#ifdef _WIN32
+    DWORD timeout_ms = 35000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+#else
+    struct timeval timeout = {35, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
 
     return true;
 }
@@ -347,27 +377,29 @@ bool LiNaClient::linaUploadFile(std::string name, std::vector<char> data, uint8_
 
     try
     {
-        // Pre-allocate send buffers (6 buffers needed)
-        std::vector<std::pair<const void *, size_t>> send_buffers;
-        send_buffers.reserve(6);
-        
-        send_buffers.push_back({&flags, 1});                          // flags
-        send_buffers.push_back({&ilen, 1});                           // ilen
-        send_buffers.push_back({identifier_ptr, ilen});               // identifier
-        send_buffers.push_back({dlen_buf, 4});                        // dlen
-        send_buffers.push_back({checksum_buf, 4});                    // checksum
-        send_buffers.push_back({payload_data.data(), payload_data.size()}); // data
+        send_all(&flags, 1, "upload header flag");
+        send_all(&ilen, 1, "upload header identifier length");
+        send_all(identifier_ptr, ilen, "upload header identifier");
+        send_all(dlen_buf, sizeof(dlen_buf), "upload header length");
+        send_all(checksum_buf, sizeof(checksum_buf), "upload header checksum");
+        for (size_t offset = 0; offset < payload_data.size(); offset += 64 * 1024) {
+            const size_t chunk_len = std::min<size_t>(64 * 1024, payload_data.size() - offset);
+            send_all(payload_data.data() + offset, chunk_len, "upload body");
+        }
 
-        check_sendv(send_buffers, "file upload data");
+        std::vector<char> response_prefix(2);
+        check_recv(response_prefix.data(), response_prefix.size(), "response prefix");
+        std::vector<char> response_tail(static_cast<uint8_t>(response_prefix[1]) + 8);
+        check_recv(response_tail.data(), response_tail.size(), "response header");
 
-        size_t header_len = LINA_HEADER_BASE_LENGTH + ilen;
-        std::vector<char> header_buf(header_len);
-        check_recv(header_buf.data(), header_buf.size(), "response header");
-
-        if (header_buf[0] != 0)
+        if (static_cast<uint8_t>(response_prefix[0]) != 0)
         {
             std::ostringstream oss;
-            oss << "Server returned error code: " << static_cast<int>(header_buf[0]) << " for file: " << name;
+            if (static_cast<uint8_t>(response_prefix[0]) == 6) {
+                oss << "Server admission timed out; retry the upload for file: " << name;
+            } else {
+                oss << "Server returned error code: " << static_cast<int>(response_prefix[0]) << " for file: " << name;
+            }
             throw LiNaClientException(oss.str());
         }
 

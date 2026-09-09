@@ -114,6 +114,7 @@ def main():
     body.append(label(435, 475, "PUT after admission: payload channel full -> send().await ->", TEAL, "middle", 10.5))
     body.append(label(435, 492, "frontend stops reading socket -> TCP backpressure pauses client", TEAL, "middle", 10.5))
     body.append(label(435, 509, "waiting requests never start their body; only 30s admission timeout -> 503", "#dc2626", "middle", 10.5))
+    body.append(label(435, 526, "Advanced auth PUT keeps legacy whole AES-GCM frame; unauthenticated PUT streams", "#7c3aed", "middle", 10.5))
 
     # ---- Legend ----
     body.append(label(1040, 500, "legend:", TEXT, "start", 10.5))

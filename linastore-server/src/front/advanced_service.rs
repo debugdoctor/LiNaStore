@@ -1,11 +1,13 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::{io, net::SocketAddr, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{Level, event, instrument};
 use uuid::Uuid;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const PAYLOAD_CHUNK_SIZE: usize = 64 * 1024;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::vars;
 use crate::{
@@ -14,7 +16,7 @@ use crate::{
         get_handshake_rate_limiter,
     },
     conveyer::{AdmissionError, ConveyQueue},
-    dtos::{Behavior, LiNaProtocol, Op, OrderRequest, Status},
+    dtos::{Behavior, LiNaProtocol, Op, OrderRequest, ResponseStream, Status},
     shutdown::Shutdown,
 };
 
@@ -62,11 +64,12 @@ impl ProtocolReadError {
 }
 
 impl LiNaProtocol {
-    async fn parse_protocol_message<T: AsyncReadExt + Unpin>(
+    /// Read the fixed Advanced request header. PUT bodies are intentionally
+    /// left on the socket until the request receives an admission permit.
+    async fn parse_protocol_header<T: AsyncReadExt + Unpin>(
         &mut self,
         stream: &mut T,
     ) -> Result<(), ProtocolReadError> {
-        // Get envars
         let envars = vars::EnvVar::get_instance();
 
         self.flags = match stream.read_u8().await {
@@ -119,40 +122,174 @@ impl LiNaProtocol {
             }
         };
 
-        let mut data_buf = BytesMut::with_capacity(0x10000);
+        Ok(())
+    }
 
-        // Read data payload for write operations and operations that might contain session tokens
-        if self.payload.dlen > 0 {
-            loop {
-                match tokio::time::timeout(READ_TIMEOUT, stream.read_buf(&mut data_buf)).await {
-                    Ok(Ok(n)) => {
-                        if n == 0 {
-                            return Err(ProtocolReadError::Disconnected);
-                        }
-                        if data_buf.len() >= self.payload.dlen as usize {
-                            break;
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        return Err(ProtocolReadError::from_io("Failed to read data", err));
-                    }
-                    Err(_) => {
-                        return Err(ProtocolReadError::Other(
-                            "Read operation timed out".to_string(),
-                        ));
-                    }
-                };
+    async fn read_protocol_body<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+    ) -> Result<(), ProtocolReadError> {
+        let mut data = vec![0u8; self.payload.dlen as usize];
+        if !data.is_empty() {
+            match tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut data)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(ProtocolReadError::from_io("Failed to read data", err)),
+                Err(_) => return Err(ProtocolReadError::Other("Read operation timed out".to_string())),
             }
-            self.payload.data = data_buf.freeze();
         }
+        self.payload.data = Bytes::from(data);
 
-        // Verify checksum for all operations
         if self.verify() {
             Ok(())
         } else {
             Err(ProtocolReadError::Other("Invalid checksum".to_string()))
         }
     }
+}
+
+fn split_identifier(identifier: &Bytes) -> (String, String) {
+    if let Some(null_pos) = identifier.iter().position(|&b| b == 0) {
+        let bucket = String::from_utf8_lossy(&identifier[..null_pos]).into_owned();
+        let key = String::from_utf8_lossy(&identifier[null_pos + 1..]).into_owned();
+        (bucket, key)
+    } else {
+        (
+            crate::mapper::DEFAULT_BUCKET.to_string(),
+            String::from_utf8_lossy(identifier).into_owned(),
+        )
+    }
+}
+
+async fn write_response_stream<T: AsyncWriteExt + Unpin>(stream: &mut T, res: ResponseStream) -> io::Result<()> {
+    let mut header = Vec::with_capacity(1 + 1 + res.identifier.len() + 8);
+    header.push(res.status as u8);
+    header.push(res.identifier.len() as u8);
+    header.extend_from_slice(&res.identifier);
+    header.extend_from_slice(&(res.data_len as u32).to_le_bytes());
+    header.extend_from_slice(&res.checksum.to_le_bytes());
+    stream.write_all(&header).await?;
+
+    let mut data = res.data;
+    while let Some(chunk) = data.recv().await {
+        stream.write_all(&chunk).await?;
+    }
+    Ok(())
+}
+
+async fn finish_response<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
+    log_id: &str,
+    uni_id: [u8; 16],
+    receiver: tokio::sync::oneshot::Receiver<ResponseStream>,
+    con_queue: &ConveyQueue,
+) {
+    match tokio::time::timeout(RESPONSE_TIMEOUT, receiver).await {
+        Ok(Ok(res)) => {
+            if let Err(e) = write_response_stream(stream, res).await {
+                event!(Level::ERROR, "[waitress {}] Error writing response: {}", log_id, e);
+            }
+        }
+        Ok(Err(_)) => {
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
+            write_error_response(stream, log_id, Status::InternalError, None).await;
+        }
+        Err(_) => {
+            con_queue.unregister_waiter(uni_id);
+            con_queue.remove_order(uni_id);
+            write_error_response(stream, log_id, Status::InternalError, None).await;
+        }
+    }
+}
+
+/// Stream an auth-free PUT after admission. The wire format remains unchanged:
+/// `header + body`; only the server's read timing changes. A legacy client can
+/// still send a single write, while updated clients write the body in chunks.
+async fn stream_plain_put<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut T,
+    message: LiNaProtocol,
+    log_id: &str,
+) -> bool {
+    let (bucket, key) = split_identifier(&message.payload.identifier);
+    let suggested = Uuid::new_v4().to_string();
+    let internal_name = match crate::mapper::get_mapper() {
+        Some(mapper) => mapper
+            .register(&bucket, &key, &suggested)
+            .await
+            .unwrap_or(suggested),
+        None => suggested,
+    };
+    let expected_len = message.payload.dlen as usize;
+    let (data_tx, integrity_tx, order) = OrderRequest::create_checked(
+        Behavior::PutFile,
+        message.flags,
+        Bytes::from(internal_name),
+        message.payload.dlen as u64,
+        true,
+    );
+    let uni_id = order.uni_id;
+    let con_queue = ConveyQueue::get_instance();
+    let receiver = match con_queue.register_waiter(uni_id).await {
+        Ok(receiver) => receiver,
+        Err(AdmissionError::TimedOut) => {
+            write_error_response(stream, log_id, Status::Overloaded, None).await;
+            return false;
+        }
+        Err(_) => {
+            write_error_response(stream, log_id, Status::InternalError, None).await;
+            return false;
+        }
+    };
+
+    if let Err(err) = con_queue.produce_order(order) {
+        event!(Level::ERROR, "[waitress {}] {}", log_id, err);
+        con_queue.unregister_waiter(uni_id);
+        write_error_response(stream, log_id, Status::InternalError, None).await;
+        return false;
+    }
+
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&[message.payload.ilen]);
+    crc.update(&message.payload.identifier);
+    crc.update(&message.payload.dlen.to_le_bytes());
+    let mut remaining = expected_len;
+    let mut stream_error = None;
+
+    while remaining > 0 {
+        let take = remaining.min(PAYLOAD_CHUNK_SIZE);
+        let mut chunk = vec![0u8; take];
+        match tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut chunk)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                stream_error = Some(ProtocolReadError::from_io("Failed to read streamed payload", err));
+                break;
+            }
+            Err(_) => {
+                stream_error = Some(ProtocolReadError::Other("Payload read timed out".to_string()));
+                break;
+            }
+        }
+
+        crc.update(&chunk);
+        if data_tx.send(Bytes::from(chunk)).await.is_err() {
+            stream_error = Some(ProtocolReadError::Other("Worker dropped payload stream".to_string()));
+            break;
+        }
+        con_queue.touch_waiter(uni_id);
+        remaining -= take;
+    }
+    drop(data_tx);
+
+    let complete = stream_error.is_none();
+    let integrity = match stream_error {
+        Some(ProtocolReadError::Disconnected) => Err("Client disconnected during upload".to_string()),
+        Some(ProtocolReadError::Other(message)) => Err(message),
+        None if crc.finalize() == message.payload.checksum => Ok(()),
+        None => Err("Invalid checksum".to_string()),
+    };
+    let _ = integrity_tx.send(integrity);
+    finish_response(stream, log_id, uni_id, receiver, &con_queue).await;
+    complete
 }
 
 // One waitress handles one incoming connection with multiple requests
@@ -169,7 +306,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
     // Loop to handle multiple requests on the same connection
     loop {
         let mut message = LiNaProtocol::new();
-        match message.parse_protocol_message(&mut stream).await {
+        match message.parse_protocol_header(&mut stream).await {
             Ok(()) => {}
             Err(ProtocolReadError::Disconnected) => {
                 event!(Level::INFO, "[waitress {}] Client disconnected", &log_id);
@@ -189,6 +326,29 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
         // Decode the operation once; downstream branches dispatch on this enum
         // instead of order-sensitive bitwise checks.
         let op = message.op();
+
+        // On the auth-free write path, admission happens before any payload
+        // bytes are read. A full payload channel applies TCP backpressure to
+        // both old single-write clients and new chunked clients.
+        if op == Op::Write && !auth_required {
+            if !stream_plain_put(&mut stream, message, &log_id).await {
+                return;
+            }
+            continue;
+        }
+
+        match message.read_protocol_body(&mut stream).await {
+            Ok(()) => {}
+            Err(ProtocolReadError::Disconnected) => {
+                event!(Level::INFO, "[waitress {}] Client disconnected", &log_id);
+                return;
+            }
+            Err(ProtocolReadError::Other(err)) => {
+                event!(Level::INFO, "[waitress {}] Invalid request body: {}", &log_id, err);
+                write_error_response(&mut stream, &log_id, Status::BadRequest, None).await;
+                return;
+            }
+        }
 
         // Handle authentication handshake request
         if op == Op::Auth {

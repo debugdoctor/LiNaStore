@@ -32,6 +32,8 @@ data/
 *.db
 .linaserver/
 *.o
+*.a
+*.so
 __pycache__/
 .tmp/
 

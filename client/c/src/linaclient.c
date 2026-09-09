@@ -31,6 +31,21 @@ static bool recv_all(SOCKET sock, void *buf, size_t len)
     return true;
 }
 
+static bool send_all(SOCKET sock, const void *buf, size_t len)
+{
+    size_t total = 0;
+    while (total < len)
+    {
+        ssize_t n = send(sock, (const char *)buf + total, len - total, 0);
+        if (n <= 0)
+        {
+            return false;
+        }
+        total += (size_t)n;
+    }
+    return true;
+}
+
 static bool aes256gcm_encrypt_with_token(
     const char *token,
     const uint8_t *plaintext,
@@ -222,12 +237,12 @@ bool _connect(LiNaClient *client)
     
     /* Set socket timeouts to avoid indefinite blocking */
     #ifdef _WIN32
-        DWORD timeout_ms = 5000; /* 5 seconds */
+        DWORD timeout_ms = 35000; /* Admission may wait up to 30 seconds. */
         setsockopt(client->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
         setsockopt(client->sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
     #else
         struct timeval tv;
-        tv.tv_sec = 5;
+        tv.tv_sec = 35;
         tv.tv_usec = 0;
         setsockopt(client->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(client->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -272,13 +287,12 @@ LiNaResult lina_upload_file(LiNaClient *client, char *name, char *data, size_t d
     uint8_t checksum_buf[4] = {0};
     uint8_t dlen_buf[4] = {0};
     char* header_buf = NULL;
-    int8_t sock_status = 0;
     uint8_t ilen = 0;
     uint8_t *encrypted = NULL;
     size_t encrypted_len = 0;
     uint8_t *payload = NULL;
     size_t payload_len = 0;
-    
+
     if (!client || !name || !data) {
         snprintf(msg, MAX_MSG_LEN, "Invalid parameters: client, name, or data is NULL");
         res.payload.message = msg;
@@ -369,54 +383,51 @@ LiNaResult lina_upload_file(LiNaClient *client, char *name, char *data, size_t d
         goto cleanup;
     }
 
-    // Calculate total header length: status(1) + ilen(1) + identifier(ilen) + dlen(4) + checksum(4)
-    size_t header_len = LINA_HEADER_BASE_LENGTH + ilen;
+    // The server returns its resolved identifier, whose length can differ from
+    // the user-facing name. Reserve the maximum header and parse its ilen.
+    size_t header_len = LINA_HEADER_BASE_LENGTH + 255;
     header_buf = (char* )malloc(header_len);
     if (!header_buf) {
         snprintf(msg, MAX_MSG_LEN, "Memory allocation failed for header buffer");
         goto cleanup;
     }
 
-    #ifdef _WIN32
-        WSABUF buffers[6] = {
-            { .len = 1, .buf = (char*)&flags },              // status
-            { .len = 1, .buf = (char*)&ilen },         // ilen
-            { .len = (DWORD)ilen, .buf = name_buf },    // identifier
-            { .len = 4, .buf = (char*)dlen_buf },              // dlen
-            { .len = 4, .buf = (char*)checksum_buf },          // checksum
-            { .len = (DWORD)payload_len, .buf = (char*)payload }            // data
-        };
-    #else
-        struct iovec buffers[6] = {
-            { .iov_len = 1, .iov_base = &flags },              // status
-            { .iov_len = 1, .iov_base = &ilen },         // ilen
-            { .iov_len = ilen, .iov_base = name_buf },      // identifier
-            { .iov_len = 4, .iov_base = dlen_buf },               // dlen
-            { .iov_len = 4, .iov_base = checksum_buf },          // checksum
-            { .iov_len = payload_len, .iov_base = payload }            // data
-        };
-    #endif
-
-    if((sock_status = check_sendv(client, buffers, 6)) <= 0) {
+    if (!send_all(client->sock, &flags, 1)
+        || !send_all(client->sock, &ilen, 1)
+        || !send_all(client->sock, name_buf, ilen)
+        || !send_all(client->sock, dlen_buf, sizeof(dlen_buf))
+        || !send_all(client->sock, checksum_buf, sizeof(checksum_buf))) {
         snprintf(msg, MAX_MSG_LEN, "Failed to send upload data");
         goto cleanup;
     }
-    
-    if((sock_status = recv(client->sock, header_buf, header_len, 0)) <= 0) {
-        if (sock_status == 0) {
-            snprintf(msg, MAX_MSG_LEN, "Connection closed while receiving response");
-        } else {
-            #ifdef _WIN32
-                snprintf(msg, MAX_MSG_LEN, "Winsock error: %d", WSAGetLastError());
-            #else
-                snprintf(msg, MAX_MSG_LEN, "errno: %d", errno);
-            #endif
+
+    // Body writes are intentionally bounded. A full server payload channel
+    // blocks this loop and lets TCP backpressure pause the caller.
+    for (size_t offset = 0; offset < payload_len; offset += 64 * 1024) {
+        size_t chunk_len = payload_len - offset;
+        if (chunk_len > 64 * 1024) chunk_len = 64 * 1024;
+        if (!send_all(client->sock, payload + offset, chunk_len)) {
+            snprintf(msg, MAX_MSG_LEN, "Failed to send upload body");
+            goto cleanup;
         }
+    }
+
+    if (!recv_all(client->sock, header_buf, 2)) {
+        snprintf(msg, MAX_MSG_LEN, "Connection closed while receiving response");
         goto cleanup;
     }
-    
+    size_t response_tail_len = (size_t)(uint8_t)header_buf[1] + 8;
+    if (!recv_all(client->sock, header_buf + 2, response_tail_len)) {
+        snprintf(msg, MAX_MSG_LEN, "Connection closed while receiving response header");
+        goto cleanup;
+    }
+
     if (header_buf[0] != 0) {
-        snprintf(msg, MAX_MSG_LEN, "Server returned error code: %d", header_buf[0]);
+        if ((uint8_t)header_buf[0] == 6) {
+            snprintf(msg, MAX_MSG_LEN, "Server admission timed out; retry the upload");
+        } else {
+            snprintf(msg, MAX_MSG_LEN, "Server returned error code: %d", (uint8_t)header_buf[0]);
+        }
         goto cleanup;
     }
     
@@ -450,7 +461,7 @@ LiNaResult lina_download_file(LiNaClient* client, char* name, const char* bucket
     uint32_t dlen = 0;
     uint8_t *payload = NULL;
     size_t payload_len = 0;
-    
+
     if (!client || !name) {
         snprintf(msg, MAX_MSG_LEN, "Invalid parameters: client or name is NULL");
         res.payload.message = msg;
@@ -549,7 +560,7 @@ LiNaResult lina_download_file(LiNaClient* client, char* name, const char* bucket
         snprintf(msg, MAX_MSG_LEN, "Failed to send download request");
         goto cleanup;
     }
-    
+
     // Receive header first
     if(!recv_all(client->sock, header_buf, header_len)) {
         snprintf(msg, MAX_MSG_LEN, "Connection closed while receiving response header");
@@ -573,14 +584,14 @@ LiNaResult lina_download_file(LiNaClient* client, char* name, const char* bucket
 
     dlen = (uint32_t)to_long(header_buf + dlen_offset, 4, true);
     uint32_t checksum_recv = (uint32_t)to_long(header_buf + dlen_offset + 4, 4, true);
-    
+
     // Allocate buffer for data
     data_recv = (char*)malloc(dlen + 1);  // +1 for null terminator
     if (!data_recv) {
         snprintf(msg, MAX_MSG_LEN, "Memory allocation failed for data buffer");
         goto cleanup;
     }
-    
+
     // Receive data
     if (dlen > 0 && !recv_all(client->sock, data_recv, dlen)) {
         snprintf(msg, MAX_MSG_LEN, "Connection closed while receiving data");
@@ -604,7 +615,7 @@ LiNaResult lina_download_file(LiNaClient* client, char* name, const char* bucket
         snprintf(msg, MAX_MSG_LEN, "Checksum verification failed (expected %u, got %u)", expected, checksum_recv);
         goto cleanup;
     }
-    
+
     res.status = true;
     res.payload.data = data_recv;
 
@@ -633,7 +644,7 @@ LiNaResult lina_delete_file(LiNaClient *client, char *name, const char* bucket)
     uint8_t *payload = NULL;
     size_t payload_len = 0;
     uint32_t dlen = 0;
-    
+
     if (!client || !name) {
         snprintf(msg, MAX_MSG_LEN, "Invalid parameters: client or name is NULL");
         res.payload.message = msg;
@@ -1197,7 +1208,7 @@ bool refresh_token_if_needed(LiNaClient* client, char* error_msg, size_t msg_len
         !(client->cached_username && client->cached_password)) {
         return true;
     }
-    
+
     if (is_token_expired(client)) {
         if (client->cached_username && client->cached_password) {
             // Use cached credentials to refresh

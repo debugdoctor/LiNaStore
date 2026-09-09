@@ -315,6 +315,7 @@ impl StoreManager {
         recv_timeout: Duration,
         compressed: bool,
         expected_len: Option<u64>,
+        integrity: Option<oneshot::Receiver<Result<(), String>>>,
     ) -> Result<(), BoxError> {
         if file_name.is_empty() {
             return Err(boxed_io_error(io::ErrorKind::Other, "No filename provided"));
@@ -362,6 +363,26 @@ impl StoreManager {
                     io::ErrorKind::Other,
                     format!("payload size mismatch: expected {} bytes, got {}", expected, total),
                 ));
+            }
+        }
+
+        // Streaming protocol frontends only know their final wire checksum at
+        // EOF. Do not dedup or make an object visible until they confirm it.
+        if let Some(integrity) = integrity {
+            match tokio::time::timeout(recv_timeout, integrity).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(message))) => {
+                    Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+                    return Err(boxed_io_error(io::ErrorKind::InvalidData, message));
+                }
+                Ok(Err(_)) => {
+                    Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+                    return Err(boxed_io_error(io::ErrorKind::InvalidData, "payload integrity result dropped"));
+                }
+                Err(_) => {
+                    Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+                    return Err(boxed_io_error(io::ErrorKind::TimedOut, "payload integrity check stalled"));
+                }
             }
         }
 
@@ -1348,7 +1369,7 @@ mod tests {
                     tx.send(Bytes::copy_from_slice(c)).await.expect("send chunk");
                 }
             });
-            sm.put_stream(name, rx, Duration::from_secs(5), compressed, Some(data.len() as u64))
+            sm.put_stream(name, rx, Duration::from_secs(5), compressed, Some(data.len() as u64), None)
                 .await
                 .expect("put_stream");
             sender.await.expect("sender");
@@ -1367,7 +1388,7 @@ mod tests {
         drop(tx);
 
         let err = sm
-            .put_stream("trunc.bin", rx, Duration::from_secs(5), false, Some(100))
+            .put_stream("trunc.bin", rx, Duration::from_secs(5), false, Some(100), None)
             .await
             .expect_err("should reject truncated stream");
         assert!(err.to_string().contains("size mismatch"), "err: {}", err);
@@ -1387,7 +1408,7 @@ mod tests {
                 tx.send(Bytes::copy_from_slice(c)).await.expect("send");
             }
         });
-        if let Err(e) = sm.put_stream("big.bin", rx, Duration::from_secs(5), false, Some(big.len() as u64)).await {
+        if let Err(e) = sm.put_stream("big.bin", rx, Duration::from_secs(5), false, Some(big.len() as u64), None).await {
             panic!("put big failed: {}", e);
         }
         sender.await.expect("sender");
@@ -1401,7 +1422,7 @@ mod tests {
                 tx.send(Bytes::copy_from_slice(c)).await.expect("send");
             }
         });
-        sm.put_stream("big2.bin", rx, Duration::from_secs(5), false, Some(big.len() as u64))
+        sm.put_stream("big2.bin", rx, Duration::from_secs(5), false, Some(big.len() as u64), None)
             .await
             .expect("put big2");
         sender.await.expect("sender");

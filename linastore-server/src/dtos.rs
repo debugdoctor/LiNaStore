@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 /// Sentinel for unknown payload length (e.g. no Content-Length header).
@@ -195,6 +195,9 @@ pub struct OrderRequest {
     /// Receiver half for the streamed payload. Dropping it signals the frontend
     /// to abort streaming; normal admission never evicts an accepted order.
     pub payload: mpsc::Receiver<Bytes>,
+    /// Protocols that validate a wire checksum incrementally confirm the result
+    /// after EOF. Storage waits for it before making the object visible.
+    pub payload_integrity: Option<oneshot::Receiver<Result<(), String>>>,
 }
 
 impl OrderRequest {
@@ -215,8 +218,33 @@ impl OrderRequest {
             data_len,
             need_response_checksum,
             payload,
+            payload_integrity: None,
         };
         (payload_tx, order)
+    }
+
+    /// Build an order whose sender must confirm payload integrity at EOF.
+    pub fn create_checked(
+        behavior: Behavior,
+        flags: u8,
+        identifier: Bytes,
+        data_len: u64,
+        need_response_checksum: bool,
+    ) -> (
+        mpsc::Sender<Bytes>,
+        oneshot::Sender<Result<(), String>>,
+        Self,
+    ) {
+        let (payload_tx, mut order) = Self::create(
+            behavior,
+            flags,
+            identifier,
+            data_len,
+            need_response_checksum,
+        );
+        let (integrity_tx, integrity) = oneshot::channel();
+        order.payload_integrity = Some(integrity);
+        (payload_tx, integrity_tx, order)
     }
 }
 

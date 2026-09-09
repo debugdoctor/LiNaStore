@@ -10,7 +10,7 @@
 
 - **元数据（SQLite）单线程**：所有 DB 访问经 `sql queue`（`DbExecutor` actor）串行消费，多步元数据操作天然原子。
 - **对象文件 IO 并行**：blob 读写删走系统调用，应用层无锁。
-- **流式进出、不整块缓冲**：HTTP/S3 请求只放 meta，实体经有界通道流式进出；上传按大小走内存或临时文件，读取逐块解压 + 增量校验。Advanced 的现有定长帧协议仍需先读完整帧以校验 CRC，因此不享有同样的网络级 PUT 背压。
+- **流式进出、不整块缓冲**：HTTP/S3 和 Advanced 未认证 PUT 只放 meta，实体经有界通道流式进出；上传按大小走内存或临时文件，读取逐块解压 + 增量校验。Advanced 认证 PUT 继续兼容旧的整体 AES-GCM 帧格式，因此仍需暂存密文。
 - **在途与活跃解耦**：请求在等网络/流式/DB 时只占在途配额（io wait），不占活跃 worker 槽。
 - **满载时等待而不是中途拒绝**：in-flight 满时，请求在 admission 阶段等待 permit；PUT body 尚未开始读取，客户端会被 TCP/HTTP 背压暂停。只有等待超过 30 秒才返回 503。
 
@@ -44,7 +44,7 @@ chunk 流 ──► 已知长度 ≤4MB？──► 内存缓冲（避免临时�
 
 - `StoreManager::open_read`：逐块解压 + 增量 BLAKE3 校验（EOF 校验失败即拒绝）。
 - HTTP/S3：单遍真流式，Content-Length 来自元数据 size，`StreamBody` 写 socket。
-- Advanced（LiNa 协议）：请求侧当前先解析完整帧；响应头带 CRC32，先流式预扫算 CRC + 校验，再流式发数据。读全程不占活跃槽（只有预扫占）。
+- Advanced（LiNa 协议）：未认证 PUT 先解析 header，再等待 admission，随后按 64KB 流式读 body 并增量校验 CRC；认证 PUT 仍先读完整兼容帧。响应头带 CRC32，先流式预扫算 CRC + 校验，再流式发数据。读全程不占活跃槽（只有预扫占）。
 
 ## 关键组件
 

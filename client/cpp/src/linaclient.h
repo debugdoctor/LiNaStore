@@ -6,6 +6,7 @@
     #include <ws2tcpip.h>
 #else
     #include <sys/socket.h>
+    #include <sys/time.h>
     #include <cstring>
     #include <netinet/in.h>
     #include <unistd.h>
@@ -73,6 +74,7 @@ public:
 private:
     bool connect();
     bool disconnect();
+    void send_all(const void* buf, size_t len, const char* context);
 
     SOCKET sock;
     struct sockaddr_in server_addr;

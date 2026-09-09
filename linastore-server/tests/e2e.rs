@@ -2,10 +2,12 @@
 //! `TempDir` (auto-cleaned) and bodies stay in memory, so the suite doesn't
 //! litter the disk with big fixture files.
 
-use std::io::Read;
+use crc32fast::Hasher as Crc32Hasher;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -49,6 +51,7 @@ struct ServerGuard {
     _dir: TempDir,
     root: PathBuf,
     http_port: u16,
+    advanced_port: u16,
     s3_port: u16,
 }
 
@@ -94,6 +97,7 @@ impl ServerGuard {
             _dir: dir,
             root,
             http_port,
+            advanced_port,
             s3_port,
         }
     }
@@ -110,6 +114,58 @@ impl ServerGuard {
     fn orphan_blob_count(&self) -> usize {
         count_blobs(&self.root.join("linadata"))
     }
+}
+
+fn advanced_checksum(identifier: &[u8], data: &[u8]) -> u32 {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&[identifier.len() as u8]);
+    hasher.update(identifier);
+    hasher.update(&(data.len() as u32).to_le_bytes());
+    hasher.update(data);
+    hasher.finalize()
+}
+
+fn advanced_chunked_put(server: &ServerGuard, identifier: &[u8], data: &[u8]) -> u8 {
+    advanced_chunked_put_on_port(server.advanced_port, identifier, data)
+}
+
+fn advanced_chunked_put_on_port(port: u16, identifier: &[u8], data: &[u8]) -> u8 {
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = TcpStream::connect(addr).expect("connect to Advanced service");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("set Advanced read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .expect("set Advanced write timeout");
+
+    let mut header = Vec::with_capacity(10 + identifier.len());
+    header.push(0x80); // Write
+    header.push(identifier.len() as u8);
+    header.extend_from_slice(identifier);
+    header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    header.extend_from_slice(&advanced_checksum(identifier, data).to_le_bytes());
+    stream.write_all(&header).expect("write Advanced header");
+
+    for chunk in data.chunks(64 * 1024) {
+        stream.write_all(chunk).expect("write Advanced body chunk");
+    }
+
+    let mut response_prefix = [0u8; 2];
+    stream
+        .read_exact(&mut response_prefix)
+        .expect("read Advanced response prefix");
+    let response_ilen = response_prefix[1] as usize;
+    let mut response_tail = vec![0u8; response_ilen + 8];
+    stream
+        .read_exact(&mut response_tail)
+        .expect("read Advanced response header");
+    let response_dlen = u32::from_le_bytes(response_tail[response_ilen..response_ilen + 4].try_into().unwrap()) as usize;
+    let mut response_data = vec![0u8; response_dlen];
+    stream
+        .read_exact(&mut response_data)
+        .expect("read Advanced response body");
+    response_prefix[0]
 }
 
 impl Drop for ServerGuard {
@@ -328,6 +384,105 @@ fn basic_put_get_head_delete() {
     assert_eq!(client.get(&url).send().unwrap().status(), StatusCode::NOT_FOUND);
 
     assert_eq!(server.orphan_blob_count(), 0);
+}
+
+#[test]
+#[serial]
+fn advanced_chunked_put_roundtrip() {
+    let server = ServerGuard::start();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("client");
+    let key = "chunked.bin";
+    let data: Vec<u8> = (0..(192 * 1024 + 17))
+        .map(|index| (index as u8).wrapping_mul(31))
+        .collect();
+    let identifier = format!("e2e\0{key}");
+
+    assert_eq!(
+        advanced_chunked_put(&server, identifier.as_bytes(), &data),
+        0,
+        "Advanced chunked PUT failed"
+    );
+
+    let response = client.get(server.s3("e2e", key)).send().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().unwrap().to_vec(), data);
+}
+
+#[test]
+#[serial]
+fn advanced_three_32mib_puts_with_duplicate_content() {
+    let total_started = Instant::now();
+    let server = ServerGuard::start();
+    let startup_elapsed = total_started.elapsed();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("client");
+    const SIZE: usize = 32 * 1024 * 1024;
+
+    let first = Arc::new(
+        (0..SIZE)
+            .map(|index| (index as u8).wrapping_mul(17))
+            .collect::<Vec<_>>(),
+    );
+    let second = Arc::clone(&first);
+    let third = Arc::new(
+        (0..SIZE)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(1))
+            .collect::<Vec<_>>(),
+    );
+    let expected = [
+        ("duplicate-a.bin", Arc::clone(&first)),
+        ("duplicate-b.bin", Arc::clone(&second)),
+        ("distinct.bin", Arc::clone(&third)),
+    ];
+    let uploads = [
+        ("duplicate-a.bin", first),
+        ("duplicate-b.bin", second),
+        ("distinct.bin", third),
+    ];
+    let port = server.advanced_port;
+    let upload_started = Instant::now();
+
+    std::thread::scope(|scope| {
+        let handles = uploads.into_iter().map(|(key, data)| {
+            let identifier = format!("e2e\0{key}");
+            scope.spawn(move || {
+                let status = advanced_chunked_put_on_port(port, identifier.as_bytes(), &data);
+                (key, status, data)
+            })
+        });
+
+        for handle in handles {
+            let (key, status, _) = handle.join().expect("Advanced upload thread panicked");
+            assert_eq!(status, 0, "Advanced upload failed for {key}");
+        }
+    });
+    let upload_elapsed = upload_started.elapsed();
+
+    let read_started = Instant::now();
+    for (key, data) in expected {
+        let response = client.get(server.s3("e2e", key)).send().unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET failed for {key}");
+        assert_eq!(
+            response.bytes().unwrap().as_ref(),
+            data.as_slice(),
+            "content mismatch for {key}"
+        );
+    }
+    let read_elapsed = read_started.elapsed();
+    assert_eq!(
+        server.orphan_blob_count(),
+        2,
+        "duplicate uploads should occupy two physical blobs"
+    );
+    println!(
+        "3x32MiB Advanced E2E: startup={startup_elapsed:?}, uploads={upload_elapsed:?}, reads={read_elapsed:?}, total={:?}",
+        total_started.elapsed()
+    );
 }
 
 #[test]

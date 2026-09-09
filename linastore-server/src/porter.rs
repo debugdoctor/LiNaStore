@@ -187,7 +187,14 @@ async fn process_order(
                 Some(req.data_len)
             };
             let status = match store_manager
-                .put_stream(&identifier, req.payload, PAYLOAD_RECV_TIMEOUT, should_compress, expected)
+                .put_stream(
+                    &identifier,
+                    req.payload,
+                    PAYLOAD_RECV_TIMEOUT,
+                    should_compress,
+                    expected,
+                    req.payload_integrity,
+                )
                 .await
             {
                 Ok(_) => Status::Success,

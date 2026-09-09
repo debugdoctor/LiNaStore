@@ -22,6 +22,8 @@ public class LiNaStoreClient {
     private final int timeout;
     private final static int LINA_NAME_MAX_LENGTH = 255;
     private final static int LINA_HEADER_BASE_LENGTH = 10; // flags(1) + ilen(1) + dlen(4) + checksum(4)
+    private final static int STREAM_CHUNK_SIZE = 64 * 1024;
+    private final static int ADMISSION_TIMEOUT_MS = 35_000;
     private String sessionToken = null;
     private long tokenExpiresAt = 0;
     
@@ -119,7 +121,7 @@ public class LiNaStoreClient {
         try {
             socket = new Socket();
             socket.connect(address, timeout);
-            socket.setSoTimeout(timeout);
+            socket.setSoTimeout(Math.max(timeout, ADMISSION_TIMEOUT_MS));
         } catch (IOException e) {
             throw new LiNaStoreConnectionException("Failed to connect to server at " + address.toString(), e);
         }
@@ -325,12 +327,18 @@ public class LiNaStoreClient {
 
             // Send all parts
             try {
+                // Header first: the server can wait for admission before it
+                // consumes payload bytes. Chunked writes then honor TCP
+                // backpressure from its bounded payload channel.
                 os.write(flagByte);
                 os.write(ilen);
                 os.write(identifier);
                 os.write(dlenBuffer);
                 os.write(checksumBuffer);
-                os.write(payloadData);
+                for (int offset = 0; offset < payloadData.length; offset += STREAM_CHUNK_SIZE) {
+                    int chunkLength = Math.min(STREAM_CHUNK_SIZE, payloadData.length - offset);
+                    os.write(payloadData, offset, chunkLength);
+                }
                 os.flush();
             } catch (IOException e){
                 throw new LiNaStoreConnectionException("Failed to send data for file: " + fileName, e);
@@ -338,19 +346,30 @@ public class LiNaStoreClient {
 
             // Read response
             try {
-                int headerLen = LINA_HEADER_BASE_LENGTH + ilen;
-                byte[] response = new byte[headerLen];
+                byte[] responsePrefix = new byte[2];
                 int totalRead = 0;
-                while (totalRead < headerLen) {
-                    int bytesRead = is.read(response, totalRead, headerLen - totalRead);
+                while (totalRead < responsePrefix.length) {
+                    int bytesRead = is.read(responsePrefix, totalRead, responsePrefix.length - totalRead);
                     if (bytesRead == -1) {
                         throw new LiNaStoreConnectionException("Connection closed while reading response for file: " + fileName);
                     }
                     totalRead += bytesRead;
                 }
+                byte[] responseTail = new byte[(responsePrefix[1] & 0xFF) + 8];
+                totalRead = 0;
+                while (totalRead < responseTail.length) {
+                    int bytesRead = is.read(responseTail, totalRead, responseTail.length - totalRead);
+                    if (bytesRead == -1) {
+                        throw new LiNaStoreConnectionException("Connection closed while reading response header for file: " + fileName);
+                    }
+                    totalRead += bytesRead;
+                }
                 
-                if (response[0] != 0) {
-                    throw new LiNaStoreProtocolException("Server returned error: " + response[0] + " for file: " + fileName);
+                if ((responsePrefix[0] & 0xFF) == 6) {
+                    throw new LiNaStoreProtocolException("Server admission timed out; retry the upload");
+                }
+                if (responsePrefix[0] != 0) {
+                    throw new LiNaStoreProtocolException("Server returned error: " + responsePrefix[0] + " for file: " + fileName);
                 }
                 return true;
             } catch (IOException e){
