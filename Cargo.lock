@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "linabase"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "linafs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "clap",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "linastore-server"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "argon2",

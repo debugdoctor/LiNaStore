@@ -114,10 +114,6 @@ package_for_platform() {
     echo "Building server component..."
     cargo build --release --target "${target}" -p linastore-server
     
-    # Build binary component (linafs CLI)
-    echo "Building binary component..."
-    cargo build --release --target "${target}" -p linafs
-    
     # Determine file extensions
     local ext=""
     if [[ "${platform_name}" == *"windows"* ]]; then
@@ -128,13 +124,18 @@ package_for_platform() {
     local server_output="${PROJECT_NAME}-server-${platform_name}${ext}"
     cp "target/${target}/release/linastore-server${ext}" "${BUILD_DIR}/${server_output}" 2>/dev/null || \
     cp "target/${target}/release/main${ext}" "${BUILD_DIR}/${server_output}" 2>/dev/null
-    
-    # Copy binary component
-    local bin_output="${PROJECT_NAME}-bin-${platform_name}${ext}"
-    cp "target/${target}/release/linafs${ext}" "${BUILD_DIR}/${bin_output}" 2>/dev/null
-    
     echo "Created ${BUILD_DIR}/${server_output}"
-    echo "Created ${BUILD_DIR}/${bin_output}"
+    
+    # Build binary component (linafs CLI). fuser is Unix-only: its build script
+    # probes for libfuse on other targets and panics, so skip it there.
+    if [[ "${platform_name}" != *"windows"* ]]; then
+        echo "Building binary component..."
+        cargo build --release --target "${target}" -p linafs
+        
+        local bin_output="${PROJECT_NAME}-bin-${platform_name}${ext}"
+        cp "target/${target}/release/linafs${ext}" "${BUILD_DIR}/${bin_output}" 2>/dev/null
+        echo "Created ${BUILD_DIR}/${bin_output}"
+    fi
 }
 
 # Package for all platforms
