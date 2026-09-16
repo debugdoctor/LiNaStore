@@ -36,6 +36,7 @@ data/
 *.so
 __pycache__/
 .tmp/
+*.pid
 
 # Allow migration SQL files
 !src/db/migrations/sqlite/*.sql
