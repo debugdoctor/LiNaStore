@@ -9,8 +9,8 @@ use crate::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, body::Frame, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{Level, event, instrument};
 use uuid::Uuid;
@@ -102,20 +102,11 @@ async fn handle_http(
 
     let log_id = Uuid::new_v4().to_string();
 
-    // GET has no body: close the payload channel, only meta enters the queue.
-    let (data_tx, order) = OrderRequest::create(
-        Behavior::GetFile,
-        0,
-        Bytes::copy_from_slice(file_identifier.as_bytes()),
-        0,
-        false,
-    );
-    drop(data_tx);
-    let uni_id = order.uni_id;
-
     let con_queue = ConveyQueue::get_instance();
-    let receiver = match con_queue.register_waiter(uni_id).await {
-        Ok(rx) => rx,
+    // Hold the in-flight permit for the whole request; it is released when this
+    // function returns (success, timeout, or disconnect).
+    let _permit = match con_queue.acquire_permit().await {
+        Ok(permit) => permit,
         Err(AdmissionError::TimedOut) => {
             event!(Level::WARN, "Admission wait timed out");
             return Ok(Response::builder()
@@ -129,16 +120,27 @@ async fn handle_http(
         }
     };
 
-    if let Err(e) = con_queue.produce_order(order) {
+    // GET has no body: close the payload channel, only meta enters the queue.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let (data_tx, order) = OrderRequest::create(
+        Behavior::GetFile,
+        0,
+        Bytes::copy_from_slice(file_identifier.as_bytes()),
+        0,
+        false,
+        reply_tx,
+    );
+    drop(data_tx);
+
+    if let Err(e) = con_queue.produce_order(order).await {
         event!(Level::ERROR, "Failed to produce order: {}", e);
-        con_queue.unregister_waiter(uni_id);
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
             .body(boxed_full(Bytes::from("Failed to process request")))?);
     }
 
     let timeout = Duration::from_secs(10);
-    match tokio::time::timeout(timeout, receiver).await {
+    match tokio::time::timeout(timeout, reply_rx).await {
         Ok(Ok(res)) => {
             let content_type = get_mime_type(&String::from_utf8_lossy(&res.identifier).to_string());
             Ok(Response::builder()
@@ -155,16 +157,12 @@ async fn handle_http(
                 "[waitress {}] Channel closed unexpectedly",
                 &log_id
             );
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
             Ok(Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(boxed_full(Bytes::from("Channel closed unexpectedly")))?)
         }
         Err(_) => {
             event!(Level::ERROR, "[waitress {}] Timeout exceeded", &log_id);
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
             Ok(Response::builder()
                 .status(hyper::StatusCode::REQUEST_TIMEOUT)
                 .body(boxed_full(Bytes::from("Request timeout")))?)
@@ -176,10 +174,10 @@ async fn handle_http(
 pub async fn run_http_server(addr: &str) {
     event!(Level::INFO, "Self service starting");
 
-    let listener = match TcpListener::bind(addr).await {
+    let listener = match super::net::bind_listener(addr) {
         Ok(listener) => listener,
-        Err(_) => {
-            event!(Level::ERROR, "Failed to bind to address {}", addr);
+        Err(e) => {
+            event!(Level::ERROR, "Failed to bind to address {}: {}", addr, e);
             return;
         }
     };
@@ -200,10 +198,13 @@ pub async fn run_http_server(addr: &str) {
                     }
                 };
 
+                super::net::tune_stream(&stream);
                 let io = TokioIo::new(stream);
 
                 tokio::task::spawn(async move {
                     if let Err(err) = http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(super::net::HEADER_READ_TIMEOUT)
                         .serve_connection(io, service_fn(handle_http))
                         .await
                     {

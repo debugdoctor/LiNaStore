@@ -1,44 +1,20 @@
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, oneshot};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::dtos::{OrderRequest, ResponseStream, in_flight_limit};
 
-// Orders are meta-only. The in-flight permit is acquired before an order is
-// enqueued, so the queue cannot grow independently of the admission limit.
-const ORDER_QUEUE_CAPACITY: usize = 128;
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
-const WAITERS_TTL: Duration = Duration::from_secs(120);
-const WAITERS_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
     TimedOut,
-    Duplicate,
     Closed,
 }
 
-struct WaiterEntry {
-    sender: oneshot::Sender<ResponseStream>,
-    created_at: Instant,
-    // In-flight permit; released when the entry is removed (response sent or waiter
-    // cleaned up). Bounds how many requests may be open at once.
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-/// Meta-only conveyer: the queue carries request metadata plus the receiver
-/// half of a bounded payload channel; bodies are streamed by workers only.
-/// Registers an in-flight permit per waiter. When the permit pool is exhausted,
-/// admission waits for an in-flight permit before the frontend starts reading
-/// a request body. This lets HTTP/TCP backpressure pause a client rather than
-/// rejecting a PUT after its body has started.
 pub struct ConveyQueue {
-    order_queue: Arc<Mutex<VecDeque<OrderRequest>>>,
-    // uni_id -> response channel sender
-    waiters: Arc<Mutex<HashMap<[u8; 16], WaiterEntry>>>,
-    // Notifies when new orders are available
-    order_notifier: tokio::sync::watch::Sender<usize>,
+    orders: mpsc::Sender<OrderRequest>,
+    pending: Mutex<Option<mpsc::Receiver<OrderRequest>>>,
     in_flight: Arc<Semaphore>,
 }
 
@@ -52,190 +28,43 @@ impl ConveyQueue {
     pub fn get_instance() -> Arc<ConveyQueue> {
         INSTANCE
             .get_or_init(|| {
-                let (order_notifier, _) = tokio::sync::watch::channel(0usize);
-                let instance = Arc::new(ConveyQueue {
-                    order_queue: Arc::new(Mutex::new(VecDeque::new())),
-                    waiters: Arc::new(Mutex::new(HashMap::new())),
-                    order_notifier,
+                let capacity = in_flight_limit().max(1);
+                let (orders, pending) = mpsc::channel(capacity);
+                Arc::new(ConveyQueue {
+                    orders,
+                    pending: Mutex::new(Some(pending)),
                     in_flight: Arc::new(Semaphore::new(in_flight_limit())),
-                });
-                Self::start_waiter_cleanup_task(&instance);
-                instance
+                })
             })
             .clone()
     }
 
-    pub fn produce_order(&self, order: OrderRequest) -> Result<(), String> {
-        let queue_len = {
-            let mut queue = self
-                .order_queue
-                .lock()
-                .map_err(|_| "Failed to lock order queue".to_string())?;
-
-            if queue.len() >= ORDER_QUEUE_CAPACITY {
-                // Never evict an order: its frontend may already be streaming
-                // the body and eviction would turn load shedding into a
-                // mid-upload failure. Admission normally makes this unreachable.
-                return Err("Order queue is full".to_string());
-            }
-
-            queue.push_back(order);
-            queue.len()
-        };
-
-        let _ = self.order_notifier.send(queue_len);
-
-        Ok(())
+    pub fn take_orders(&self) -> Option<mpsc::Receiver<OrderRequest>> {
+        self.pending.lock().ok().and_then(|mut pending| pending.take())
     }
 
-    /// Get a receiver for order notifications
-    pub fn subscribe_orders(&self) -> tokio::sync::watch::Receiver<usize> {
-        self.order_notifier.subscribe()
-    }
-
-    pub fn consume_order(&self) -> Result<Option<OrderRequest>, String> {
-        let mut guard = self
-            .order_queue
-            .lock()
-            .map_err(|_| "Failed to lock order queue".to_string())?;
-
-        if guard.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(guard.pop_front())
-    }
-
-    pub fn produce_service(&self, res: ResponseStream) -> Result<(), String> {
-        let uni_id = res.uni_id;
-
-        let mut waiters = self
-            .waiters
-            .lock()
-            .map_err(|_| "Failed to lock waiter registry".to_string())?;
-        if let Some(entry) = waiters.remove(&uni_id) {
-            let _ = entry.sender.send(res);
-            return Ok(());
-        }
-
-        Err("No waiter registered for this response".to_string())
-    }
-
-    /// Register a response channel for `uni_id`, waiting for admission when
-    /// all in-flight permits are occupied. The caller should not consume a
-    /// request body until this future resolves successfully.
-    pub async fn register_waiter(
-        &self,
-        uni_id: [u8; 16],
-    ) -> Result<oneshot::Receiver<ResponseStream>, AdmissionError> {
-        if self
-            .waiters
-            .lock()
-            .map_err(|_| AdmissionError::Closed)?
-            .contains_key(&uni_id)
+    pub async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, AdmissionError> {
+        match tokio::time::timeout(ADMISSION_TIMEOUT, self.in_flight.clone().acquire_owned()).await
         {
-            return Err(AdmissionError::Duplicate);
-        }
-
-        let permit = match tokio::time::timeout(
-            ADMISSION_TIMEOUT,
-            self.in_flight.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(AdmissionError::Closed),
-            Err(_) => return Err(AdmissionError::TimedOut),
-        };
-
-        let (sender, receiver) = oneshot::channel();
-        let mut waiters = self
-            .waiters
-            .lock()
-            .map_err(|_| AdmissionError::Closed)?;
-
-        if waiters.contains_key(&uni_id) {
-            drop(permit);
-            return Err(AdmissionError::Duplicate);
-        }
-
-        waiters.insert(
-            uni_id,
-            WaiterEntry {
-                sender,
-                created_at: Instant::now(),
-                _permit: permit,
-            },
-        );
-        Ok(receiver)
-    }
-
-    /// Refresh an active request's cleanup deadline while its body is flowing.
-    pub fn touch_waiter(&self, uni_id: [u8; 16]) {
-        if let Ok(mut waiters) = self.waiters.lock() {
-            if let Some(entry) = waiters.get_mut(&uni_id) {
-                entry.created_at = Instant::now();
-            }
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(AdmissionError::Closed),
+            Err(_) => Err(AdmissionError::TimedOut),
         }
     }
 
-    pub fn unregister_waiter(&self, uni_id: [u8; 16]) {
-        if let Ok(mut waiters) = self.waiters.lock() {
-            waiters.remove(&uni_id);
-        }
-    }
-
-    pub fn remove_order(&self, uni_id: [u8; 16]) -> bool {
-        if let Ok(mut guard) = self.order_queue.lock() {
-            let before = guard.len();
-            guard.retain(|order| order.uni_id != uni_id);
-            return guard.len() != before;
-        }
-        false
-    }
-
-    fn start_waiter_cleanup_task(this: &Arc<ConveyQueue>) {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle,
-            Err(_) => return,
-        };
-
-        let weak = Arc::downgrade(this);
-        handle.spawn(async move {
-            let mut ticker = tokio::time::interval(WAITERS_CLEANUP_INTERVAL);
-            loop {
-                ticker.tick().await;
-                let Some(queue) = weak.upgrade() else {
-                    break;
-                };
-                queue.cleanup_expired_waiters().await;
-            }
-        });
-    }
-
-    async fn cleanup_expired_waiters(&self) {
-        let now = Instant::now();
-        let mut expired: Vec<[u8; 16]> = Vec::new();
-
-        {
-            let mut waiters = match self.waiters.lock() {
-                Ok(waiters) => waiters,
-                Err(_) => return,
-            };
-            waiters.retain(|uni_id, entry| {
-                let is_expired = now.duration_since(entry.created_at) > WAITERS_TTL;
-                if is_expired {
-                    expired.push(*uni_id);
-                }
-                !is_expired
-            });
-        }
-
-        for uni_id in expired {
-            let _ = self.remove_order(uni_id);
-        }
+    pub async fn produce_order(&self, order: OrderRequest) -> Result<(), String> {
+        self.orders
+            .send(order)
+            .await
+            .map_err(|_| "Order queue closed".to_string())
     }
 }
 
-#[cfg(test)]
-mod tests {}
+pub fn send_response(
+    reply: tokio::sync::oneshot::Sender<ResponseStream>,
+    res: ResponseStream,
+) -> Result<(), String> {
+    reply
+        .send(res)
+        .map_err(|_| "Frontend dropped the response channel".to_string())
+}

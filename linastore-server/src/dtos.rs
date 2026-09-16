@@ -1,6 +1,5 @@
 use bytes::{Bytes, BytesMut};
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
 /// Sentinel for unknown payload length (e.g. no Content-Length header).
 pub const PAYLOAD_UNKNOWN_LEN: u64 = u64::MAX;
@@ -8,13 +7,13 @@ pub const PAYLOAD_UNKNOWN_LEN: u64 = u64::MAX;
 /// Bounded streaming-channel depth (slots), shared by the request payload and
 /// the response channels. Larger depth = more chunks buffered in flight (higher
 /// throughput, weaker backpressure); smaller = tighter backpressure. Tune via
-/// `LINASTORE_CHANNEL_DEPTH` (default 64). Memory per channel ~= depth * chunk
+/// `LINASTORE_CHANNEL_DEPTH` (default 16). Memory per channel ~= depth * chunk
 /// size, so keep an eye on it when raising the depth.
 pub fn channel_depth() -> usize {
     std::env::var("LINASTORE_CHANNEL_DEPTH")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(16)
         .max(1)
 }
 
@@ -33,14 +32,16 @@ pub fn active_limit() -> usize {
         .max(1)
 }
 
-/// In-flight request cap: 2x the active slot count. Override via
-/// `LINASTORE_IN_FLIGHT`. This bounds how many requests may be open at once
-/// (including ones parked on IO); when full, new requests wait at admission.
+/// In-flight request cap: 256 by default. Override via `LINASTORE_IN_FLIGHT`.
+/// This bounds how many requests may be open at once (including ones parked on
+/// IO); when full, new requests wait at admission. Sized for IO/network-bound
+/// workloads, where cheap parked connections (not CPU) are the limiting factor;
+/// pair with a small `channel_depth` to keep worst-case memory bounded.
 pub fn in_flight_limit() -> usize {
     std::env::var("LINASTORE_IN_FLIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| 2 * active_limit())
+        .unwrap_or(256)
         .max(1)
 }
 
@@ -165,7 +166,6 @@ impl Op {
 /// channel only while it is actually reading, so reads never buffer a whole
 /// file in memory.
 pub struct ResponseStream {
-    pub uni_id: [u8; 16],
     pub status: Status,
     pub identifier: Bytes,
     /// Uncompressed data length, in bytes.
@@ -181,9 +181,7 @@ pub struct ResponseStream {
 /// in the queue: the frontend keeps the `mpsc::Sender` and streams the payload
 /// only after a worker dequeues the meta, so memory scales with worker
 /// concurrency rather than queue depth.
-#[derive(Debug)]
 pub struct OrderRequest {
-    pub uni_id: [u8; 16],
     pub behavior: Behavior,
     pub flags: u8,
     pub identifier: Bytes,
@@ -198,20 +196,26 @@ pub struct OrderRequest {
     /// Protocols that validate a wire checksum incrementally confirm the result
     /// after EOF. Storage waits for it before making the object visible.
     pub payload_integrity: Option<oneshot::Receiver<Result<(), String>>>,
+    /// Response channel, carried by the order itself so the worker can reply
+    /// without a global waiter registry. Dropping it (frontend gave up) makes
+    /// the worker's send fail, which the worker treats as "client gone".
+    pub reply: oneshot::Sender<ResponseStream>,
 }
 
 impl OrderRequest {
-    /// Create a meta order plus the sender half of its payload channel.
+    /// Create a meta order plus the sender half of its payload channel. The
+    /// caller owns `reply`'s receiver and must keep its in-flight permit alive
+    /// until it stops waiting on it.
     pub fn create(
         behavior: Behavior,
         flags: u8,
         identifier: Bytes,
         data_len: u64,
         need_response_checksum: bool,
+        reply: oneshot::Sender<ResponseStream>,
     ) -> (mpsc::Sender<Bytes>, Self) {
         let (payload_tx, payload) = mpsc::channel(channel_depth());
         let order = OrderRequest {
-            uni_id: Uuid::new_v4().into_bytes(),
             behavior,
             flags,
             identifier,
@@ -219,6 +223,7 @@ impl OrderRequest {
             need_response_checksum,
             payload,
             payload_integrity: None,
+            reply,
         };
         (payload_tx, order)
     }
@@ -230,6 +235,7 @@ impl OrderRequest {
         identifier: Bytes,
         data_len: u64,
         need_response_checksum: bool,
+        reply: oneshot::Sender<ResponseStream>,
     ) -> (
         mpsc::Sender<Bytes>,
         oneshot::Sender<Result<(), String>>,
@@ -241,6 +247,7 @@ impl OrderRequest {
             identifier,
             data_len,
             need_response_checksum,
+            reply,
         );
         let (integrity_tx, integrity) = oneshot::channel();
         order.payload_integrity = Some(integrity);

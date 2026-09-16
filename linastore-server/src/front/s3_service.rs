@@ -9,8 +9,8 @@ use crate::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, StatusCode, body::Frame, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::sync::oneshot;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{Level, event, instrument};
 use uuid::Uuid;
@@ -122,30 +122,31 @@ fn stream_body(rx: tokio::sync::mpsc::Receiver<Bytes>) -> S3Body {
 
 /// Enqueue a body-less order (GET/HEAD/DELETE) and wait for the response.
 async fn process_through_queue(behavior: Behavior, identifier: &str) -> Result<ResponseStream, Status> {
+    let con_queue = ConveyQueue::get_instance();
+    // Hold the in-flight permit for the whole request; released on return.
+    let _permit = match con_queue.acquire_permit().await {
+        Ok(permit) => permit,
+        Err(AdmissionError::TimedOut) => return Err(Status::Overloaded),
+        Err(_) => return Err(Status::InternalError),
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
     let (data_tx, order) = OrderRequest::create(
         behavior,
         0,
         Bytes::copy_from_slice(identifier.as_bytes()),
         0,
         false,
+        reply_tx,
     );
     drop(data_tx);
-    let uni_id = order.uni_id;
 
-    let con_queue = ConveyQueue::get_instance();
-    let receiver = match con_queue.register_waiter(uni_id).await {
-        Ok(rx) => rx,
-        Err(AdmissionError::TimedOut) => return Err(Status::Overloaded),
-        Err(_) => return Err(Status::InternalError),
-    };
-
-    if let Err(e) = con_queue.produce_order(order) {
+    if let Err(e) = con_queue.produce_order(order).await {
         event!(Level::ERROR, "Failed to produce order: {}", e);
-        con_queue.unregister_waiter(uni_id);
         return Err(Status::InternalError);
     }
 
-    match tokio::time::timeout(Duration::from_secs(10), receiver).await {
+    match tokio::time::timeout(Duration::from_secs(10), reply_rx).await {
         Ok(Ok(res)) => {
             if res.status == Status::Success {
                 Ok(res)
@@ -153,15 +154,9 @@ async fn process_through_queue(behavior: Behavior, identifier: &str) -> Result<R
                 Err(res.status)
             }
         }
-        Ok(Err(_)) => {
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
-            Err(Status::InternalError)
-        }
+        Ok(Err(_)) => Err(Status::InternalError),
         Err(_) => {
             event!(Level::ERROR, "S3 request timeout");
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
             Err(Status::InternalError)
         }
     }
@@ -174,19 +169,27 @@ async fn put_through_queue(
     data_len: u64,
     body: hyper::body::Incoming,
 ) -> Result<ResponseStream, Status> {
-    let (data_tx, order) = OrderRequest::create(Behavior::PutFile, 0, Bytes::from(identifier.to_string()), data_len, false);
-    let uni_id = order.uni_id;
-
     let con_queue = ConveyQueue::get_instance();
-    let receiver = match con_queue.register_waiter(uni_id).await {
-        Ok(rx) => rx,
+    // Admission happens before any body byte is read: a full pool pauses the
+    // client via TCP backpressure rather than rejecting a started upload.
+    let _permit = match con_queue.acquire_permit().await {
+        Ok(permit) => permit,
         Err(AdmissionError::TimedOut) => return Err(Status::Overloaded),
         Err(_) => return Err(Status::InternalError),
     };
 
-    if let Err(e) = con_queue.produce_order(order) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let (data_tx, order) = OrderRequest::create(
+        Behavior::PutFile,
+        0,
+        Bytes::from(identifier.to_string()),
+        data_len,
+        false,
+        reply_tx,
+    );
+
+    if let Err(e) = con_queue.produce_order(order).await {
         event!(Level::ERROR, "Failed to produce order: {}", e);
-        con_queue.unregister_waiter(uni_id);
         return Err(Status::InternalError);
     }
 
@@ -197,11 +200,10 @@ async fn put_through_queue(
         match tokio::time::timeout(BODY_CHUNK_TIMEOUT, body.frame()).await {
             Ok(Some(Ok(frame))) => {
                 if let Ok(data) = frame.into_data() {
-                if data_tx.send(data).await.is_err() {
+                    if data_tx.send(data).await.is_err() {
                         stream_failed = true;
                         break;
                     }
-                    con_queue.touch_waiter(uni_id);
                 }
             }
             Ok(Some(Err(_))) | Err(_) => {
@@ -214,12 +216,10 @@ async fn put_through_queue(
     drop(data_tx);
 
     if stream_failed {
-        con_queue.unregister_waiter(uni_id);
-        con_queue.remove_order(uni_id);
         return Err(Status::BadRequest);
     }
 
-    match tokio::time::timeout(Duration::from_secs(10), receiver).await {
+    match tokio::time::timeout(Duration::from_secs(10), reply_rx).await {
         Ok(Ok(res)) => {
             if res.status == Status::Success {
                 Ok(res)
@@ -227,15 +227,9 @@ async fn put_through_queue(
                 Err(res.status)
             }
         }
-        Ok(Err(_)) => {
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
-            Err(Status::InternalError)
-        }
+        Ok(Err(_)) => Err(Status::InternalError),
         Err(_) => {
             event!(Level::ERROR, "S3 request timeout");
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
             Err(Status::InternalError)
         }
     }
@@ -424,10 +418,10 @@ async fn handle_s3(req: Request<hyper::body::Incoming>) -> Result<Response<S3Bod
 pub async fn run_s3_server(addr: &str) {
     event!(Level::INFO, "S3-compatible service starting on {}", addr);
 
-    let listener = match TcpListener::bind(addr).await {
+    let listener = match super::net::bind_listener(addr) {
         Ok(listener) => listener,
-        Err(_) => {
-            event!(Level::ERROR, "Failed to bind to address {}", addr);
+        Err(e) => {
+            event!(Level::ERROR, "Failed to bind to address {}: {}", addr, e);
             return;
         }
     };
@@ -443,9 +437,12 @@ pub async fn run_s3_server(addr: &str) {
                     Err(_) => continue,
                 };
 
+                super::net::tune_stream(&stream);
                 let io = TokioIo::new(stream);
                 tokio::task::spawn(async move {
                     if let Err(err) = http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(super::net::HEADER_READ_TIMEOUT)
                         .serve_connection(io, service_fn(handle_s3))
                         .await
                     {

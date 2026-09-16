@@ -25,6 +25,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 aes-gcm = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = ["process", "fs"] }

@@ -18,12 +18,12 @@
 
 | 配额 | 默认 | 说明 |
 |------|------|------|
-| `req queue` | 128 | 只放 meta；默认容量，环境变量暂未开放 |
-| `in_flight` 信号量 | `2 × active` | 在途请求上限（含挂起等待）；满时异步等待，`LINASTORE_IN_FLIGHT` 可配 |
+| `req queue` | `= in_flight` | 只放 meta 的 mpsc；容量跟随 `in_flight` |
+| `in_flight` 信号量 | `256` | 在途请求上限（含挂起等待）；满时异步等待，`LINASTORE_IN_FLIGHT` 可配 |
 | `active` 信号量 | `floor(CPU核数 / 2)` | 同时真正干活的请求数（1:1），`LINASTORE_PORTER_CONCURRENCY` 可配 |
 | SQL 队列 | 单线程 | `DbExecutor` 唯一持有 SQLite，串行消费 |
 
-> 默认 `active = floor(逻辑核数 / 2)`，`in_flight = 2 × active`。在途任务只是挂在 IO 上（便宜），所以可以比活跃槽大两倍，吸收并发慢连接；真正干活的并发数 `active` 才受 CPU 数约束。超过 admission 等待上限才返回 503，不会丢弃已入队请求。
+> 默认 `active = floor(逻辑核数 / 2)`，`in_flight = 256`（面向 IO/网络型负载）。在途任务只是挂在 IO 上（便宜），所以 `in_flight` 远大于活跃槽，用来吸收并发慢连接；真正干活的并发数 `active` 才受 CPU 数约束。`in_flight` 上限约等于可同时挂起的请求数，请配合较小的 `channel_depth`（默认 16）控制最坏内存。超过 admission 等待上限才返回 503，不会丢弃已入队请求。
 
 ## 上传路径（put_stream）
 
@@ -50,8 +50,8 @@ chunk 流 ──► 已知长度 ≤4MB？──► 内存缓冲（避免临时�
 
 | 组件 | 位置 | 职责 |
 |------|------|------|
-| ConveyQueue | `linastore-server/src/conveyer.rs` | req queue + waiter（响应通道） |
-| Porter | `linastore-server/src/porter.rs` | 每请求一 task；`in_flight`/`active` 双信号量 |
+| ConveyQueue | `linastore-server/src/conveyer.rs` | 一条 order mpsc + `in_flight` 许可；响应通道 `reply` 内嵌在 order 里 |
+| Porter | `linastore-server/src/porter.rs` | 每请求一 task；`active` 信号量（`in_flight` 由前端自持许可） |
 | DbExecutor | `linabase/src/dbexec.rs` | SQLite 单线程 actor（sql queue） |
 | StoreManager | `linabase/src/service.rs` | 并发对象存储；`put_stream`/`open_read` 流式 IO + 去重 |
 | ResponseStream | `linastore-server/src/dtos.rs` | 流式响应（status/长度/CRC 头 + 有界数据通道） |

@@ -3,13 +3,13 @@ use std::{sync::Arc, time::Duration};
 
 use linabase::service::{ObjectReader, StoreManager};
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 use tracing::{Level, event, instrument};
 
 use crate::{
-    conveyer::ConveyQueue,
+    conveyer::{ConveyQueue, send_response},
     dtos::{
         Behavior, FlagType, OrderRequest, ResponseStream, PAYLOAD_UNKNOWN_LEN, Status,
         active_limit, channel_depth, in_flight_limit,
@@ -53,40 +53,34 @@ pub async fn porter(root: &str) {
     // The active-worker pool: only real processing (hash/compress, file IO,
     // DB) holds one of these, 1:1 per request. Waiting on network/streaming
     // or on the SQL queue does NOT occupy a slot. In-flight is bounded by the
-    // conveyer's waiter permits, so no separate semaphore here.
+    // frontends' permits, so no separate semaphore here.
     let active = Arc::new(Semaphore::new(active_count));
     let mut tasks = JoinSet::new();
     let mut shutting_down = false;
 
     let shutdown_status = Shutdown::get_instance();
     let conveyers = ConveyQueue::get_instance();
-    let mut order_notifier = conveyers.subscribe_orders();
+    let mut orders = match conveyers.take_orders() {
+        Some(orders) => orders,
+        None => {
+            event!(Level::ERROR, "[porter] Order queue already taken");
+            return;
+        }
+    };
 
     loop {
         while !shutting_down {
-            match conveyers.consume_order() {
-                Ok(Some(req)) => {
-                    // Each queued order already holds an in-flight permit (taken
-                    // at waiter registration), so spawned tasks are bounded by it.
+            match orders.try_recv() {
+                Ok(req) => {
                     let store_manager = Arc::clone(&store_manager);
-                    let conveyers = Arc::clone(&conveyers);
                     let active = Arc::clone(&active);
                     tasks.spawn(async move {
-                        process_order(req, store_manager.as_ref(), &conveyers, &active).await
+                        process_order(req, store_manager.as_ref(), &active).await
                     });
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    error_count += 1;
-                    if error_count % ERROR_LOG_INTERVAL == 0 {
-                        event!(
-                            Level::ERROR,
-                            "[porter] Queue error ({} errors): {}",
-                            error_count,
-                            e
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    shutting_down = true;
                     break;
                 }
             }
@@ -100,10 +94,12 @@ pub async fn porter(root: &str) {
             _ = shutdown_status.wait(), if !shutting_down => {
                 shutting_down = true;
             }
-            changed = order_notifier.changed(), if !shutting_down => {
-                if changed.is_err() {
-                    shutting_down = true;
-                }
+            Some(req) = orders.recv(), if !shutting_down => {
+                let store_manager = Arc::clone(&store_manager);
+                let active = Arc::clone(&active);
+                tasks.spawn(async move {
+                    process_order(req, store_manager.as_ref(), &active).await
+                });
             }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 match result {
@@ -146,54 +142,54 @@ pub async fn porter(root: &str) {
 async fn process_order(
     req: OrderRequest,
     store_manager: &StoreManager,
-    conveyers: &ConveyQueue,
     active: &Arc<Semaphore>,
 ) -> Result<(), String> {
-    let valid_data_end = req
-        .identifier
+    let OrderRequest {
+        behavior,
+        flags,
+        identifier,
+        data_len,
+        need_response_checksum,
+        payload,
+        payload_integrity,
+        reply,
+    } = req;
+
+    let valid_data_end = identifier
         .iter()
         .position(|&b| b == 0)
-        .unwrap_or(req.identifier.len());
+        .unwrap_or(identifier.len());
 
     if valid_data_end == 0 {
-        return send_response(
-            response_no_data(req.uni_id, Status::FileNameInvalid, req.identifier),
-            conveyers,
-        );
+        return send_response(reply, response_no_data(Status::FileNameInvalid, identifier));
     }
 
-    let identifier_bytes = &req.identifier[..valid_data_end];
-    let identifier = match std::str::from_utf8(identifier_bytes) {
+    let identifier_str = match std::str::from_utf8(&identifier[..valid_data_end]) {
         Ok(s) => s.to_string(),
         Err(_) => {
-            return send_response(
-                response_no_data(req.uni_id, Status::FileNameInvalid, req.identifier),
-                conveyers,
-            );
+            return send_response(reply, response_no_data(Status::FileNameInvalid, identifier));
         }
     };
 
-    let behavior = req.behavior.clone();
     match behavior {
         Behavior::PutFile => {
-            let flags = req.flags;
             let should_compress = flag_set(flags, FlagType::Compress);
 
             // Stream the payload straight into the object file (bounded
             // memory, incremental hash) — network-paced, no active slot held.
-            let expected = if req.data_len == PAYLOAD_UNKNOWN_LEN {
+            let expected = if data_len == PAYLOAD_UNKNOWN_LEN {
                 None
             } else {
-                Some(req.data_len)
+                Some(data_len)
             };
             let status = match store_manager
                 .put_stream(
-                    &identifier,
-                    req.payload,
+                    &identifier_str,
+                    payload,
                     PAYLOAD_RECV_TIMEOUT,
                     should_compress,
                     expected,
-                    req.payload_integrity,
+                    payload_integrity,
                 )
                 .await
             {
@@ -203,34 +199,35 @@ async fn process_order(
                     Status::StoreFailed
                 }
             };
-            send_response(
-                response_no_data(req.uni_id, status, req.identifier),
-                conveyers,
-            )
+            send_response(reply, response_no_data(status, identifier))
         }
-        Behavior::GetFile => stream_get_response(store_manager, req, &identifier, conveyers, active).await,
+        Behavior::GetFile => {
+            stream_get_response(
+                store_manager,
+                reply,
+                identifier,
+                &identifier_str,
+                need_response_checksum,
+                active,
+            )
+            .await
+        }
         Behavior::DeleteFile => {
-            drop(req.payload);
+            drop(payload);
             let _slot = active.clone().acquire_owned().await;
-            let status = match store_manager.delete(&identifier, false).await {
+            let status = match store_manager.delete(&identifier_str, false).await {
                 Ok(_) => Status::Success,
                 Err(_) => Status::FileNotFound,
             };
-            send_response(
-                response_no_data(req.uni_id, status, req.identifier),
-                conveyers,
-            )
+            send_response(reply, response_no_data(status, identifier))
         }
-        _ => send_response(
-            response_no_data(req.uni_id, Status::InternalError, req.identifier),
-            conveyers,
-        ),
+        _ => send_response(reply, response_no_data(Status::InternalError, identifier)),
     }
 }
 
 /// Build a response with no body (channel closed immediately). The checksum
 /// is always valid so LiNa clients can verify even empty responses.
-fn response_no_data(uni_id: [u8; 16], status: Status, identifier: Bytes) -> ResponseStream {
+fn response_no_data(status: Status, identifier: Bytes) -> ResponseStream {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&[identifier.len() as u8]);
     hasher.update(&identifier);
@@ -239,7 +236,6 @@ fn response_no_data(uni_id: [u8; 16], status: Status, identifier: Bytes) -> Resp
     let (tx, rx) = mpsc::channel(1);
     drop(tx);
     ResponseStream {
-        uni_id,
         status,
         identifier,
         data_len: 0,
@@ -253,14 +249,14 @@ fn response_no_data(uni_id: [u8; 16], status: Status, identifier: Bytes) -> Resp
 /// neither the porter nor the queue ever buffers the whole file.
 async fn stream_get_response(
     store_manager: &StoreManager,
-    req: OrderRequest,
+    reply: oneshot::Sender<ResponseStream>,
+    raw_identifier: Bytes,
     identifier: &str,
-    conveyers: &ConveyQueue,
+    need_crc: bool,
     active: &Arc<Semaphore>,
 ) -> Result<(), String> {
     let identifier_bytes = Bytes::copy_from_slice(identifier.as_bytes());
 
-    let need_crc = req.need_response_checksum;
     // Opening + (for LiNa) the CRC/integrity pre-pass hold an active slot;
     // the actual streaming below does not.
     let (mut reader, checksum) = {
@@ -268,7 +264,7 @@ async fn stream_get_response(
         if need_crc {
             // LiNa protocol needs the CRC before the header, so compute it in a
             // first streaming pass (also verifies integrity) before streaming data.
-            match open_verified_reader(store_manager, &identifier).await {
+            match open_verified_reader(store_manager, identifier).await {
                 Ok(mut reader) => {
                     let data_len = reader.data_len();
                     let mut hasher = crc32fast::Hasher::new();
@@ -281,8 +277,8 @@ async fn stream_get_response(
                             Ok(n) => n,
                             Err(_) => {
                                 return send_response(
-                                    response_no_data(req.uni_id, Status::InternalError, req.identifier),
-                                    conveyers,
+                                    reply,
+                                    response_no_data(Status::InternalError, raw_identifier),
                                 );
                             }
                         };
@@ -292,33 +288,33 @@ async fn stream_get_response(
                         hasher.update(&buf[..n]);
                     }
                     let checksum = hasher.finalize();
-                    match store_manager.open_read(&identifier).await {
+                    match store_manager.open_read(identifier).await {
                         Ok(Some(reader)) => (reader, checksum),
                         _ => {
                             return send_response(
-                                response_no_data(req.uni_id, Status::InternalError, req.identifier),
-                                conveyers,
+                                reply,
+                                response_no_data(Status::InternalError, raw_identifier),
                             );
                         }
                     }
                 }
                 Err(status) => {
-                    return send_response(response_no_data(req.uni_id, status, req.identifier), conveyers);
+                    return send_response(reply, response_no_data(status, raw_identifier));
                 }
             }
         } else {
-            match store_manager.open_read(&identifier).await {
+            match store_manager.open_read(identifier).await {
                 Ok(Some(reader)) => (reader, 0),
                 Ok(None) => {
                     return send_response(
-                        response_no_data(req.uni_id, Status::FileNotFound, req.identifier),
-                        conveyers,
+                        reply,
+                        response_no_data(Status::FileNotFound, raw_identifier),
                     );
                 }
                 Err(_) => {
                     return send_response(
-                        response_no_data(req.uni_id, Status::InternalError, req.identifier),
-                        conveyers,
+                        reply,
+                        response_no_data(Status::InternalError, raw_identifier),
                     );
                 }
             }
@@ -327,14 +323,13 @@ async fn stream_get_response(
 
     let (tx, rx) = mpsc::channel(channel_depth());
     let res = ResponseStream {
-        uni_id: req.uni_id,
         status: Status::Success,
         identifier: identifier_bytes,
         data_len: reader.data_len(),
         checksum,
         data: rx,
     };
-    send_response(res, conveyers)?;
+    send_response(reply, res)?;
 
     // Stream the object into the channel. A client that drains slowly applies
     // backpressure here (no active slot held); on read error (incl. integrity
@@ -369,10 +364,4 @@ async fn open_verified_reader(
         Ok(None) => Err(Status::FileNotFound),
         Err(_) => Err(Status::InternalError),
     }
-}
-
-fn send_response(res: ResponseStream, conveyers: &ConveyQueue) -> Result<(), String> {
-    conveyers
-        .produce_service(res)
-        .map_err(|e| format!("Failed to send response: {}", e))
 }

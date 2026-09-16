@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use std::{io, net::SocketAddr, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tracing::{Level, event, instrument};
 use uuid::Uuid;
 
@@ -179,9 +178,7 @@ async fn write_response_stream<T: AsyncWriteExt + Unpin>(stream: &mut T, res: Re
 async fn finish_response<T: AsyncWriteExt + Unpin>(
     stream: &mut T,
     log_id: &str,
-    uni_id: [u8; 16],
     receiver: tokio::sync::oneshot::Receiver<ResponseStream>,
-    con_queue: &ConveyQueue,
 ) {
     match tokio::time::timeout(RESPONSE_TIMEOUT, receiver).await {
         Ok(Ok(res)) => {
@@ -189,14 +186,7 @@ async fn finish_response<T: AsyncWriteExt + Unpin>(
                 event!(Level::ERROR, "[waitress {}] Error writing response: {}", log_id, e);
             }
         }
-        Ok(Err(_)) => {
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
-            write_error_response(stream, log_id, Status::InternalError, None).await;
-        }
-        Err(_) => {
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
+        Ok(Err(_)) | Err(_) => {
             write_error_response(stream, log_id, Status::InternalError, None).await;
         }
     }
@@ -220,17 +210,10 @@ async fn stream_plain_put<T: AsyncReadExt + AsyncWriteExt + Unpin>(
         None => suggested,
     };
     let expected_len = message.payload.dlen as usize;
-    let (data_tx, integrity_tx, order) = OrderRequest::create_checked(
-        Behavior::PutFile,
-        message.flags,
-        Bytes::from(internal_name),
-        message.payload.dlen as u64,
-        true,
-    );
-    let uni_id = order.uni_id;
     let con_queue = ConveyQueue::get_instance();
-    let receiver = match con_queue.register_waiter(uni_id).await {
-        Ok(receiver) => receiver,
+    // Hold the in-flight permit for the whole request; released on return.
+    let _permit = match con_queue.acquire_permit().await {
+        Ok(permit) => permit,
         Err(AdmissionError::TimedOut) => {
             write_error_response(stream, log_id, Status::Overloaded, None).await;
             return false;
@@ -241,9 +224,18 @@ async fn stream_plain_put<T: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
     };
 
-    if let Err(err) = con_queue.produce_order(order) {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let (data_tx, integrity_tx, order) = OrderRequest::create_checked(
+        Behavior::PutFile,
+        message.flags,
+        Bytes::from(internal_name),
+        message.payload.dlen as u64,
+        true,
+        reply_tx,
+    );
+
+    if let Err(err) = con_queue.produce_order(order).await {
         event!(Level::ERROR, "[waitress {}] {}", log_id, err);
-        con_queue.unregister_waiter(uni_id);
         write_error_response(stream, log_id, Status::InternalError, None).await;
         return false;
     }
@@ -275,7 +267,6 @@ async fn stream_plain_put<T: AsyncReadExt + AsyncWriteExt + Unpin>(
             stream_error = Some(ProtocolReadError::Other("Worker dropped payload stream".to_string()));
             break;
         }
-        con_queue.touch_waiter(uni_id);
         remaining -= take;
     }
     drop(data_tx);
@@ -288,7 +279,7 @@ async fn stream_plain_put<T: AsyncReadExt + AsyncWriteExt + Unpin>(
         None => Err("Invalid checksum".to_string()),
     };
     let _ = integrity_tx.send(integrity);
-    finish_response(stream, log_id, uni_id, receiver, &con_queue).await;
+    finish_response(stream, log_id, reply_rx).await;
     complete
 }
 
@@ -306,18 +297,31 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
     // Loop to handle multiple requests on the same connection
     loop {
         let mut message = LiNaProtocol::new();
-        match message.parse_protocol_header(&mut stream).await {
-            Ok(()) => {}
-            Err(ProtocolReadError::Disconnected) => {
+        match tokio::time::timeout(
+            super::net::HEADER_READ_TIMEOUT,
+            message.parse_protocol_header(&mut stream),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(ProtocolReadError::Disconnected)) => {
                 event!(Level::INFO, "[waitress {}] Client disconnected", &log_id);
                 return;
             }
-            Err(ProtocolReadError::Other(err)) => {
+            Ok(Err(ProtocolReadError::Other(err))) => {
                 event!(
                     Level::INFO,
                     "[waitress {}] Client disconnected: {}",
                     &log_id,
                     err
+                );
+                return;
+            }
+            Err(_) => {
+                event!(
+                    Level::INFO,
+                    "[waitress {}] Idle timeout, closing connection",
+                    &log_id
                 );
                 return;
             }
@@ -638,18 +642,11 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
         };
 
         let is_put = matches!(behavior, Behavior::PutFile);
-        let (data_tx, order) = OrderRequest::create(
-            behavior,
-            message.flags,
-            resolved_identifier,
-            file_data.len() as u64,
-            true,
-        );
-        let uni_id = order.uni_id;
-
         let con_queue = ConveyQueue::get_instance();
-        let receiver = match con_queue.register_waiter(uni_id).await {
-            Ok(rx) => rx,
+        // Hold the in-flight permit until this request is answered; it is
+        // released at the end of this loop iteration.
+        let _permit = match con_queue.acquire_permit().await {
+            Ok(permit) => permit,
             Err(AdmissionError::TimedOut) => {
                 event!(
                     Level::WARN,
@@ -665,10 +662,18 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
             }
         };
 
-        if let Err(err) = con_queue.produce_order(order) {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let (data_tx, order) = OrderRequest::create(
+            behavior,
+            message.flags,
+            resolved_identifier,
+            file_data.len() as u64,
+            true,
+            reply_tx,
+        );
+
+        if let Err(err) = con_queue.produce_order(order).await {
             event!(Level::ERROR, "[waitress {}] {}", &log_id, err);
-            con_queue.unregister_waiter(uni_id);
-            con_queue.remove_order(uni_id);
             write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
             return;
         }
@@ -681,7 +686,6 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                     "[waitress {}] Order dropped before payload handover",
                     &log_id
                 );
-                con_queue.unregister_waiter(uni_id);
                 write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
                 return;
             }
@@ -689,7 +693,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
         drop(data_tx);
 
         let timeout = Duration::from_secs(10);
-        match tokio::time::timeout(timeout, receiver).await {
+        match tokio::time::timeout(timeout, reply_rx).await {
             Ok(Ok(res)) => {
                 // Header: status(1) + ilen(1) + identifier + dlen(4) + checksum(4)
                 let status = res.status as u8;
@@ -721,14 +725,10 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
                     "[waitress {}] Channel closed unexpectedly",
                     &log_id
                 );
-                con_queue.unregister_waiter(uni_id);
-                con_queue.remove_order(uni_id);
                 write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
             }
             Err(_) => {
                 event!(Level::ERROR, "[waitress {}] Timeout exceeded", &log_id);
-                con_queue.unregister_waiter(uni_id);
-                con_queue.remove_order(uni_id);
                 write_error_response(&mut stream, &log_id, Status::InternalError, None).await;
             }
         }
@@ -746,7 +746,7 @@ async fn waitress<T: AsyncReadExt + AsyncWriteExt + Unpin + std::fmt::Debug>(
 pub async fn run_advanced_server(addr: &str) {
     event!(Level::INFO, "Waitress starting");
 
-    let listener = match TcpListener::bind(addr).await {
+    let listener = match super::net::bind_listener(addr) {
         Ok(listener) => listener,
         Err(err) => {
             event!(Level::ERROR, "Failed to bind to address {}: {}", addr, err);
@@ -772,6 +772,7 @@ pub async fn run_advanced_server(addr: &str) {
                 };
 
                 tokio::task::spawn(async move {
+                    super::net::tune_stream(&stream);
                     waitress(stream, addr).await;
                 });
             }
