@@ -12,11 +12,18 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     ptr,
+    sync::Arc,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
 const BUFFER_SIZE: usize = 0x80000;
+
+/// A sample is not worth compressing if the encoded size stays above this
+/// fraction of the input. Guards against spending CPU (and per-block headers)
+/// on already-compressed payloads such as JPEG/MP4/zip.
+const COMPRESS_SKIP_RATIO: f64 = 0.95;
 
 pub fn get_hash256_from_file<P: AsRef<Path>>(file_path: P) -> Result<String, BoxError> {
     let mut hasher = Hasher::new();
@@ -108,6 +115,9 @@ pub struct BlockManager {
     multi_thread_threshold: usize,
     // Maximum number of threads for large files
     max_threads: usize,
+    // Bounds streaming (block-by-block) compression across all callers so the
+    // shared blocking pool can't be oversubscribed by concurrent uploads.
+    compress_limit: Arc<Semaphore>,
 }
 
 impl BlockManager {
@@ -122,7 +132,7 @@ impl BlockManager {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .min(4); // Cap at 4 threads to avoid excessive resource usage
+            .max(1);
 
         let thread_pool = match ThreadPoolBuilder::new()
             .num_threads(max_threads)
@@ -138,6 +148,7 @@ impl BlockManager {
             thread_pool,
             multi_thread_threshold: 1024 * 1024, // 1MB threshold for multi-threading
             max_threads,
+            compress_limit: Arc::new(Semaphore::new(max_threads)),
         }
     }
 
@@ -347,6 +358,29 @@ impl BlockManager {
         self.chunk_size
     }
 
+    pub fn max_threads(&self) -> usize {
+        self.max_threads
+    }
+
+    /// Take a global compression slot. Held for the duration of one block's
+    /// compression so total concurrent compression is bounded by `max_threads`.
+    pub async fn acquire_compress_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.compress_limit.clone().acquire_owned().await.ok()
+    }
+
+    /// Probe whether `sample` compresses enough to be worth doing for the whole
+    /// object, using the real codec and level. `false` means "store raw": the
+    /// caller should record the object as uncompressed.
+    pub fn worth_compressing(&self, sample: &[u8]) -> bool {
+        if sample.is_empty() {
+            return false;
+        }
+        match self.__encode(sample) {
+            Ok(encoded) => (encoded.len() as f64) < (sample.len() as f64) * COMPRESS_SKIP_RATIO,
+            Err(_) => true,
+        }
+    }
+
     // Input bytes less than 0x10000 (64KiB) - 0xa
     fn __encode(&self, chunk: &[u8]) -> Result<Vec<u8>, BoxError> {
         let result = Vec::with_capacity(u16::MAX as usize);
@@ -482,6 +516,26 @@ mod tests {
         );
 
         println!("Thread count determination test passed!");
+    }
+
+    fn xorshift_bytes(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_worth_compressing_distinguishes_payloads() {
+        let manager = BlockManager::new();
+        assert!(manager.worth_compressing(&vec![b'a'; 200_000]));
+        assert!(!manager.worth_compressing(&xorshift_bytes(200_000)));
+        assert!(!manager.worth_compressing(&[]));
     }
 
     #[test]

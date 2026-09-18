@@ -2,7 +2,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use nanoid;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fs as stdfs, io,
     path::{Path, PathBuf},
@@ -14,6 +14,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::dbexec::{DbClient, DbExecutor, reconcile_orphans_files};
@@ -334,7 +335,10 @@ impl StoreManager {
         let mut buf: Vec<u8> = Vec::new();
         let mut spool: Option<(tokio::fs::File, PathBuf)> = None;
 
-        if let Err(e) = Self::collect_body(
+        // `collect_body` may downgrade compression to raw storage when the
+        // payload turns out to be incompressible; the effective choice is used
+        // for both the stored format and the metadata flag.
+        let compressed = match Self::collect_body(
             &mut payload,
             recv_timeout,
             &mut hasher,
@@ -349,9 +353,12 @@ impl StoreManager {
         )
         .await
         {
-            Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
-            return Err(e);
-        }
+            Ok(compressed) => compressed,
+            Err(e) => {
+                Self::cleanup_spool(spool, &source_dir, &new_source_id).await;
+                return Err(e);
+            }
+        };
 
         let new_hash256 = hasher.finalize().to_hex().to_string();
 
@@ -444,6 +451,14 @@ impl StoreManager {
         Ok(())
     }
 
+    /// Collect the payload into memory (small) or a temp file (large).
+    ///
+    /// Returns the effective compression flag. Compression is decided from a
+    /// first sample: incompressible payloads are stored raw from the start, so
+    /// no CPU is wasted and no per-block headers are added. Blocks are
+    /// compressed through a bounded pipeline (ordered writes), so large
+    /// compressed uploads use several cores instead of one.
+    #[allow(clippy::too_many_arguments)]
     async fn collect_body(
         payload: &mut mpsc::Receiver<Bytes>,
         recv_timeout: Duration,
@@ -456,10 +471,13 @@ impl StoreManager {
         source_dir: &Path,
         new_source_id: &str,
         compressed: bool,
-    ) -> Result<(), BoxError> {
+    ) -> Result<bool, BoxError> {
         let block_size = bm.chunk_size();
-        // Bytes accumulated but not yet flushed as a full block (spool mode).
         let mut pending: Vec<u8> = Vec::with_capacity(block_size);
+        let mut effective = compressed;
+        let mut decided = !compressed;
+        let mut inflight: VecDeque<JoinHandle<Result<Vec<u8>, BoxError>>> = VecDeque::new();
+        let max_inflight = bm.max_threads().max(1);
 
         loop {
             let chunk = match tokio::time::timeout(recv_timeout, payload.recv()).await {
@@ -484,7 +502,13 @@ impl StoreManager {
             let (file, _) = spool.as_mut().expect("spool just created");
             if *inline {
                 if !buf.is_empty() {
-                    Self::write_block(file, bm, buf, compressed).await?;
+                    if !decided {
+                        effective = bm.worth_compressing(buf);
+                        decided = true;
+                    }
+                    let block = std::mem::take(buf);
+                    Self::dispatch_block(file, &mut inflight, max_inflight, bm, block, effective)
+                        .await?;
                 }
                 buf.clear();
                 *inline = false;
@@ -493,17 +517,33 @@ impl StoreManager {
             while pending.len() >= block_size {
                 let block = pending[..block_size].to_vec();
                 pending.drain(..block_size);
-                Self::write_block(file, bm, &block, compressed).await?;
+                if !decided {
+                    effective = bm.worth_compressing(&block);
+                    decided = true;
+                }
+                Self::dispatch_block(file, &mut inflight, max_inflight, bm, block, effective)
+                    .await?;
             }
         }
 
-        if !*inline {
+        if *inline {
+            // Never spilled: the whole payload is in `buf`; decide from it.
+            if !decided {
+                effective = bm.worth_compressing(buf);
+            }
+        } else {
             let (file, _) = spool.as_mut().expect("spool mode has a file");
             if !pending.is_empty() {
-                Self::write_block(file, bm, &pending, compressed).await?;
+                if !decided {
+                    effective = bm.worth_compressing(&pending);
+                }
+                let block = std::mem::take(&mut pending);
+                Self::dispatch_block(file, &mut inflight, max_inflight, bm, block, effective)
+                    .await?;
             }
+            Self::flush_blocks(file, &mut inflight).await?;
         }
-        Ok(())
+        Ok(effective)
     }
 
     async fn open_spool(
@@ -527,24 +567,57 @@ impl StoreManager {
         }
     }
 
-    /// Write one (up to block-size) chunk: raw for plain storage, or compressed
-    /// with the block header when `compressed` is set.
-    async fn write_block(
+    /// Queue one block for compression, or write it raw. Compression runs on
+    /// the blocking pool with bounded in-flight depth; results are awaited in
+    /// submission order so the on-disk block order is preserved.
+    async fn dispatch_block(
         file: &mut tokio::fs::File,
+        inflight: &mut VecDeque<JoinHandle<Result<Vec<u8>, BoxError>>>,
+        max_inflight: usize,
         bm: &Arc<BlockManager>,
-        block: &[u8],
+        block: Vec<u8>,
         compressed: bool,
     ) -> Result<(), BoxError> {
         if !compressed {
-            file.write_all(block).await?;
+            file.write_all(&block).await?;
             return Ok(());
         }
+        // Hold a global compression slot until this block is encoded.
+        let permit = bm.acquire_compress_slot().await;
         let bm = Arc::clone(bm);
-        let block_owned = block.to_vec();
-        let encoded = task::spawn_blocking(move || bm.compress_block(&block_owned))
-            .await
-            .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("compress task join error: {}", e)))??;
-        file.write_all(&encoded).await?;
+        inflight.push_back(task::spawn_blocking(move || {
+            let _permit = permit;
+            bm.compress_block(&block)
+        }));
+        if inflight.len() >= max_inflight.max(1) {
+            Self::write_next_block(file, inflight).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_next_block(
+        file: &mut tokio::fs::File,
+        inflight: &mut VecDeque<JoinHandle<Result<Vec<u8>, BoxError>>>,
+    ) -> Result<(), BoxError> {
+        if let Some(handle) = inflight.pop_front() {
+            let encoded = handle.await.map_err(|e| {
+                boxed_io_error(
+                    io::ErrorKind::Other,
+                    format!("compress task join error: {}", e),
+                )
+            })??;
+            file.write_all(&encoded).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_blocks(
+        file: &mut tokio::fs::File,
+        inflight: &mut VecDeque<JoinHandle<Result<Vec<u8>, BoxError>>>,
+    ) -> Result<(), BoxError> {
+        while !inflight.is_empty() {
+            Self::write_next_block(file, inflight).await?;
+        }
         Ok(())
     }
 
@@ -561,20 +634,23 @@ impl StoreManager {
 
         let new_size = input.len() as u64;
 
-        // Hash + compression are CPU-bound; run off the runtime.
+        // Hash + compression are CPU-bound; run off the runtime. Compression is
+        // probed first: incompressible payloads (JPEG/MP4/zip) are stored raw.
         let bm = Arc::clone(&self.bm);
         let input_for_blocking = input.clone();
-        let (new_hash256, new_storage_bytes) = task::spawn_blocking(move || -> Result<(String, Vec<u8>), BoxError> {
-            let hash = utils::get_hash256_from_binary(&input_for_blocking);
-            let encoded = if compressed {
-                bm.compress_all(&input_for_blocking)?
-            } else {
-                input_for_blocking.to_vec()
-            };
-            Ok((hash, encoded))
-        })
-        .await
-        .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("encode task join error: {}", e)))??;
+        let (new_hash256, new_storage_bytes, compressed) =
+            task::spawn_blocking(move || -> Result<(String, Vec<u8>, bool), BoxError> {
+                let hash = utils::get_hash256_from_binary(&input_for_blocking);
+                let effective = compressed && bm.worth_compressing(&input_for_blocking);
+                let encoded = if effective {
+                    bm.compress_all(&input_for_blocking)?
+                } else {
+                    input_for_blocking.to_vec()
+                };
+                Ok((hash, encoded, effective))
+            })
+            .await
+            .map_err(|e| boxed_io_error(io::ErrorKind::Other, format!("encode task join error: {}", e)))??;
 
         // Object file write — concurrent, no lock.
         let new_source_id = Self::file_name_gen();
@@ -1376,6 +1452,54 @@ mod tests {
             let got = read_all(&sm, name).await.expect("read");
             assert_eq!(got, data, "streamed put mismatch (compressed={})", compressed);
         }
+    }
+
+    async fn put_stream_bytes(sm: &StoreManager, name: &str, data: &Bytes, compressed: bool) {
+        let (tx, rx) = mpsc::channel(4);
+        let data_clone = data.clone();
+        let sender = tokio::spawn(async move {
+            for c in data_clone.chunks(32 * 1024) {
+                tx.send(Bytes::copy_from_slice(c)).await.expect("send chunk");
+            }
+        });
+        sm.put_stream(
+            name,
+            rx,
+            Duration::from_secs(5),
+            compressed,
+            Some(data.len() as u64),
+            None,
+        )
+        .await
+        .expect("put_stream");
+        sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_downgrades_incompressible() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let sm = StoreManager::new(temp_dir.path()).await.expect("store");
+
+        // Incompressible payload requested with compression: must be stored raw
+        // (no block headers) and still round-trip.
+        let random = generate_random_binary(2 * 1024 * 1024);
+        put_stream_bytes(&sm, "rand.bin", &random, true).await;
+        assert_eq!(read_all(&sm, "rand.bin").await.expect("read"), random);
+        let links = sm.dao.get_links_by_name("rand.bin", false).await.expect("links");
+        let raw = stdfs::read(sm.source_path(&links[0].source_id)).expect("read source");
+        assert_eq!(raw, random.to_vec(), "incompressible payload should be stored raw");
+
+        // Compressible payload requested with compression: stored compressed.
+        let zeros = Bytes::from(vec![0u8; 2 * 1024 * 1024]);
+        put_stream_bytes(&sm, "zeros.bin", &zeros, true).await;
+        assert_eq!(read_all(&sm, "zeros.bin").await.expect("read"), zeros);
+        let links = sm.dao.get_links_by_name("zeros.bin", false).await.expect("links");
+        let stored = stdfs::read(sm.source_path(&links[0].source_id)).expect("read source");
+        assert!(
+            stored.len() < zeros.len() / 4,
+            "compressible payload should shrink, got {}",
+            stored.len()
+        );
     }
 
     #[tokio::test]
